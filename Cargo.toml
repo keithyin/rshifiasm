@@ -1,0 +1,21 @@
+[package]
+name = "rshifiasm"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust translation of hifiasm, aiming at byte identical assembly output"
+license = "MIT"
+
+[lib]
+name = "rshifiasm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rshifiasm"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1"
+
+[profile.release]
+opt-level = 3
+debug = false
