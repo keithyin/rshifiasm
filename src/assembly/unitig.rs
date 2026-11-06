@@ -1580,6 +1580,7 @@ pub fn ma_ug_print2(
     prefix: &str,
     output: &mut dyn Write,
     reads: &ReadStore,
+    trio_labels: &[u8],
 ) -> io::Result<()> {
     let can_compute_coverage =
         coverage_cut.is_some() && sources.is_some() && read_to_unitig.is_some();
@@ -1631,7 +1632,7 @@ pub fn ma_ug_print2(
                 let strand = if (element >> 32) & 1 == 0 { '+' } else { '-' };
                 if u64::from(x) < reads.total_reads {
                     let cut = coverage_cut.unwrap()[x as usize];
-                    let label = reads.trio_labels[x as usize];
+                    let label = trio_labels[x as usize];
                     let hg_index = if label != FATHER && label != MOTHER {
                         AMBIGU
                     } else {
@@ -1731,6 +1732,7 @@ pub fn ma_ug_print(
     prefix: &str,
     output: &mut dyn Write,
     reads: &ReadStore,
+    trio_labels: &[u8],
 ) -> io::Result<()> {
     ma_ug_print2(
         unitig_graph,
@@ -1742,6 +1744,7 @@ pub fn ma_ug_print(
         prefix,
         output,
         reads,
+        trio_labels,
     )
 }
 
@@ -1756,6 +1759,7 @@ pub fn ma_ug_print_simple(
     prefix: &str,
     output: &mut dyn Write,
     reads: &ReadStore,
+    trio_labels: &[u8],
 ) -> io::Result<()> {
     ma_ug_print2(
         unitig_graph,
@@ -1767,6 +1771,7 @@ pub fn ma_ug_print_simple(
         prefix,
         output,
         reads,
+        trio_labels,
     )
 }
 
@@ -2432,6 +2437,7 @@ pub fn output_unitig_graph(
         "utg",
         &mut output,
         reads,
+        &reads.trio_labels,
     )?;
     output.flush()?;
 
@@ -2446,6 +2452,7 @@ pub fn output_unitig_graph(
         "utg",
         &mut output,
         reads,
+        &reads.trio_labels,
     )?;
     output.flush()?;
 
@@ -2549,6 +2556,7 @@ pub fn output_contig_graph_primary_pre(
         "utg",
         &mut output,
         reads,
+        &reads.trio_labels,
     )?;
     output.flush()?;
 
@@ -2563,6 +2571,7 @@ pub fn output_contig_graph_primary_pre(
         "utg",
         &mut output,
         reads,
+        &reads.trio_labels,
     )?;
     output.flush()?;
 

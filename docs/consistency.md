@@ -94,7 +94,7 @@
 | P4 已存 overlap 辅助 | `dedup_chains` / `push_nec_re` / `extract_max_exact` / `push_ne_ovlp` / `check_well_cal` | ✅ 完成（22 组场景、149 行黄金回放逐字节一致） |
 | P4 纠错 | `--write-ec` 纠错读段逐字节一致 | ✅ 完成（三轮全部一致，见下文实测） |
 | P5 组装图 | `p_utg.gfa`、`p_ctg.gfa` 逐字节一致 | ✅ 完成（r_utg/p_utg 全链路一致；p_ctg 探针级 + e2e 一致，见下文实测） |
-| P6 单倍型 | `hap1/hap2.p_ctg.gfa`、`a_ctg.gfa` 一致 | ⏳ 待实现（`clean_u_trans_t_idx`/`set_trio_flag_by_cov`/`reduce_hamming_error_adv` 已探针一致） |
+| P6 单倍型 | `hap1/hap2.p_ctg.gfa`、`a_ctg.gfa` 一致 | ✅ 完成（`hap1/hap2.p_ctg.*` 探针级 + e2e 逐字节一致，见下文实测；`a_ctg.gfa` 属 `--dual-scaf` 路径，暂缓） |
 | P7 Hi-C/trio | 需额外测试数据 | ⏳ 待实现 |
 | P8 ONT/UL | 需额外测试数据 | ⏳ 待实现 |
 
@@ -1222,6 +1222,51 @@ RSHIFIASM_EC_STOP_AT=<n>   只纠前 n 条读段
 - Rust 版不写 `*.ovlp.source.bin` / `*.ovlp.reverse.bin` / `*.ec.bin`
   重跑缓存索引（仅加速用途，不影响任何比对产物），故
   `compare_outputs.sh` 对这三个文件报 MISSING 属预期。
+
+### P6 门禁实测（2026-11-07，hap1/hap2 逐字节一致）
+
+移植范围（`Overlaps.cpp`）：
+
+- 清理函数族（`src/assembly/trio_clean.rs`）：`if_primary_unitig`、
+  `set_drop_trio_flag`、`update_unitig_graph`、`magic_trio_phasing`、
+  `get_candidate_uids`、`unitig_simi`、`all_to_all_deduplicate`、
+  `is_useful_node`/`recover_chain_nodes`/`rescue_useless_trio_nodes`、
+  `delete_useless_trio_nodes`、`update_hap_label`、`force_trio_clean`、
+  `clean_trio_untig_graph`（redo 循环 + `FlySimp` 相位缓存跨轮复用）。
+- 驱动层（`src/assembly/bp_graph.rs`）：`adjust_utg_by_trio`、
+  `output_trio_unitig_graph`（is_bench 路径）、`DedupIndex`
+  （`gen_dedup_idx_t` 的侵入式链表布局）、`cal_exact_ug_o`、
+  `dedup_exact_ug`、`push_ma_utg_t`、`append_miss_nid`、
+  `output_hap_graph`、`output_trio_graph_joint`。
+- 默认链路关键分支：`self_scaf=0` 走 `output_hap_graph`；
+  `purge_level_trio=0` 跳过 purge_dups；`HA_F_BAN_POST_JOIN` 默认关，
+  两个 rescue 都执行；`break_ug_contig`/`update_dump_trio` 默认不触发。
+
+门禁结果：
+
+- **探针级**（`tests/bp_graph_golden.rs`）：`output_bp_graph` 全流程（含
+  hap 输出）对 `/tmp/bp_probe.cpp`（f 系列转储）与
+  `reference/default_repeat.bp.*` 逐字节一致——p_ctg/hap1/hap2 的
+  gfa、noseq.gfa、lowQ.bed 共 9 个文件。
+- **端到端**：`rshifiasm -t1`（159.4 s，峰值 7.5 GB，exit 0），
+  `scripts/compare_outputs.sh` 对 r_utg/p_utg/p_ctg/hap1/hap2 的
+  gfa、noseq.gfa、lowQ.bed 共 15 个文件 `cmp` 无差异。
+- 日志核对：`[M::output_trio_graph_joint] dedup_base::0, miss_base::0`
+  与 C++ flag 探针输出一致（该语料无精确重复、无遗漏 unitig）。
+
+移植中踩过的坑（对后续阶段有用）：
+
+- **HG 标签来自活数组**：`ma_ug_print2` 的 `HG:A:` 取自
+  `"apmaaa"[trio_flag]`（FATHER→`p`、MOTHER→`m`、其余→`a`），而 C++ 的
+  `R_INF.trio_flag` 是被各阶段持续改写的同一个数组。Rust 侧打印原先读
+  `ReadStore::trio_labels`（初始副本），而变异写在独立的 `trio_flags`
+  克隆上；p_ctg 在 `set_trio_flag_by_cov` **之前**打印（全 `a`）掩盖了
+  这一问题，hap 输出才暴露。修复：打印链显式传入活的 `trio_labels`
+  切片（`ma_ug_print2`/`ma_ug_print`/`ma_ug_print_simple` 及其调用方）。
+- `f17_trio_flag.bin` 带 4 字节长度头，逐字节对拍时不要按文件偏移直接
+  索引读段 id（本项目测试读取已正确跳过）。
+- 定位工具：`/tmp/flag_probe.cpp`（加载 d20 转储，逐步打印
+  `R_INF.trio_flag` 分布），其 hap 输出与正式参考逐字节一致。
 
 ### P2 门禁实测（与 C++ 日志逐字节一致）
 

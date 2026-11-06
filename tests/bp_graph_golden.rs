@@ -16,6 +16,7 @@ use rshifiasm::assembly::asg::Asg;
 use rshifiasm::assembly::bp_graph::{adjust_utg_by_primary, output_bp_graph};
 use rshifiasm::assembly::bubble::BubbleLabel;
 use rshifiasm::assembly::hap_cov::UTrans;
+use rshifiasm::assembly::hamming::reduce_hamming_error_adv;
 use rshifiasm::assembly::hit::PRIMARY_LABEL;
 use rshifiasm::assembly::probe::{
     load_asg, load_coverage_cut, load_read_to_unitig, load_sources,
@@ -118,7 +119,7 @@ fn the_primary_contig_output_reproduces_the_reference() {
     let output_prefix = output_directory.join("replay");
     let output_name = output_prefix.to_str().expect("the path must be UTF-8");
 
-    let error = output_bp_graph(
+    output_bp_graph(
         &mut graph,
         &mut coverage_cut,
         output_name,
@@ -130,14 +131,19 @@ fn the_primary_contig_output_reproduces_the_reference() {
         &reads,
         &mut trio_flags,
     )
-    .expect_err("the haplotype output stage is not ported yet");
-    assert!(
-        error.contains("output_trio_graph_joint"),
-        "unexpected error: {}",
-        error
-    );
+    .expect("output_bp_graph must produce the primary and haplotype contigs");
 
-    for suffix in [".p_ctg.gfa", ".p_ctg.noseq.gfa", ".p_ctg.lowQ.bed"] {
+    for suffix in [
+        ".p_ctg.gfa",
+        ".p_ctg.noseq.gfa",
+        ".p_ctg.lowQ.bed",
+        ".hap1.p_ctg.gfa",
+        ".hap1.p_ctg.noseq.gfa",
+        ".hap1.p_ctg.lowQ.bed",
+        ".hap2.p_ctg.gfa",
+        ".hap2.p_ctg.noseq.gfa",
+        ".hap2.p_ctg.lowQ.bed",
+    ] {
         let produced = format!("{}{}", output_name, suffix);
         let golden = format!("{}{}", golden_prefix.display(), suffix);
         assert_same_file(Path::new(&produced), Path::new(&golden), suffix);
@@ -483,13 +489,27 @@ fn the_phase_unitig_graph_reproduces_the_reference() {
         &reads,
         &mut trio_flags,
     )
-    .expect_err("the haplotype output stage is not ported yet");
+    .expect("output_bp_graph must produce the primary and haplotype contigs");
 
-    // `reduce_hamming_error_adv` inserts no edge and fixes no bubble on this
+    // Replay the `f20`/`f21` states on a fresh clone: the driver's
+    // `reduce_hamming_error_adv` inserted no edge and fixed no bubble on this
     // corpus, so the read graph is unchanged when `ma_ug_gen_phase` runs.
+    let mut replay_graph = load_asg(&asg_path);
+    let mut replay_flags = trio_labels.clone();
+    reduce_hamming_error_adv(
+        None,
+        &mut replay_graph,
+        &sources,
+        &coverage_cut,
+        options.maximum_hang_length,
+        options.minimum_overlap_length,
+        options.gap_fuzz,
+        &mut replay_flags,
+        options.maximum_hang_rate,
+    );
     let golden_read_graph = load_asg(&read_graph_path);
     assert_graphs_match(
-        &read_graph,
+        &replay_graph,
         &golden_read_graph,
         "before ma_ug_gen_phase",
         true,
@@ -504,10 +524,10 @@ fn the_phase_unitig_graph_reproduces_the_reference() {
     };
     let phase_threshold = ((base * PHASE_SEF) as u64).max(PHASE_SEP);
     let phase = ma_ug_gen_phase(
-        &mut read_graph,
+        &mut replay_graph,
         phase_threshold as u32,
         PHASE_SEP_RATE,
-        &trio_flags,
+        &replay_flags,
     );
 
     let golden_unitigs = load_unitig_dump(&phase_ug_path);

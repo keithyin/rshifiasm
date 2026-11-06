@@ -13,11 +13,14 @@ use crate::assembly::bubble_identify::{asg_pop_bubble_primary_trio, get_unitig};
 use crate::assembly::gfa_clean::{
     get_real_length, get_real_length_one, END_TIPS, LONG_TIPS, LOOP, MUL_INPUT, MUL_OUTPUT,
 };
+use crate::assembly::hamming::{gen_rd_hamming_fly_simp_t, FlySimp};
 use crate::assembly::hap_cov::{HapCov, C_HET, P_HET};
-use crate::assembly::hit::{CoverageCut, ReadToUnitig, ALTER_LABEL, HAP_LABEL};
+use crate::assembly::hit::{CoverageCut, ReadToUnitig, ALTER_LABEL, HAP_LABEL, PRIMARY_LABEL};
 use crate::assembly::tangle::resolve_tangles;
 use crate::assembly::trans_cov::collect_trans_cov;
+use crate::assembly::purge_dups::ALTER_COVERAGE_THRESHOLD;
 use crate::assembly::unitig::{UnitigGraph, AMBIGU, FATHER, MOTHER};
+use crate::command_line::options::AssemblyOptions;
 use crate::container::ksort::radix_sort_u64;
 use crate::correction::ec_driver::PafList;
 
@@ -2420,6 +2423,1374 @@ pub fn clean_primary_untig_graph(
             round -= 1;
             continue;
         }
+        break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `output_trio_graph_joint` cleanup passes (`Overlaps.cpp` 18895–21121).
+// ---------------------------------------------------------------------------
+
+/// `if_primary_unitig`: whether the unitig is supported by primary coverage.
+///
+/// A unitig counts as primary when enough of its reads have their exact
+/// overlaps dominated by reads of the same unitig, at a per-read coverage
+/// inside `[recover_atg_cov_min, recover_atg_cov_max]`.
+#[allow(clippy::too_many_arguments)]
+pub fn if_primary_unitig(
+    unitig: &MaUtg,
+    read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+    primary_flag: &mut [u8],
+    options: &AssemblyOptions,
+) -> bool {
+    if options.recover_alternate_contig_coverage_minimum < 0
+        || options.recover_alternate_contig_coverage_maximum < 0
+    {
+        return false;
+    }
+    if unitig.reads.is_empty() {
+        return false;
+    }
+
+    for &packed in &unitig.reads {
+        primary_flag[(packed >> 33) as usize] = 1;
+    }
+
+    let mut available_reads = 0u32;
+    let mut total_c_bases = 0i64;
+    let mut total_c_bases_primary = 0i64;
+    for &packed in &unitig.reads {
+        let read = (packed >> 33) as usize;
+        let mut c_bases_primary = 0i64;
+        let mut c_bases_alter = 0i64;
+        let cut = &coverage_cut[read];
+        let r_bases = cut.end.wrapping_sub(cut.start) as i64;
+        for hit in &sources[read].hits {
+            if !hit.exact_region {
+                continue;
+            }
+            let mut target = hit.target_identifier;
+            if read_graph.sequences[target as usize].deleted {
+                // Resolve the deleted target to the read that contains it.
+                let (resolved, is_unitig) = read_to_unitig.get(target);
+                target = resolved;
+                if target == u32::MAX
+                    || is_unitig == 1
+                    || read_graph.sequences[target as usize].deleted
+                {
+                    continue;
+                }
+            }
+            if read_graph.sequences[target as usize].deleted {
+                continue;
+            }
+            let covered = hit.query_end.wrapping_sub(hit.query_start) as i64;
+            if primary_flag[target as usize] != 0 {
+                c_bases_primary += covered;
+            } else {
+                c_bases_alter += covered;
+            }
+        }
+
+        let c_bases = c_bases_primary + c_bases_alter;
+        total_c_bases += c_bases;
+
+        let c_bases = c_bases / r_bases;
+        if c_bases >= options.recover_alternate_contig_coverage_minimum
+            && c_bases <= options.recover_alternate_contig_coverage_maximum
+        {
+            if c_bases_primary as f64
+                >= (c_bases_primary + c_bases_alter) as f64 * ALTER_COVERAGE_THRESHOLD
+            {
+                available_reads += 1;
+            }
+            total_c_bases_primary += c_bases_primary;
+        }
+    }
+
+    for &packed in &unitig.reads {
+        primary_flag[(packed >> 33) as usize] = 0;
+    }
+
+    !(((available_reads as f64) < unitig.reads.len() as f64 * 0.8
+        && (total_c_bases_primary as f64) < total_c_bases as f64 * 0.8)
+        || available_reads == 0)
+}
+
+/// `set_drop_trio_flag`: every read of a surviving non-alternate unitig that
+/// has no trio assignment yet becomes [`DROP`].
+pub fn set_drop_trio_flag(unitig_graph: &UnitigGraph, trio_flags: &mut [u8]) {
+    let graph = &unitig_graph.graph;
+    for v in 0..graph.sequences.len() {
+        if graph.sequences[v].deleted {
+            continue;
+        }
+        if graph.sequences[v].coverage_class == ALTER_LABEL {
+            continue;
+        }
+        let unitig = &unitig_graph.unitigs[v];
+        if unitig.reads.is_empty() {
+            continue;
+        }
+        for &packed in &unitig.reads {
+            let read = (packed >> 33) as usize;
+            if trio_flags[read] != AMBIGU {
+                continue;
+            }
+            trio_flags[read] = DROP as u8;
+        }
+    }
+}
+
+/// `update_unitig_graph`: drops unitig tips whose reads contradict `flag`,
+/// keeping primary-supported ones.
+///
+/// Only tips (one live arc end) are inspected. A tip survives when too few of
+/// its reads carry a foreign trio label, when the size-scaled
+/// `double_check_rate` floor is not reached, or when
+/// [`if_primary_unitig`] holds; otherwise it is deleted.
+#[allow(clippy::too_many_arguments)]
+pub fn update_unitig_graph(
+    unitig_graph: &mut UnitigGraph,
+    read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    reverse_sources: &[PafList],
+    read_to_unitig: &mut ReadToUnitig,
+    is_r_het: &[u8],
+    is_final_check: bool,
+    double_check_rate: f64,
+    flag: u32,
+    drop_rate: f32,
+    trio_labels: &[u8],
+    purge_similarity_threshold: f32,
+    options: &AssemblyOptions,
+) {
+    drop_semi_circle(
+        unitig_graph,
+        read_graph,
+        reverse_sources,
+        read_to_unitig,
+        is_r_het,
+        purge_similarity_threshold,
+    );
+
+    let mut primary_flag = vec![0u8; read_graph.sequences.len()];
+    let mut n_reduce = 1u32;
+    while n_reduce != 0 {
+        n_reduce = 0;
+        let n_vtx = unitig_graph.graph.sequences.len();
+        for v in 0..n_vtx {
+            if unitig_graph.graph.sequences[v].deleted {
+                continue;
+            }
+            if unitig_graph.unitigs[v].reads.is_empty() {
+                continue;
+            }
+            // Only tips: both ends live means the unitig is internal.
+            if get_real_length(&unitig_graph.graph, (v as u32) << 1) != 0
+                && get_real_length(&unitig_graph.graph, ((v as u32) << 1) ^ 1) != 0
+            {
+                continue;
+            }
+
+            let mut flag_occ = 0u32;
+            let mut non_flag_occ = 0u32;
+            let mut hap_label_occ = 0u32;
+            for &packed in &unitig_graph.unitigs[v].reads {
+                let read = (packed >> 33) as usize;
+                if read_graph.sequences[read].coverage_class == HAP_LABEL {
+                    hap_label_occ += 1;
+                }
+                let label = trio_labels[read];
+                if label == AMBIGU {
+                    continue;
+                }
+                if label == DROP as u8 {
+                    continue;
+                }
+                if u32::from(label) == flag {
+                    flag_occ += 1;
+                }
+                if u32::from(label) != flag {
+                    non_flag_occ += 1;
+                }
+            }
+
+            if !is_final_check && hap_label_occ == unitig_graph.unitigs[v].reads.len() as u32 {
+                continue;
+            }
+
+            if !is_final_check {
+                let unitig_read_count = unitig_graph.unitigs[v].reads.len();
+                let rate = if unitig_read_count >= 100 {
+                    double_check_rate
+                } else if unitig_read_count >= 50 {
+                    double_check_rate * 0.5
+                } else {
+                    double_check_rate * 0.25
+                };
+                if (non_flag_occ as f64) < unitig_read_count as f64 * rate {
+                    continue;
+                }
+            }
+
+            if (non_flag_occ as f64) > (non_flag_occ + flag_occ) as f64 * f64::from(drop_rate) {
+                if if_primary_unitig(
+                    &unitig_graph.unitigs[v],
+                    read_graph,
+                    coverage_cut,
+                    sources,
+                    read_to_unitig,
+                    &mut primary_flag,
+                    options,
+                ) {
+                    continue;
+                }
+
+                let unitig = &mut unitig_graph.unitigs[v];
+                if !unitig.reads.is_empty() {
+                    unitig.length = 0;
+                    unitig.circular = false;
+                    unitig.start = 0;
+                    unitig.end = 0;
+                    unitig.reads = Vec::new();
+                }
+                unitig_graph.graph.delete_sequence(v as u32);
+                n_reduce += 1;
+            }
+        }
+    }
+
+    drop_semi_circle(
+        unitig_graph,
+        read_graph,
+        reverse_sources,
+        read_to_unitig,
+        is_r_het,
+        purge_similarity_threshold,
+    );
+    unitig_graph.graph.cleanup();
+}
+
+/// `magic_trio_phasing`: relabels the target unitigs of branching vertices
+/// whose reads clearly belong to the opposite haplotype.
+///
+/// A vertex with two or more live arcs counts the foreign reads of every
+/// target unitig; when at least one target is foreign and at least one is
+/// not, every foreign target (that [`if_primary_unitig`] does not protect)
+/// is relabelled [`ALTER_LABEL`] and dropped from the graph.
+#[allow(clippy::too_many_arguments)]
+pub fn magic_trio_phasing(
+    graph: &mut Asg,
+    unitigs: &[MaUtg],
+    read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+    trio_labels: &[u8],
+    positive_flag: u32,
+    drop_rate: f32,
+    options: &AssemblyOptions,
+) -> u32 {
+    let flag = if positive_flag == u32::from(FATHER) {
+        u32::from(MOTHER)
+    } else if positive_flag == u32::from(MOTHER) {
+        u32::from(FATHER)
+    } else {
+        u32::MAX
+    };
+    let mut primary_flag = vec![0u8; read_graph.sequences.len()];
+    let mut n_reduced = 0u32;
+
+    let n_vtx = (graph.sequences.len() * 2) as u32;
+    for v in 0..n_vtx {
+        if graph.arc_count(v) < 2 || graph.sequences[(v >> 1) as usize].deleted {
+            continue;
+        }
+        if get_real_length(graph, v) < 2 {
+            continue;
+        }
+
+        // The C code walks the live arc array while `asg_seq_drop` only sets
+        // deletion flags, so a snapshot of the arc positions is equivalent.
+        let (arc_start, arc_count) = graph.arc_range(v);
+        let arc_indices: Vec<usize> = (arc_start..arc_start + arc_count as usize).collect();
+
+        let mut keep_node = 0u32;
+        let mut del_node = 0u32;
+        for &arc_index in &arc_indices {
+            if graph.arcs[arc_index].deleted {
+                continue;
+            }
+            let target_unitig = &unitigs[(graph.arcs[arc_index].v >> 1) as usize];
+            let (flag_occ, non_flag_occ, _ambigious) =
+                get_unitig_trio_flag(target_unitig, flag, trio_labels);
+            if (flag_occ as f64) <= (non_flag_occ + flag_occ) as f64 * f64::from(drop_rate)
+                || (flag_occ + non_flag_occ) == 0
+            {
+                keep_node += 1;
+                continue;
+            }
+
+            let unitig_read_count = target_unitig.reads.len() as u32;
+            let rate = if unitig_read_count >= 100 {
+                DOUBLE_CHECK_THRES
+            } else if unitig_read_count >= 50 {
+                DOUBLE_CHECK_THRES * 0.5
+            } else {
+                DOUBLE_CHECK_THRES * 0.25
+            };
+            if (flag_occ as f64) < unitig_read_count as f64 * rate {
+                keep_node += 1;
+                continue;
+            }
+            del_node += 1;
+        }
+
+        if keep_node == 0 || del_node == 0 {
+            continue;
+        }
+
+        for &arc_index in &arc_indices {
+            if graph.arcs[arc_index].deleted {
+                continue;
+            }
+            let target_vertex = graph.arcs[arc_index].v;
+            let target_unitig = &unitigs[(target_vertex >> 1) as usize];
+            let (flag_occ, non_flag_occ, _ambigious) =
+                get_unitig_trio_flag(target_unitig, flag, trio_labels);
+            if (flag_occ as f64) <= (non_flag_occ + flag_occ) as f64 * f64::from(drop_rate)
+                || (flag_occ + non_flag_occ) == 0
+            {
+                continue;
+            }
+
+            let unitig_read_count = target_unitig.reads.len() as u32;
+            let rate = if unitig_read_count >= 100 {
+                DOUBLE_CHECK_THRES
+            } else if unitig_read_count >= 50 {
+                DOUBLE_CHECK_THRES * 0.5
+            } else {
+                DOUBLE_CHECK_THRES * 0.25
+            };
+            if (flag_occ as f64) < unitig_read_count as f64 * rate {
+                continue;
+            }
+
+            if if_primary_unitig(
+                target_unitig,
+                read_graph,
+                coverage_cut,
+                sources,
+                read_to_unitig,
+                &mut primary_flag,
+                options,
+            ) {
+                continue;
+            }
+
+            let unitig_vertex = target_vertex >> 1;
+            graph.sequences[unitig_vertex as usize].coverage_class = ALTER_LABEL;
+            asg_seq_drop(graph, unitig_vertex);
+            n_reduced += 1;
+        }
+    }
+
+    graph.cleanup();
+    n_reduced
+}
+
+/// `get_candidate_uids`: the live unitigs reachable from `unitig`'s reads,
+/// packed as `<uid>:32 | <occurrence count + 1>:32`.
+fn get_candidate_uids(
+    graph: &Asg,
+    unitig: &MaUtg,
+    reverse_sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+    candidates: &mut Vec<u64>,
+) {
+    candidates.clear();
+    if unitig.reads.is_empty() {
+        return;
+    }
+    for &packed in &unitig.reads {
+        let read = (packed >> 33) as usize;
+        for hit in &reverse_sources[read].hits {
+            let (mut uid, mut is_unitig) = read_to_unitig.get(hit.target_identifier);
+            if uid == u32::MAX {
+                continue;
+            }
+            // Contained read: resolve one more level to its unitig.
+            if is_unitig == 0 {
+                let (resolved, resolved_is_unitig) = read_to_unitig.get(uid);
+                uid = resolved;
+                is_unitig = resolved_is_unitig;
+            }
+            if uid == u32::MAX || is_unitig == 0 {
+                continue;
+            }
+            if graph.sequences[uid as usize].coverage_class == ALTER_LABEL {
+                continue;
+            }
+            candidates.push(u64::from(uid) | 0x1_0000_0000);
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+
+    radix_sort_u64(candidates);
+    let mut m = 0usize;
+    for k in 1..candidates.len() {
+        if candidates[k] == candidates[k - 1] {
+            candidates[m] += 0x1_0000_0000;
+        } else {
+            m += 1;
+            candidates[m] = candidates[k];
+        }
+    }
+    candidates.truncate(m + 1);
+}
+
+/// `unitig_simi`: whether the two unitigs share enough reads to be the same
+/// haplotype segment.
+///
+/// The shorter unitig is the query; it matches when enough of its reads
+/// overlap the reference unitig and the query carries enough heterozygous
+/// reads.
+#[allow(clippy::too_many_arguments)]
+fn unitig_simi(
+    x: u32,
+    y: u32,
+    unitigs: &[MaUtg],
+    reverse_sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+    is_r_het: &[u8],
+    similarity_threshold: f32,
+) -> u32 {
+    let unitig_x = &unitigs[x as usize];
+    let unitig_y = &unitigs[y as usize];
+    if unitig_x.reads.is_empty() || unitig_y.reads.is_empty() {
+        return UNAVAILABLE;
+    }
+
+    let (query, ref_unitig) = if unitig_x.reads.len() <= unitig_y.reads.len() {
+        (unitig_x, y)
+    } else {
+        (unitig_y, x)
+    };
+
+    let mut min_count = 0u32;
+    let mut max_count = 0u32;
+    let mut n_het = 0u32;
+    let mut n_hom = 0u32;
+    for &packed in &query.reads {
+        let read = (packed >> 33) as usize;
+        // `reverse_sources[rId].length >= 0` holds for every stored list.
+        min_count += 1;
+        if is_r_het[read] & C_HET != 0 || is_r_het[read] & P_HET != 0 {
+            n_het += 1;
+        }
+        n_hom += 1;
+
+        for hit in &reverse_sources[read].hits {
+            let (mut uid, mut is_unitig) = read_to_unitig.get(hit.target_identifier);
+            if uid == u32::MAX {
+                continue;
+            }
+            if is_unitig == 0 {
+                let (resolved, resolved_is_unitig) = read_to_unitig.get(uid);
+                uid = resolved;
+                is_unitig = resolved_is_unitig;
+            }
+            if uid == u32::MAX || is_unitig == 0 {
+                continue;
+            }
+            if uid == ref_unitig {
+                max_count += 1;
+                break;
+            }
+        }
+    }
+
+    if min_count == 0 {
+        return UNAVAILABLE;
+    }
+    if (max_count as f64) > min_count as f64 * f64::from(similarity_threshold)
+        && n_het as f64 >= n_hom as f64 * HET_HOM_RATE
+    {
+        PLOID
+    } else {
+        NON_PLOID
+    }
+}
+
+/// `all_to_all_deduplicate`: removes unitigs that are the alternate copy of a
+/// kept unitig they share reads with.
+///
+/// Every read of a live, non-alternate unitig is first mapped to its unitig.
+/// A unitig is then deleted when a reachable unitig reports [`PLOID`]
+/// similarity and [`if_primary_unitig`] does not protect it. The map's
+/// unitig entries are cleared afterwards.
+#[allow(clippy::too_many_arguments)]
+pub fn all_to_all_deduplicate(
+    unitig_graph: &mut UnitigGraph,
+    read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    positive_flag: u32,
+    drop_rate: f32,
+    reverse_sources: &[PafList],
+    read_to_unitig: &mut ReadToUnitig,
+    is_r_het: &[u8],
+    double_check_rate: f64,
+    non_tig_occ: i32,
+    trio_labels: &[u8],
+    purge_similarity_threshold: f32,
+    options: &AssemblyOptions,
+) {
+    let flag = if positive_flag == u32::from(FATHER) {
+        u32::from(MOTHER)
+    } else if positive_flag == u32::from(MOTHER) {
+        u32::from(FATHER)
+    } else {
+        u32::MAX
+    };
+    let mut primary_flag = vec![0u8; read_graph.sequences.len()];
+    let mut candidates: Vec<u64> = Vec::new();
+
+    for v in 0..unitig_graph.graph.sequences.len() {
+        let unitig = &unitig_graph.unitigs[v];
+        if unitig.reads.is_empty() {
+            continue;
+        }
+        if unitig_graph.graph.sequences[v].deleted {
+            continue;
+        }
+        if unitig_graph.graph.sequences[v].coverage_class == ALTER_LABEL {
+            continue;
+        }
+        for &packed in &unitig.reads {
+            let read = (packed >> 33) as usize;
+            read_to_unitig.set(
+                read as u32,
+                v as u32,
+                true,
+                Some(read_graph.sequences[read].coverage_class),
+            );
+        }
+    }
+
+    let mut n_reduce = 1u32;
+    while n_reduce != 0 {
+        n_reduce = 0;
+        let n_vtx = (unitig_graph.graph.sequences.len() * 2) as u32;
+        for v in 0..n_vtx {
+            let uid = (v >> 1) as usize;
+            if unitig_graph.unitigs[uid].reads.is_empty() {
+                continue;
+            }
+            if unitig_graph.graph.sequences[uid].deleted {
+                continue;
+            }
+            if unitig_graph.graph.sequences[uid].coverage_class == ALTER_LABEL {
+                continue;
+            }
+
+            let mut is_tig = true;
+            if get_real_length(&unitig_graph.graph, v ^ 1) == 1 {
+                if let Some(convex) = get_real_length_one(&unitig_graph.graph, v ^ 1) {
+                    if get_real_length(&unitig_graph.graph, convex ^ 1) == 1 {
+                        is_tig = false;
+                    }
+                }
+            }
+
+            let (flag_occ, non_flag_occ, _ambigious) =
+                get_unitig_trio_flag(&unitig_graph.unitigs[uid], flag, trio_labels);
+            if !is_tig && i64::from(flag_occ) <= i64::from(non_tig_occ) {
+                continue;
+            }
+            if (flag_occ as f64) <= (non_flag_occ + flag_occ) as f64 * f64::from(drop_rate) {
+                continue;
+            }
+            if (flag_occ + non_flag_occ) == 0 {
+                continue;
+            }
+
+            let unitig_read_count = unitig_graph.unitigs[uid].reads.len() as u32;
+            let rate = if unitig_read_count >= 100 {
+                double_check_rate
+            } else if unitig_read_count >= 50 {
+                double_check_rate * 0.5
+            } else {
+                double_check_rate * 0.25
+            };
+            if (flag_occ as f64) < unitig_read_count as f64 * rate {
+                continue;
+            }
+
+            get_candidate_uids(
+                &unitig_graph.graph,
+                &unitig_graph.unitigs[uid],
+                reverse_sources,
+                read_to_unitig,
+                &mut candidates,
+            );
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let mut similar = false;
+            for &candidate in &candidates {
+                if unitig_simi(
+                    uid as u32,
+                    (candidate & 0xffff_ffff) as u32,
+                    &unitig_graph.unitigs,
+                    reverse_sources,
+                    read_to_unitig,
+                    is_r_het,
+                    purge_similarity_threshold,
+                ) == PLOID
+                {
+                    similar = true;
+                    break;
+                }
+            }
+            if !similar {
+                continue;
+            }
+
+            if if_primary_unitig(
+                &unitig_graph.unitigs[uid],
+                read_graph,
+                coverage_cut,
+                sources,
+                read_to_unitig,
+                &mut primary_flag,
+                options,
+            ) {
+                continue;
+            }
+
+            let unitig = &mut unitig_graph.unitigs[uid];
+            if !unitig.reads.is_empty() {
+                unitig.length = 0;
+                unitig.circular = false;
+                unitig.start = 0;
+                unitig.end = 0;
+                unitig.reads = Vec::new();
+            }
+            unitig_graph.graph.delete_sequence(uid as u32);
+            n_reduce += 1;
+        }
+    }
+
+    // `for (v = 0; v < ruIndex->len; v++) ...`: drop every unitig mapping.
+    read_to_unitig.clear_unitig_entries();
+}
+
+/// `is_useful_node`: the label votes of one unitig clear the usefulness bar.
+fn is_useful_node(
+    flag_occ: u32,
+    non_flag_occ: u32,
+    drop_occ: u32,
+    tot_occ: u32,
+    flag_rate: f32,
+    used_rate: f32,
+    min_occ: u32,
+) -> bool {
+    flag_occ > 0
+        && flag_occ >= min_occ
+        && (flag_occ as f64) >= (non_flag_occ + flag_occ + drop_occ) as f64 * f64::from(flag_rate)
+        && (drop_occ as f64) <= tot_occ as f64 * f64::from(used_rate)
+}
+
+/// `recover_chain_nodes`: relabels useful alternate unitigs of a deleted
+/// chain back to primary.
+///
+/// Both the per-unitig and the running total vote are checked; the running
+/// vote additionally rescues every earlier alternate unitig of the chain
+/// with a zero `min_occ` bar.
+#[allow(clippy::too_many_arguments)]
+fn recover_chain_nodes(
+    chain: &[u32],
+    unitig_graph: &mut UnitigGraph,
+    flag: u32,
+    flag_rate: f32,
+    used_rate: f32,
+    min_occ: u32,
+    trio_labels: &[u8],
+) {
+    let UnitigGraph { unitigs, graph } = unitig_graph;
+    let mut tot_flag_occ = 0u32;
+    let mut tot_non_flag_occ = 0u32;
+    let mut tot_drop_occ = 0u32;
+    let mut tot_occ = 0u32;
+
+    for (i, &node) in chain.iter().enumerate() {
+        let uid = (node >> 1) as usize;
+        let unitig = &unitigs[uid];
+        let mut flag_occ = 0u32;
+        let mut non_flag_occ = 0u32;
+        let mut drop_occ = 0u32;
+        for &packed in &unitig.reads {
+            let label = trio_labels[(packed >> 33) as usize];
+            if label == AMBIGU {
+                continue;
+            } else if label == DROP as u8 {
+                drop_occ += 1;
+            } else if u32::from(label) == flag {
+                flag_occ += 1;
+            } else if u32::from(label) != flag {
+                non_flag_occ += 1;
+            }
+        }
+
+        if is_useful_node(
+            flag_occ,
+            non_flag_occ,
+            drop_occ,
+            unitig.reads.len() as u32,
+            flag_rate,
+            used_rate,
+            min_occ,
+        ) {
+            graph.sequences[uid].coverage_class = PRIMARY_LABEL;
+        }
+        tot_flag_occ += flag_occ;
+        tot_non_flag_occ += non_flag_occ;
+        tot_drop_occ += drop_occ;
+        tot_occ += unitig.reads.len() as u32;
+
+        if is_useful_node(
+            tot_flag_occ,
+            tot_non_flag_occ,
+            tot_drop_occ,
+            tot_occ,
+            flag_rate,
+            used_rate,
+            min_occ,
+        ) {
+            for &earlier in &chain[..=i] {
+                let earlier_uid = (earlier >> 1) as usize;
+                if graph.sequences[earlier_uid].coverage_class != ALTER_LABEL {
+                    continue;
+                }
+                let earlier_unitig = &unitigs[earlier_uid];
+                let mut flag_occ = 0u32;
+                let mut non_flag_occ = 0u32;
+                let mut drop_occ = 0u32;
+                for &packed in &earlier_unitig.reads {
+                    let label = trio_labels[(packed >> 33) as usize];
+                    if label == AMBIGU {
+                        continue;
+                    } else if label == DROP as u8 {
+                        drop_occ += 1;
+                    } else if u32::from(label) == flag {
+                        flag_occ += 1;
+                    } else if u32::from(label) != flag {
+                        non_flag_occ += 1;
+                    }
+                }
+                if is_useful_node(
+                    flag_occ,
+                    non_flag_occ,
+                    drop_occ,
+                    earlier_unitig.reads.len() as u32,
+                    flag_rate,
+                    used_rate,
+                    0,
+                ) {
+                    graph.sequences[earlier_uid].coverage_class = PRIMARY_LABEL;
+                }
+            }
+        }
+    }
+}
+
+/// `rescue_useless_trio_nodes`: walks the chains behind alternate tips and
+/// relabels the useful unitigs on them back to primary.
+pub fn rescue_useless_trio_nodes(
+    unitig_graph: &mut UnitigGraph,
+    flag: u32,
+    flag_rate: f32,
+    used_rate: f32,
+    min_occ: u32,
+    trio_labels: &[u8],
+) {
+    let n_vtx = (unitig_graph.graph.sequences.len() << 1) as u32;
+    let mut chain: Vec<u32> = Vec::new();
+
+    for v in 0..n_vtx {
+        if unitig_graph.graph.sequences[(v >> 1) as usize].deleted {
+            continue;
+        }
+        if unitig_graph.graph.sequences[(v >> 1) as usize].coverage_class != ALTER_LABEL {
+            continue;
+        }
+        // Check whether `v` is the tip end of a chain.
+        if get_real_length(&unitig_graph.graph, v ^ 1) == 1 {
+            if let Some(w) = get_real_length_one(&unitig_graph.graph, v ^ 1) {
+                if get_real_length(&unitig_graph.graph, w ^ 1) == 1 {
+                    continue;
+                }
+            }
+        }
+
+        chain.clear();
+        let mut end_node = 0u32;
+        let mut node_len = 0i64;
+        let mut base_len = 0i64;
+        let mut max_stop_node_len = 0i64;
+        let mut max_stop_base_len = 0i64;
+        get_unitig(
+            &unitig_graph.graph,
+            Some(&unitig_graph.unitigs),
+            v,
+            &mut end_node,
+            &mut node_len,
+            &mut base_len,
+            &mut max_stop_node_len,
+            &mut max_stop_base_len,
+            1,
+            Some(&mut chain),
+        );
+        recover_chain_nodes(
+            &chain,
+            unitig_graph,
+            flag,
+            flag_rate,
+            used_rate,
+            min_occ,
+            trio_labels,
+        );
+        if chain.len() > 1 {
+            chain.reverse();
+            recover_chain_nodes(
+                &chain,
+                unitig_graph,
+                flag,
+                flag_rate,
+                used_rate,
+                min_occ,
+                trio_labels,
+            );
+        }
+    }
+
+    unitig_graph.graph.cleanup();
+}
+
+/// `delete_useless_trio_nodes`: deletes every alternate unitig that no
+/// primary coverage supports, rescuing useful chain nodes first.
+#[allow(clippy::too_many_arguments)]
+pub fn delete_useless_trio_nodes(
+    unitig_graph: &mut UnitigGraph,
+    read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    read_to_unitig: &mut ReadToUnitig,
+    flag: u32,
+    flag_rate: f32,
+    used_rate: f32,
+    min_occ: u32,
+    trio_labels: &[u8],
+    options: &AssemblyOptions,
+) {
+    if flag_rate > 0.0 && used_rate > 0.0 && min_occ > 0 {
+        rescue_useless_trio_nodes(unitig_graph, flag, flag_rate, used_rate, min_occ, trio_labels);
+    }
+
+    let mut primary_flag = vec![0u8; read_graph.sequences.len()];
+    let n_vtx = unitig_graph.graph.sequences.len();
+    for v in 0..n_vtx {
+        if unitig_graph.graph.sequences[v].deleted {
+            continue;
+        }
+        if unitig_graph.graph.sequences[v].coverage_class == ALTER_LABEL
+            && !if_primary_unitig(
+                &unitig_graph.unitigs[v],
+                read_graph,
+                coverage_cut,
+                sources,
+                read_to_unitig,
+                &mut primary_flag,
+                options,
+            )
+        {
+            unitig_graph.graph.delete_sequence(v as u32);
+            if !unitig_graph.unitigs[v].reads.is_empty() {
+                unitig_graph.unitigs[v].reads = Vec::new();
+            }
+        }
+    }
+
+    unitig_graph.graph.cleanup();
+}
+
+/// `update_hap_label`: with a unitig graph, labels the reads of its
+/// `HAP_LABEL` unitigs in the read graph; without one, resets every
+/// `HAP_LABEL` read to primary.
+pub fn update_hap_label(unitig_graph: Option<&UnitigGraph>, read_graph: &mut Asg) {
+    let unitig_graph = match unitig_graph {
+        Some(unitig_graph) => unitig_graph,
+        None => {
+            for sequence in &mut read_graph.sequences {
+                if sequence.deleted {
+                    continue;
+                }
+                if sequence.coverage_class != HAP_LABEL {
+                    continue;
+                }
+                sequence.coverage_class = PRIMARY_LABEL;
+            }
+            return;
+        }
+    };
+
+    let n_vtx = unitig_graph.graph.sequences.len();
+    for v in 0..n_vtx {
+        if unitig_graph.graph.sequences[v].deleted {
+            continue;
+        }
+        if unitig_graph.graph.sequences[v].coverage_class != HAP_LABEL {
+            continue;
+        }
+        let unitig = &unitig_graph.unitigs[v];
+        if unitig.reads.is_empty() {
+            continue;
+        }
+        for &packed in &unitig.reads {
+            read_graph.sequences[(packed >> 33) as usize].coverage_class = HAP_LABEL;
+        }
+    }
+}
+
+/// `force_trio_clean`: walks the chains behind every tip and deletes the
+/// unitigs whose reads clearly belong to the opposite haplotype.
+///
+/// The whole chain must carry enough foreign reads
+/// (`contig_drop_rate`) before its individual unitigs are judged against
+/// `self_drop_rate` and `min_occ`.
+#[allow(clippy::too_many_arguments)]
+pub fn force_trio_clean(
+    unitig_graph: &mut UnitigGraph,
+    read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    read_to_unitig: &mut ReadToUnitig,
+    flag: u32,
+    self_drop_rate: f32,
+    contig_drop_rate: f32,
+    min_occ: u32,
+    trio_labels: &[u8],
+    options: &AssemblyOptions,
+) {
+    let mut primary_flag = vec![0u8; read_graph.sequences.len()];
+    let mut chain: Vec<u32> = Vec::new();
+    let mut n_reduce = 1u32;
+
+    while n_reduce != 0 {
+        n_reduce = 0;
+        // The reference bounds `beg` by `n_seq` (not the vertex count), so
+        // only the first half of the vertices is walked; kept as is.
+        let n_vtx = unitig_graph.graph.sequences.len() as u32;
+        for beg in 0..n_vtx {
+            if unitig_graph.graph.sequences[(beg >> 1) as usize].deleted
+                || unitig_graph.graph.arc_count(beg) == 0
+                || get_real_length(&unitig_graph.graph, beg) == 0
+            {
+                continue;
+            }
+            // Check whether `beg` is the tip end of a chain.
+            if get_real_length(&unitig_graph.graph, beg ^ 1) == 1 {
+                if let Some(end) = get_real_length_one(&unitig_graph.graph, beg ^ 1) {
+                    if get_real_length(&unitig_graph.graph, end ^ 1) == 1 {
+                        continue;
+                    }
+                }
+            }
+
+            chain.clear();
+            let mut tf_occ = 0u32;
+            let mut tnf_occ = 0u32;
+            let mut end_node = 0u32;
+            let mut node_len = 0i64;
+            let mut base_len = 0i64;
+            let mut max_stop_node_len = 0i64;
+            let mut max_stop_base_len = 0i64;
+            get_unitig(
+                &unitig_graph.graph,
+                Some(&unitig_graph.unitigs),
+                beg,
+                &mut end_node,
+                &mut node_len,
+                &mut base_len,
+                &mut max_stop_node_len,
+                &mut max_stop_base_len,
+                1,
+                Some(&mut chain),
+            );
+
+            for &node in &chain {
+                let unitig = &unitig_graph.unitigs[(node >> 1) as usize];
+                for &packed in &unitig.reads {
+                    let label = trio_labels[(packed >> 33) as usize];
+                    if label == AMBIGU {
+                        continue;
+                    }
+                    if label == DROP as u8 {
+                        continue;
+                    }
+                    if u32::from(label) == flag {
+                        tf_occ += 1;
+                    }
+                    if u32::from(label) != flag {
+                        tnf_occ += 1;
+                    }
+                }
+            }
+            if (tnf_occ as f64) <= (tnf_occ + tf_occ) as f64 * f64::from(contig_drop_rate) {
+                continue;
+            }
+
+            for &node in &chain {
+                let uid = (node >> 1) as usize;
+                let mut flag_occ = 0u32;
+                let mut non_flag_occ = 0u32;
+                for &packed in &unitig_graph.unitigs[uid].reads {
+                    let label = trio_labels[(packed >> 33) as usize];
+                    if label == AMBIGU {
+                        continue;
+                    }
+                    if label == DROP as u8 {
+                        continue;
+                    }
+                    if u32::from(label) == flag {
+                        flag_occ += 1;
+                    }
+                    if u32::from(label) != flag {
+                        non_flag_occ += 1;
+                    }
+                }
+
+                if non_flag_occ <= min_occ {
+                    continue;
+                }
+                if (non_flag_occ as f64)
+                    <= (non_flag_occ + flag_occ) as f64 * f64::from(self_drop_rate)
+                {
+                    continue;
+                }
+                if (non_flag_occ as f64)
+                    <= (tf_occ + tnf_occ) as f64 * f64::from(contig_drop_rate)
+                {
+                    continue;
+                }
+                if if_primary_unitig(
+                    &unitig_graph.unitigs[uid],
+                    read_graph,
+                    coverage_cut,
+                    sources,
+                    read_to_unitig,
+                    &mut primary_flag,
+                    options,
+                ) {
+                    continue;
+                }
+
+                let unitig = &mut unitig_graph.unitigs[uid];
+                if !unitig.reads.is_empty() {
+                    unitig.length = 0;
+                    unitig.circular = false;
+                    unitig.start = 0;
+                    unitig.end = 0;
+                    unitig.reads = Vec::new();
+                }
+                unitig_graph.graph.delete_sequence(uid as u32);
+                n_reduce += 1;
+            }
+        }
+    }
+
+    unitig_graph.graph.cleanup();
+}
+
+/// `clean_trio_untig_graph`: the full per-haplotype cleanup sweep.
+///
+/// The sweep is `asg_pop_bubble_primary_trio` + [`magic_trio_phasing`], the
+/// tip/complex cutting loop of [`clean_primary_untig_graph`], tangle
+/// resolution, [`all_to_all_deduplicate`] and a short-diploid cut. The whole
+/// sweep runs twice: once directly and once after
+/// [`unitig_arc_del_short_diploid_by_length`]. The phase cache ([`FlySimp`])
+/// is built once and reused across both sweeps.
+#[allow(clippy::too_many_arguments)]
+pub fn clean_trio_untig_graph(
+    unitig_graph: &mut UnitigGraph,
+    read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    reverse_sources: &[PafList],
+    tips_len: i64,
+    tip_drop_ratio: f32,
+    stops_threshold: u32,
+    read_to_unitig: &mut ReadToUnitig,
+    chimeric_rate: f32,
+    just_bubble_pop: bool,
+    drop_ratio: f32,
+    trio_flag: u32,
+    trio_drop_rate: f32,
+    max_hang: i32,
+    min_ovlp: i32,
+    gap_fuzz: i32,
+    cov: &mut HapCov,
+    new_rtg_edges: &mut Vec<AsgArc>,
+    trio_labels: &[u8],
+    purge_similarity_threshold: f32,
+    maximum_hang_rate: f32,
+    options: &AssemblyOptions,
+) {
+    let mut fly: Option<FlySimp> = None;
+    let mut is_first = true;
+
+    loop {
+        // `redo:`
+        asg_pop_bubble_primary_trio(
+            unitig_graph,
+            None,
+            trio_flag,
+            DROP,
+            Some(&mut *cov),
+            trio_labels,
+            true,
+            fly.as_mut(),
+        );
+        if fly.is_none() {
+            fly = Some(gen_rd_hamming_fly_simp_t(
+                unitig_graph,
+                read_graph,
+                sources,
+                coverage_cut,
+                max_hang,
+                maximum_hang_rate,
+                min_ovlp,
+                gap_fuzz,
+                new_rtg_edges,
+            ));
+        }
+
+        {
+            let UnitigGraph { unitigs, graph } = unitig_graph;
+            magic_trio_phasing(
+                graph,
+                unitigs,
+                read_graph,
+                coverage_cut,
+                sources,
+                read_to_unitig,
+                trio_labels,
+                trio_flag,
+                trio_drop_rate,
+                options,
+            );
+        }
+
+        if !just_bubble_pop {
+            cut_trio_tip_primary(
+                &mut unitig_graph.graph,
+                Some(&unitig_graph.unitigs),
+                tips_len as u32,
+                trio_flag,
+                0,
+                read_graph,
+                reverse_sources,
+                read_to_unitig,
+                &cov.is_r_het,
+                2,
+                trio_labels,
+                purge_similarity_threshold,
+            );
+        }
+
+        let mut pre_cons = get_graph_statistic(&unitig_graph.graph);
+        let mut cur_cons = 0i64;
+        while pre_cons != cur_cons {
+            pre_cons = get_graph_statistic(&unitig_graph.graph);
+            asg_pop_bubble_primary_trio(
+                unitig_graph,
+                None,
+                trio_flag,
+                DROP,
+                Some(&mut *cov),
+                trio_labels,
+                true,
+                fly.as_mut(),
+            );
+            if !just_bubble_pop {
+                asg_arc_cut_trio_long_tip_primary(
+                    &mut unitig_graph.graph,
+                    &unitig_graph.unitigs,
+                    read_graph,
+                    reverse_sources,
+                    read_to_unitig,
+                    2,
+                    tip_drop_ratio,
+                    trio_flag,
+                    cov,
+                    trio_labels,
+                    purge_similarity_threshold,
+                    maximum_hang_rate,
+                    coverage_cut,
+                );
+                asg_arc_cut_trio_long_equal_tips_assembly(
+                    &mut unitig_graph.graph,
+                    &unitig_graph.unitigs,
+                    read_graph,
+                    reverse_sources,
+                    2,
+                    read_to_unitig,
+                    trio_flag,
+                    trio_labels,
+                    coverage_cut,
+                    purge_similarity_threshold,
+                    maximum_hang_rate,
+                    cov,
+                );
+                asg_arc_cut_trio_long_tip_primary_complex(
+                    &mut unitig_graph.graph,
+                    &unitig_graph.unitigs,
+                    read_graph,
+                    reverse_sources,
+                    read_to_unitig,
+                    2,
+                    tip_drop_ratio,
+                    stops_threshold,
+                    trio_flag,
+                    cov,
+                    trio_labels,
+                    purge_similarity_threshold,
+                    maximum_hang_rate,
+                    coverage_cut,
+                );
+                asg_arc_cut_trio_long_equal_tips_assembly_complex(
+                    &mut unitig_graph.graph,
+                    &unitig_graph.unitigs,
+                    read_graph,
+                    reverse_sources,
+                    2,
+                    read_to_unitig,
+                    stops_threshold,
+                    trio_flag,
+                    cov,
+                    trio_labels,
+                    purge_similarity_threshold,
+                    maximum_hang_rate,
+                    coverage_cut,
+                );
+                detect_chimeric_by_topo(
+                    &mut unitig_graph.graph,
+                    &unitig_graph.unitigs,
+                    read_graph,
+                    reverse_sources,
+                    2,
+                    stops_threshold,
+                    chimeric_rate,
+                    read_to_unitig,
+                    &cov.is_r_het,
+                    purge_similarity_threshold,
+                );
+            }
+            cur_cons = get_graph_statistic(&unitig_graph.graph);
+        }
+
+        if !just_bubble_pop {
+            cut_trio_tip_primary(
+                &mut unitig_graph.graph,
+                Some(&unitig_graph.unitigs),
+                tips_len as u32,
+                trio_flag,
+                0,
+                read_graph,
+                reverse_sources,
+                read_to_unitig,
+                &cov.is_r_het,
+                2,
+                trio_labels,
+                purge_similarity_threshold,
+            );
+        }
+
+        {
+            let UnitigGraph { unitigs, graph } = unitig_graph;
+            magic_trio_phasing(
+                graph,
+                unitigs,
+                read_graph,
+                coverage_cut,
+                sources,
+                read_to_unitig,
+                trio_labels,
+                trio_flag,
+                trio_drop_rate,
+                options,
+            );
+        }
+
+        resolve_tangles(
+            unitig_graph,
+            read_graph,
+            reverse_sources,
+            20,
+            100,
+            0.05,
+            0.2,
+            read_to_unitig,
+            &cov.is_r_het,
+            trio_flag,
+            drop_ratio,
+            trio_labels,
+            purge_similarity_threshold,
+        );
+
+        drop_semi_circle(
+            unitig_graph,
+            read_graph,
+            reverse_sources,
+            read_to_unitig,
+            &cov.is_r_het,
+            purge_similarity_threshold,
+        );
+
+        all_to_all_deduplicate(
+            unitig_graph,
+            read_graph,
+            coverage_cut,
+            sources,
+            trio_flag,
+            trio_drop_rate,
+            reverse_sources,
+            read_to_unitig,
+            &cov.is_r_het,
+            DOUBLE_CHECK_THRES,
+            options.trio_flag_occurrence_threshold,
+            trio_labels,
+            purge_similarity_threshold,
+            options,
+        );
+
+        if is_first {
+            is_first = false;
+            unitig_arc_del_short_diploid_by_length(&mut unitig_graph.graph, drop_ratio);
+            continue; // `goto redo`
+        }
+
+        let adjusted_arcs = fly.as_ref().map_or(0, |fly| fly.n_insert);
+        eprintln!("[M::clean_trio_untig_graph] # adjusted arcs::{}", adjusted_arcs);
         break;
     }
 }

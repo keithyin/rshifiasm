@@ -332,6 +332,7 @@ fn the_unitig_stage_reproduces_the_reference_r_utg() {
         "utg",
         &mut produced,
         &reads,
+        &reads.trio_labels,
     )
     .unwrap();
 
@@ -348,6 +349,7 @@ fn the_unitig_stage_reproduces_the_reference_r_utg() {
         "utg",
         &mut produced_simple,
         &reads,
+        &reads.trio_labels,
     )
     .unwrap();
 
