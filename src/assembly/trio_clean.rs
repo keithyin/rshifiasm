@@ -2244,6 +2244,7 @@ pub fn clean_primary_untig_graph(
             Some(&mut *cov),
             trio_labels,
             true,
+            None,
         );
         if !just_bubble_pop {
             cut_trio_tip_primary(
@@ -2274,6 +2275,7 @@ pub fn clean_primary_untig_graph(
                 Some(&mut *cov),
                 trio_labels,
                 true,
+                None,
             );
             if !just_bubble_pop {
                 // Tangles have to be considered here.

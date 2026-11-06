@@ -244,8 +244,360 @@ fn ma_ug_gen_inner(graph: &mut Asg, coverage_flag: Option<u8>) -> UnitigGraph {
     }
 }
 
-/// `get_edge_from_source`: the first stored overlap of `query` that becomes
-/// exactly the `query -> target` arc.
+/// `PHASE_SEF`: the multiplier that turns the homozygous coverage into the
+/// minimum occurrence of a phased unitig.
+pub const PHASE_SEF: f64 = 2.0;
+/// `PHASE_SEP`: the lower bound of the phase occurrence threshold.
+pub const PHASE_SEP: u64 = 64;
+/// `PHASE_SEP_RATE`: the ratio that decides whether a chain is split by the
+/// trio labels.
+pub const PHASE_SEP_RATE: f64 = 0.04;
+
+/// `ma_ug_gen_phase`: [`ma_ug_gen`] with trio-label aware unitig splitting.
+///
+/// A chain whose reads carry a clear father or mother majority is split into
+/// phase blocks at the label switches; the remaining chains stay whole.
+pub fn ma_ug_gen_phase(
+    graph: &mut Asg,
+    min_occ: u32,
+    cutoff: f64,
+    trio_labels: &[u8],
+) -> UnitigGraph {
+    graph.cleanup();
+
+    let normalize = |label: u8| -> u8 {
+        if label == FATHER || label == MOTHER {
+            label
+        } else {
+            AMBIGU
+        }
+    };
+    let label_of = |packed: u64| -> u8 { normalize(trio_labels[(packed >> 33) as usize]) };
+
+    let vertex_count = graph.sequences.len() * 2;
+    let mut mark = vec![0i32; vertex_count];
+    let mut unitigs: Vec<MaUtg> = Vec::new();
+    let mut queue: Vec<u64> = Vec::new();
+    let mut uidx: Vec<u64> = Vec::new();
+
+    for v in 0..vertex_count as u32 {
+        if graph.sequences[(v >> 1) as usize].deleted || mark[v as usize] != 0 {
+            continue;
+        }
+        if graph.arc_count(v) == 0 && graph.arc_count(v ^ 1) != 0 {
+            continue;
+        }
+
+        mark[v as usize] = 1;
+        queue.clear();
+        let mut start = v;
+        let mut end = v ^ 1;
+        let mut length: u32 = 0;
+        let mut father_count: u32 = 0;
+        let mut mother_count: u32 = 0;
+
+        // Forward walk, exactly as in `ma_ug_gen`.
+        let mut w = v;
+        loop {
+            if graph.arc_count(w) != 1 {
+                break;
+            }
+            let x = graph.arcs_of(w)[0].v;
+            if graph.arc_count(x ^ 1) != 1 {
+                break;
+            }
+            mark[x as usize] = 1;
+            mark[(w ^ 1) as usize] = 1;
+            let edge_length = graph.arcs_of(w)[0].node_length();
+            queue.push((u64::from(w) << 32) | u64::from(edge_length));
+            match trio_labels[(w >> 1) as usize] {
+                FATHER => father_count = father_count.wrapping_add(1),
+                MOTHER => mother_count = mother_count.wrapping_add(1),
+                _ => {}
+            }
+            end = x ^ 1;
+            length = length.wrapping_add(edge_length);
+            w = x;
+            if x == v {
+                break;
+            }
+        }
+
+        let circular;
+        if start != (end ^ 1) || queue.is_empty() {
+            let sequence_length = graph.sequences[(end >> 1) as usize].length;
+            queue.push((u64::from(end ^ 1) << 32) | u64::from(sequence_length));
+            match trio_labels[(end >> 1) as usize] {
+                FATHER => father_count = father_count.wrapping_add(1),
+                MOTHER => mother_count = mother_count.wrapping_add(1),
+                _ => {}
+            }
+            length = length.wrapping_add(sequence_length);
+            circular = false;
+        } else {
+            start = u32::MAX;
+            end = u32::MAX;
+            circular = true;
+        }
+
+        if !circular {
+            let mut x = v;
+            loop {
+                if graph.arc_count(x ^ 1) != 1 {
+                    break;
+                }
+                let w = graph.arcs_of(x ^ 1)[0].v ^ 1;
+                if graph.arc_count(w) != 1 {
+                    break;
+                }
+                mark[x as usize] = 1;
+                mark[(w ^ 1) as usize] = 1;
+                let edge_length = graph.arcs_of(w)[0].node_length();
+                queue.insert(0, (u64::from(w) << 32) | u64::from(edge_length));
+                match trio_labels[(w >> 1) as usize] {
+                    FATHER => father_count = father_count.wrapping_add(1),
+                    MOTHER => mother_count = mother_count.wrapping_add(1),
+                    _ => {}
+                }
+                start = w;
+                length = length.wrapping_add(edge_length);
+                x = w;
+            }
+        }
+
+        if start != u32::MAX {
+            mark[start as usize] = 1;
+            mark[end as usize] = 1;
+        }
+
+        let common = father_count.min(mother_count);
+        let is_phased = common > min_occ
+            && f64::from(common) > f64::from(father_count.wrapping_add(mother_count)) * cutoff;
+        if !is_phased || queue.is_empty() {
+            unitigs.push(MaUtg {
+                length: length & 0x7fff_ffff,
+                circular,
+                start,
+                end,
+                reads: queue.clone(),
+                sequence: Vec::new(),
+            });
+            continue;
+        }
+
+        // Split the traversal into phase blocks at the label switches.
+        uidx.clear();
+        let queue_size = queue.len();
+        let current = label_of(queue[0]);
+        let mut previous = current;
+        let first_father = father_count;
+        let first_mother = mother_count;
+        father_count = 0;
+        mother_count = 0;
+        if current == FATHER {
+            father_count = 1;
+        }
+        if current == MOTHER {
+            mother_count = 1;
+        }
+        let mut segment_start = 0usize;
+        for k in 1..=queue_size {
+            let mut split = false;
+            let mut next = AMBIGU;
+            if k == queue_size {
+                split = true;
+            } else {
+                next = label_of(queue[k]);
+                if next != AMBIGU && previous != AMBIGU && next != previous {
+                    split = true;
+                }
+            }
+            if split {
+                let mut packed = (segment_start as u64) << 1;
+                packed |= u64::from(father_count.max(mother_count)) << 32;
+                if mother_count != 0 {
+                    packed |= 1;
+                }
+                uidx.push(packed);
+                father_count = 0;
+                mother_count = 0;
+                segment_start = k;
+            }
+            if next != AMBIGU {
+                previous = next;
+            }
+            if next == FATHER {
+                father_count = father_count.wrapping_add(1);
+            }
+            if next == MOTHER {
+                mother_count = mother_count.wrapping_add(1);
+            }
+        }
+
+        let mut father: u32 = 0;
+        let mut mother: u32 = 0;
+        let mut piece_father: u32 = 0;
+        let mut piece_mother: u32 = 0;
+        let mut emitted_reads: u32 = 0;
+        let first = uidx[0];
+        if first & 1 != 0 {
+            mother = mother.wrapping_add((first >> 32) as u32);
+        } else {
+            father = father.wrapping_add((first >> 32) as u32);
+        }
+        let mut block_start = 0usize;
+        for k in 1..=uidx.len() {
+            let mut split = false;
+            if k == uidx.len() {
+                split = true;
+            } else {
+                let entry = uidx[k];
+                if entry & 1 != 0 {
+                    mother = mother.wrapping_add((entry >> 32) as u32);
+                } else {
+                    father = father.wrapping_add((entry >> 32) as u32);
+                }
+                let common = father.min(mother);
+                if common > min_occ
+                    && f64::from(common) > f64::from(father.wrapping_add(mother)) * cutoff
+                {
+                    split = true;
+                }
+            }
+            if !split {
+                continue;
+            }
+
+            let sz = ((uidx[block_start] as u32) >> 1) as usize;
+            let ez = if k < uidx.len() {
+                ((uidx[k] as u32) >> 1) as usize
+            } else {
+                queue_size
+            };
+            assert!(ez > sz);
+            emitted_reads += (ez - sz) as u32;
+
+            if circular && sz == 0 && ez == queue_size {
+                let reads = queue.clone();
+                for &packed in &reads {
+                    let label = label_of(packed);
+                    if label == FATHER {
+                        piece_father = piece_father.wrapping_add(1);
+                    }
+                    if label == MOTHER {
+                        piece_mother = piece_mother.wrapping_add(1);
+                    }
+                }
+                unitigs.push(MaUtg {
+                    length: length & 0x7fff_ffff,
+                    circular: true,
+                    start,
+                    end,
+                    reads,
+                    sequence: Vec::new(),
+                });
+            } else {
+                let mut piece_length: u32 = 0;
+                let mut reads: Vec<u64> = Vec::with_capacity(ez - sz);
+                for i in sz..ez - 1 {
+                    let packed = queue[i];
+                    reads.push(packed);
+                    piece_length = piece_length.wrapping_add(packed as u32);
+                    let label = label_of(packed);
+                    if label == FATHER {
+                        piece_father = piece_father.wrapping_add(1);
+                    }
+                    if label == MOTHER {
+                        piece_mother = piece_mother.wrapping_add(1);
+                    }
+                }
+                // The last element carries the sequence length of its vertex.
+                let vertex = (queue[ez - 1] >> 32) as u32;
+                let last = (u64::from(vertex) << 32)
+                    | u64::from(graph.sequences[(vertex >> 1) as usize].length);
+                reads.push(last);
+                piece_length = piece_length.wrapping_add(last as u32);
+                let label = label_of(last);
+                if label == FATHER {
+                    piece_father = piece_father.wrapping_add(1);
+                }
+                if label == MOTHER {
+                    piece_mother = piece_mother.wrapping_add(1);
+                }
+                unitigs.push(MaUtg {
+                    length: piece_length & 0x7fff_ffff,
+                    circular: false,
+                    start: (queue[sz] >> 32) as u32,
+                    end: ((queue[ez - 1] >> 32) as u32) ^ 1,
+                    reads,
+                    sequence: Vec::new(),
+                });
+            }
+
+            father = 0;
+            mother = 0;
+            block_start = k;
+            if k < uidx.len() {
+                let entry = uidx[k];
+                if entry & 1 != 0 {
+                    mother = mother.wrapping_add((entry >> 32) as u32);
+                } else {
+                    father = father.wrapping_add((entry >> 32) as u32);
+                }
+            }
+        }
+        assert_eq!(emitted_reads as usize, queue_size);
+        assert_eq!(piece_father, first_father);
+        assert_eq!(piece_mother, first_mother);
+    }
+
+    // Add the arcs between unitigs.
+    mark.fill(-1);
+    for (i, unitig) in unitigs.iter().enumerate() {
+        if unitig.circular {
+            continue;
+        }
+        mark[unitig.start as usize] = ((i as i32) << 1) | 0;
+        mark[unitig.end as usize] = ((i as i32) << 1) | 1;
+    }
+
+    let mut unitig_graph = Asg::new();
+    for arc in &graph.arcs {
+        if arc.deleted {
+            continue;
+        }
+        let query_mark = mark[(arc.query_vertex() ^ 1) as usize];
+        let target_mark = mark[arc.v as usize];
+        if query_mark >= 0 && target_mark >= 0 {
+            let u = (query_mark as u32) ^ 1;
+            let mut node_length = unitigs[(u >> 1) as usize]
+                .length
+                .wrapping_sub(arc.overlap) as i32;
+            if node_length < 0 {
+                node_length = 1;
+            }
+            unitig_graph.push_arc(AsgArc {
+                ul: (u64::from(u) << 32) | u64::from(node_length as u32),
+                v: target_mark as u32,
+                overlap: arc.overlap,
+                deleted: false,
+                occurrence: 0,
+                strong: false,
+                without_large_indel: false,
+                exact_region: arc.exact_region,
+            });
+        }
+    }
+    for (i, unitig) in unitigs.iter().enumerate() {
+        unitig_graph.set_sequence(i, unitig.length, false);
+    }
+    unitig_graph.cleanup();
+
+    UnitigGraph {
+        unitigs,
+        graph: unitig_graph,
+    }
+}
 ///
 /// The scan includes hits whose `del` flag is set, exactly like the reference.
 pub fn get_edge_from_source(
@@ -2164,6 +2516,7 @@ pub fn output_contig_graph_primary_pre(
             None,
             &reads.trio_labels,
             false,
+            None,
         );
         delete_useless_nodes(&mut unitig_graph);
         renew_utg(&mut unitig_graph, read_graph, &edges);

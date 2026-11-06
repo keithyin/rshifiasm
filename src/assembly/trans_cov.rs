@@ -10,13 +10,14 @@
 //! coverage of the aligned part is handed back to the primary reads. Every
 //! read on both aligned parts is flagged `P_HET`.
 //!
-//! `chain_origin_trans_uid_by_distance` and `collect_trans_ovlp` of the
-//! reference only fill the trio transition buffers (`t_ch`/`utg_trans_t`);
-//! they change neither coverage nor the heterozygosity flags, so they stay
-//! deferred until the trio stage is ported.
+//! `chain_origin_trans_uid_by_distance` appends the read-to-read transitions
+//! to the trans chain for the trio output stage. `collect_trans_ovlp` only
+//! fills a different trio transition buffer and is still deferred.
 
 use crate::assembly::asg::{Asg, AsgArc, MaUtg};
-use crate::assembly::hap_cov::{ArcOffset, HapCov, P_HET};
+use crate::assembly::hap_cov::{
+    chain_origin_trans_uid_by_distance, ArcOffset, HapCov, P_HET, RC_1,
+};
 use crate::assembly::hit::{ma_hit_to_arc, CoverageCut};
 use crate::correction::ec_driver::PafList;
 
@@ -551,7 +552,7 @@ pub fn chain_trans_ovlp(
 ///
 /// `primary`/`auxiliary` are unitig vertex chains; `primary_offset` and
 /// `auxiliary_offset` are the overlap lengths the reference passes through to
-/// `chain_origin_trans_uid_by_distance`, which is deferred.
+/// [`chain_origin_trans_uid_by_distance`].
 #[allow(clippy::too_many_arguments)]
 pub fn collect_trans_cov(
     primary: &[u32],
@@ -583,8 +584,25 @@ pub fn collect_trans_cov(
     );
 
     if thre_pri > 0 {
-        // Deferred: `chain_origin_trans_uid_by_distance` only appends to
-        // `t_ch->k_trans`/`k_t_b`/`c_buf`, which the trio output consumes.
+        // Append the read-to-read transitions of this alignment; they feed
+        // the trio/haplotype output stage.
+        if let Some(t_ch) = cov.t_ch.as_mut() {
+            chain_origin_trans_uid_by_distance(
+                t_ch,
+                unitigs,
+                &mut cov.pos_idx,
+                &mut cov.u_buffer,
+                &mut cov.tail_index,
+                primary,
+                primary_offset as u32,
+                None,
+                auxiliary,
+                auxiliary_offset as u32,
+                Some(len_aux),
+                RC_1,
+                -1024.0,
+            );
+        }
 
         let has_trans_chain = cov.t_ch.is_some();
 

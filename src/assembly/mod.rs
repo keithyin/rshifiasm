@@ -4,12 +4,14 @@
 //! the module that owns its algorithm.
 
 pub mod asg;
+pub mod bp_graph;
 pub mod bubble;
 pub mod bubble_identify;
 pub mod chimeric;
 pub mod corrected_output;
 pub mod gfa_clean;
 pub mod graph_build;
+pub mod hamming;
 pub mod hap_cov;
 pub mod hit;
 pub mod pipeline;
@@ -17,6 +19,7 @@ pub mod probe;
 pub mod purge_dups;
 pub mod rescue;
 pub mod tangle;
+pub mod trans_clean;
 pub mod trans_cov;
 pub mod trio_clean;
 pub mod unitig;

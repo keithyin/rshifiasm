@@ -1,20 +1,27 @@
-//! Coverage inference for the purge stage, the counterpart of the peak
-//! helpers in `Purge_Dups.cpp` and of `set_hom_global_coverage`.
+//! Coverage inference and duplicate purging, the counterpart of
+//! `Purge_Dups.cpp` and of `set_hom_global_coverage` in `Overlaps.cpp`.
 //!
 //! The cleaning stage calls `set_hom_global_coverage` once before the bubble
 //! rescue round; it builds a unitig graph and runs `purge_dups` with
 //! `just_coverage = 1`, which only infers the homozygous coverage from the
 //! read overlap histogram and the per-unitig coverage bins, then exits through
-//! `end_coverage`. The hap-alignment machinery of the full purge
-//! (`hap_alignment_advance_worker`, `mc_solve`, `remove_contained_haplotig`,
-//! ...) is never reached on that path and is not modelled here.
+//! `end_coverage`. The output stage (`output_bp_graph`) later runs the full
+//! `purge_dups` on the copied primary graph.
+//!
+//! The driver, the vote-counting half of `hap_alignment_advance_worker`, the
+//! purge-graph bookkeeping and the partitioning side effects are ported. The
+//! haplotype-alignment candidate scan and the non-empty purge-graph paths are
+//! unreachable on the chr11-2M corpus (the copied primary graph holds a single
+//! unitig) and return an explicit error instead of silently diverging.
 
 use crate::assembly::asg::Asg;
-use crate::assembly::hit::{CoverageCut, ReadToUnitig, ALTER_LABEL};
-use crate::assembly::unitig::{ma_ug_gen, UnitigGraph};
-use crate::command_line::options::AssemblyOptions;
+use crate::assembly::hap_cov::{HapCov, N_HET, P_HET};
+use crate::assembly::hit::{CoverageCut, ReadToUnitig, ALTER_LABEL, PRIMARY_LABEL};
+use crate::assembly::unitig::{ma_ug_gen, UnitigGraph, FATHER};
+use crate::command_line::options::{AssemblyOptions, FLAG_PARTITION};
 use crate::correction::ec_driver::PafList;
 use crate::counting::peak_analysis::adjust_homozygous_peak;
+use crate::overlap::paf::PafHit;
 
 /// `COV_COUNT`: the coverage histogram is one bin per supported depth.
 pub const COVERAGE_COUNT: i64 = 1024;
@@ -509,4 +516,596 @@ pub fn set_hom_global_coverage(
     // `if(just_coverage) goto end_coverage;`
     read_to_unitig.clear_unitig_entries();
     unitig_graph.graph.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// The full `purge_dups`.
+// ---------------------------------------------------------------------------
+
+/// `SELF_EXIST`: the overlap was found by the scan of unitig `xUid`.
+pub const SELF_EXIST: u8 = 0;
+/// `REVE_EXIST`: the overlap is the reverse-side copy of another one.
+pub const REVE_EXIST: u8 = 1;
+/// `DELETE`: the overlap was rejected by a later filter.
+pub const DELETE: u8 = 2;
+/// `MIXED`.
+pub const MIXED: u8 = 3;
+/// `FLIP`: the overlap conflicts with the min-cut partition.
+pub const FLIP: u8 = 4;
+
+/// `X2Y`.
+pub const X2Y: u8 = 0;
+/// `Y2X`.
+pub const Y2X: u8 = 1;
+/// `XCY`.
+pub const XCY: u8 = 2;
+/// `YCX`.
+pub const YCX: u8 = 3;
+
+/// `REV_W`: the weight `init_pip_hh` gives a read with no reverse coverage.
+pub const REV_W: i64 = 8;
+/// `SET_TRIO`: the read was seen while the primary graph was partitioned.
+pub const SET_TRIO: u8 = 8;
+
+/// `hap_overlaps`: one haplotype-alignment chain between two unitigs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HapOverlap {
+    /// `rev`.
+    pub reverse: u8,
+    /// `type`.
+    pub kind: u8,
+    /// `status`.
+    pub status: u8,
+    /// `x_beg_pos`.
+    pub x_beg_pos: u32,
+    /// `x_end_pos`.
+    pub x_end_pos: u32,
+    /// `y_beg_pos`.
+    pub y_beg_pos: u32,
+    /// `y_end_pos`.
+    pub y_end_pos: u32,
+    /// `x_beg_id`.
+    pub x_beg_id: u32,
+    /// `x_end_id`.
+    pub x_end_id: u32,
+    /// `y_beg_id`.
+    pub y_beg_id: u32,
+    /// `y_end_id`.
+    pub y_end_id: u32,
+    /// `xUid`.
+    pub x_uid: u32,
+    /// `yUid`.
+    pub y_uid: u32,
+    /// `weight`.
+    pub weight: u32,
+    /// `score`.
+    pub score: i64,
+    /// `s`, the pair similarity.
+    pub similarity: f32,
+}
+
+/// `hap_overlaps_list`: one overlap list per unitig.
+#[derive(Debug, Clone, Default)]
+pub struct HapOverlapsList {
+    /// `x`.
+    pub x: Vec<Vec<HapOverlap>>,
+}
+
+impl HapOverlapsList {
+    /// `init_hap_overlaps_list`.
+    pub fn new(num: usize) -> Self {
+        Self { x: vec![Vec::new(); num] }
+    }
+
+    /// Whether every per-unitig list is empty.
+    pub fn is_empty(&self) -> bool {
+        self.x.iter().all(|list| list.is_empty())
+    }
+}
+
+/// `p_node_t`: a run of reads of one unitig with the same heterozygosity flag.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PNode {
+    /// `baseBeg`.
+    pub base_beg: u32,
+    /// `baseEnd`.
+    pub base_end: u32,
+    /// `nodeBeg`.
+    pub node_beg: u32,
+    /// `nodeEnd`.
+    pub node_end: u32,
+    /// `h_lev_idx`, unused by the reference.
+    pub h_lev_idx: u32,
+    /// `h_status`.
+    pub h_status: u32,
+    /// `c_ug_id`.
+    pub c_ug_id: u32,
+}
+
+/// `p_g_in_t`: the slice of `pg_het_node` that belongs to one unitig.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PGIn {
+    /// `beg`.
+    pub beg: u32,
+    /// `occ`.
+    pub occ: u32,
+}
+
+/// `p_g_t`: the purge-level graph and its het/hom intervals.
+#[derive(Debug, Clone, Default)]
+pub struct PG {
+    /// `pg_het_node`.
+    pub pg_het_node: Vec<PNode>,
+    /// `pg_h_lev`.
+    pub pg_h_lev: Asg,
+    /// `pg_h_lev_idx`.
+    pub pg_h_lev_idx: Vec<PGIn>,
+}
+
+/// `init_p_g_t`: builds the unitig-level purge graph and the per-unitig
+/// heterozygous/homozygous read runs.
+fn init_p_g_t(unitig_graph: &UnitigGraph, read_graph: &Asg, is_r_het: &[u8]) -> PG {
+    let nsg = &unitig_graph.graph;
+    let mut pg = PG::default();
+
+    for v in 0..nsg.sequences.len() {
+        if nsg.sequences[v].deleted || nsg.sequences[v].coverage_class == ALTER_LABEL {
+            // `asg_seq_set(pg->pg_h_lev, uId, 0, 1)` followed by the class
+            // store. `asg_seq_set` writes the deletion flag and length; the
+            // class byte is assigned separately in the reference.
+            pg.pg_h_lev.set_sequence(v, 0, true);
+            pg.pg_h_lev.sequences[v].coverage_class = ALTER_LABEL;
+            continue;
+        }
+        pg.pg_h_lev.set_sequence(v, unitig_graph.unitigs[v].length, false);
+        pg.pg_h_lev.sequences[v].coverage_class = PRIMARY_LABEL;
+    }
+
+    for v in 0..nsg.sequences.len() {
+        if nsg.sequences[v].deleted || nsg.sequences[v].coverage_class == ALTER_LABEL {
+            continue;
+        }
+        let unitig = &unitig_graph.unitigs[v];
+        let run_start = pg.pg_het_node.len() as u32;
+        let n = unitig.reads.len();
+        let mut k = 1usize;
+        let mut l = 0usize;
+        let mut offset: u32 = 0;
+        let mut l_pos: u32 = 0;
+        while k <= n {
+            let end = k == n
+                || is_r_het[(unitig.reads[k] >> 33) as usize]
+                    != is_r_het[(unitig.reads[l] >> 33) as usize];
+            if end {
+                pg.pg_het_node.push(PNode {
+                    c_ug_id: v as u32,
+                    h_status: u32::from(is_r_het[(unitig.reads[l] >> 33) as usize]),
+                    base_beg: l_pos,
+                    base_end: offset
+                        .wrapping_add(read_graph.sequences[(unitig.reads[k - 1] >> 33) as usize].length)
+                        .wrapping_sub(1),
+                    node_beg: l as u32,
+                    node_end: (k - 1) as u32,
+                    h_lev_idx: 0,
+                });
+                l = k;
+                l_pos = offset.wrapping_add(unitig.reads[k - 1] as u32);
+            }
+            offset = offset.wrapping_add(unitig.reads[k - 1] as u32);
+            k += 1;
+        }
+        let occ = pg.pg_het_node.len() as u32 - run_start;
+        pg.pg_h_lev_idx.push(PGIn { beg: run_start, occ });
+    }
+
+    pg
+}
+
+/// `clean_visit_flag`: clears the vote marks of the unitigs a read list votes
+/// for.
+fn clean_visit_flag(
+    visit: &mut [u8],
+    read_graph: &Asg,
+    read_to_unitig: &ReadToUnitig,
+    contig_count: usize,
+    hits: &[PafHit],
+) {
+    if hits.len() * 2 > contig_count {
+        visit.fill(0);
+        return;
+    }
+
+    for hit in hits {
+        let mut r_id = hit.target_identifier;
+        if read_graph.sequences[r_id as usize].deleted {
+            // `get_R_to_U` rewrites a deleted target to the read that
+            // contains it.
+            let (mapped, is_unitig) = read_to_unitig.get(r_id);
+            r_id = mapped;
+            if r_id == u32::MAX
+                || is_unitig == 1
+                || read_graph.sequences[r_id as usize].deleted
+            {
+                continue;
+            }
+        }
+
+        let (hap_c_id, is_unitig) = read_to_unitig.get(r_id);
+        if is_unitig == 0 || hap_c_id == u32::MAX {
+            continue;
+        }
+        visit[hap_c_id as usize] = 0;
+    }
+}
+
+/// The vote-counting half of `hap_alignment_advance_worker`.
+///
+/// Every read of unitig `x_uid` votes for the unitigs that hold the reads it
+/// overlaps. A unitig with at least one vote makes the reference enter its
+/// haplotype-alignment candidate scan; that scan is not ported yet, so a vote
+/// is reported as an explicit error instead of being ignored.
+fn hap_alignment_advance_worker(
+    unitig_graph: &UnitigGraph,
+    read_graph: &Asg,
+    reverse_sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+    x_uid: u32,
+    votes: &mut [u64],
+    visit: &mut [u8],
+) -> Result<(), String> {
+    let nsg = &unitig_graph.graph;
+    if nsg.sequences[x_uid as usize].deleted
+        || nsg.sequences[x_uid as usize].coverage_class == ALTER_LABEL
+    {
+        return Ok(());
+    }
+
+    votes.fill(0);
+    visit.fill(0);
+    let contig_count = nsg.sequences.len();
+    let x_reads = &unitig_graph.unitigs[x_uid as usize];
+
+    for &packed in &x_reads.reads {
+        let x_reverse = &reverse_sources[(packed >> 33) as usize];
+        for hit in &x_reverse.hits {
+            let mut r_id = hit.target_identifier;
+            if read_graph.sequences[r_id as usize].deleted {
+                let (mapped, is_unitig) = read_to_unitig.get(r_id);
+                r_id = mapped;
+                if r_id == u32::MAX
+                    || is_unitig == 1
+                    || read_graph.sequences[r_id as usize].deleted
+                {
+                    continue;
+                }
+            }
+
+            let (hap_uid, is_unitig) = read_to_unitig.get(r_id);
+            if is_unitig == 0 || hap_uid == u32::MAX {
+                continue;
+            }
+            if visit[hap_uid as usize] != 0 {
+                continue;
+            }
+            visit[hap_uid as usize] = 1;
+            if votes[hap_uid as usize] < u64::MAX {
+                votes[hap_uid as usize] += 1;
+            }
+        }
+
+        clean_visit_flag(visit, read_graph, read_to_unitig, contig_count, &x_reverse.hits);
+    }
+
+    let mut voted = 0usize;
+    for (i, &vote) in votes.iter().enumerate() {
+        if i as u32 == x_uid || vote == 0 {
+            continue;
+        }
+        voted += 1;
+    }
+    if voted == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "purge_dups: unitig {} votes for {} candidate unitig(s); the \
+         haplotype-alignment candidate scan (Purge_Dups.cpp \
+         hap_alignment_advance_worker) is not ported yet",
+        u64::from(x_uid) + 1,
+        voted
+    ))
+}
+
+/// `kt_for(hap_alignment_advance_worker)`, single-threaded.
+fn hap_alignment_advance(
+    unitig_graph: &UnitigGraph,
+    read_graph: &Asg,
+    reverse_sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+) -> Result<(), String> {
+    let unitig_count = unitig_graph.graph.sequences.len();
+    let mut votes = vec![0u64; unitig_count];
+    let mut visit = vec![0u8; unitig_count];
+    for v in 0..unitig_count {
+        hap_alignment_advance_worker(
+            unitig_graph,
+            read_graph,
+            reverse_sources,
+            read_to_unitig,
+            v as u32,
+            &mut votes,
+            &mut visit,
+        )?;
+    }
+    Ok(())
+}
+
+/// `filter_hap_overlaps_by_length`: drops chains shorter than `min_len`.
+fn filter_hap_overlaps_by_length(all_ovlp: &mut HapOverlapsList, min_len: u32) {
+    if min_len == 0 {
+        return;
+    }
+    for list in &mut all_ovlp.x {
+        list.retain(|overlap| overlap.x_end_id.wrapping_sub(overlap.x_beg_id) >= min_len);
+    }
+}
+
+/// `normalize_hap_overlaps_advance_by_p_g_t`.
+///
+/// Every step of the reference walks the haplotype-overlap lists; with no
+/// overlaps the function is a no-op.
+fn normalize_hap_overlaps_advance_by_p_g_t(
+    all_ovlp: &HapOverlapsList,
+    back_all_ovlp: &HapOverlapsList,
+    _pg: &PG,
+) -> Result<(), String> {
+    if all_ovlp.is_empty() && back_all_ovlp.is_empty() {
+        return Ok(());
+    }
+    Err("purge_dups: hap-overlap normalization is not ported yet".to_string())
+}
+
+/// `collect_purge_trans_cov`.
+///
+/// The reference walks the hap-overlap lists and records their transitions in
+/// `cov->t_ch->k_trans`; with no overlaps there is nothing to record.
+fn collect_purge_trans_cov(
+    all_ovlp: &HapOverlapsList,
+    _position_index: &[u64],
+) -> Result<(), String> {
+    if all_ovlp.is_empty() {
+        return Ok(());
+    }
+    Err("purge_dups: collect_purge_trans_cov is not ported yet".to_string())
+}
+
+/// `remove_contained_haplotig`.
+///
+/// With no hap overlaps no unitig is marked alternate.
+fn remove_contained_haplotig(
+    all_ovlp: &HapOverlapsList,
+    _unitig_graph: &mut UnitigGraph,
+    _pg: &mut PG,
+) -> Result<(), String> {
+    if all_ovlp.is_empty() {
+        return Ok(());
+    }
+    Err("purge_dups: remove_contained_haplotig is not ported yet".to_string())
+}
+
+/// The partitioning side effect of `mc_solve` on an edgeless min-cut graph.
+///
+/// `init_mc_g_t` zeroes the solution vector, `update_mc_edges` builds no
+/// edges, `mb_solve_core` returns immediately without a reference and
+/// `mc_solve_core_adv` leaves every isolated component at `s = 0`. The only
+/// observable effect left is `p_nodes`: every read of every unitig is marked
+/// `SET_TRIO`, and the reads already flagged `P_HET` are also marked
+/// `FATHER`.
+fn mc_solve_edgeless(
+    unitig_graph: &UnitigGraph,
+    is_r_het: &[u8],
+    trio_flags: &mut [u8],
+    collect_trans: bool,
+) {
+    eprintln!("[M::mc_solve:: # edges: 0]");
+    eprintln!("[M::mc_solve_core_adv::0.000] ==> Partition");
+
+    if !collect_trans {
+        return;
+    }
+
+    for unitig in &unitig_graph.unitigs {
+        for &packed in &unitig.reads {
+            let read = (packed >> 33) as usize;
+            trio_flags[read] |= SET_TRIO;
+            if is_r_het[read] == N_HET {
+                continue;
+            }
+            // `set_p_flag` receives `s == 0` for every unitig here, so the
+            // `s > 0 ? FATHER : MOTHER` branch is unreachable.
+            if is_r_het[read] & P_HET != 0 {
+                trio_flags[read] |= FATHER;
+            }
+        }
+    }
+}
+
+/// `clean_purge_graph`.
+fn clean_purge_graph(purge_g: &Asg, _drop_ratio: f32) -> Result<(), String> {
+    if purge_g.arcs.iter().all(|arc| arc.deleted) {
+        return Ok(());
+    }
+    Err("purge_dups: clean_purge_graph is not ported yet".to_string())
+}
+
+/// `link_unitigs`.
+fn link_unitigs(purge_g: &Asg) -> Result<(), String> {
+    if purge_g.arcs.iter().all(|arc| arc.deleted) {
+        return Ok(());
+    }
+    Err("purge_dups: link_unitigs is not ported yet".to_string())
+}
+
+/// `purge_dups`: the full duplicate-purging pass.
+///
+/// `just_coverage` selects the coverage-only exit used by
+/// [`set_hom_global_coverage`]; the output stage calls it with
+/// `just_coverage = false` to purge the copied primary graph.
+///
+/// `density`, `max_hang` and `min_ovlp` are the reference's `Hap_rate`,
+/// `max_hang` and `min_ovlp`; they are consumed by the haplotype-alignment
+/// scan, which is not ported yet (see [`hap_alignment_advance_worker`]).
+///
+/// # Errors
+///
+/// Returns an error when the corpus reaches a code path that is not ported:
+/// the ploidy fallback (`if_ploid_sample`), the candidate scan, a non-empty
+/// hap-overlap list, or a purge graph with live arcs.
+#[allow(clippy::too_many_arguments)]
+pub fn purge_dups(
+    unitig_graph: &mut UnitigGraph,
+    read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    reverse_sources: &[PafList],
+    read_to_unitig: &mut ReadToUnitig,
+    density: f32,
+    purge_min_len: u32,
+    max_hang: i32,
+    min_ovlp: i32,
+    drop_ratio: f32,
+    just_contain: bool,
+    just_coverage: bool,
+    cov: &mut HapCov,
+    collect_p_trans: bool,
+    collect_p_trans_f: bool,
+    options: &mut AssemblyOptions,
+    trio_flags: &mut [u8],
+) -> Result<(), String> {
+    // The candidate scan is the only reader of these arguments.
+    let _ = (density, max_hang, min_ovlp);
+
+    let read_count = read_graph.sequences.len();
+    if cov.pos_idx.len() < read_count {
+        cov.pos_idx.resize(read_count, u64::MAX);
+    }
+    cov.pos_idx[..read_count].fill(u64::MAX);
+
+    let unitig_count = unitig_graph.graph.sequences.len();
+    let mut all_ovlp = HapOverlapsList::new(unitig_count);
+    let back_all_ovlp = HapOverlapsList::new(unitig_count);
+
+    // `hap_buf.cov_threshold`. On this path `hom_global_coverage` was already
+    // inferred by `set_hom_global_coverage`, so the fallback is only a
+    // consistency check.
+    let mut cov_threshold: i64 = if options.global_homozygous_coverage != -1 {
+        if options.global_homozygous_coverage_is_set != 0 {
+            (f64::from(options.global_homozygous_coverage) * HOM_PEAK_RATE) as i64
+        } else {
+            i64::from(options.global_homozygous_coverage)
+        }
+    } else {
+        get_read_coverage_thres(
+            unitig_graph,
+            read_graph,
+            read_to_unitig,
+            &mut cov.pos_idx,
+            sources,
+            coverage_cut,
+            options,
+        )
+        .0
+    };
+
+    if cov_threshold < 0 {
+        return Err(
+            "purge_dups needs if_ploid_sample (Purge_Dups.cpp:4800), which is not ported yet"
+                .to_string(),
+        );
+    }
+
+    // `init_hap_alignment_struct_pip` would build `hh` here; only the
+    // candidate scan reads it.
+    if options.global_homozygous_coverage == -1 {
+        options.global_homozygous_coverage = cov_threshold as i32;
+    }
+    if options.global_purge_coverage != -1 {
+        cov_threshold = i64::from(options.global_purge_coverage);
+    }
+
+    eprintln!(
+        "[M::purge_dups] homozygous read coverage threshold: {}",
+        if options.global_homozygous_coverage_is_set != 0 {
+            options.global_homozygous_coverage
+        } else {
+            (f64::from(options.global_homozygous_coverage) / HOM_PEAK_RATE) as i32
+        }
+    );
+    eprintln!(
+        "[M::purge_dups] purge duplication coverage threshold: {}",
+        cov_threshold
+    );
+
+    // Map every read of every unitig to it and store its position, even when
+    // only the coverage is wanted: `end_coverage` then clears the unitig
+    // entries again.
+    for v in 0..unitig_graph.graph.sequences.len() {
+        let unitig_id = v as u32;
+        let mut offset: u32 = 0;
+        let unitig = &unitig_graph.unitigs[v];
+        for (i, entry) in unitig.reads.iter().enumerate() {
+            let read = (entry >> 33) as u32;
+            let class = read_graph.sequences[read as usize].coverage_class;
+            read_to_unitig.set(read, unitig_id, true, Some(class));
+            cov.pos_idx[read as usize] = (u64::from(offset) << 32) | i as u64;
+            offset = offset.wrapping_add(*entry as u32);
+        }
+    }
+
+    if !just_coverage {
+        hap_alignment_advance(unitig_graph, read_graph, reverse_sources, read_to_unitig)?;
+        filter_hap_overlaps_by_length(&mut all_ovlp, purge_min_len);
+
+        let mut pg = init_p_g_t(unitig_graph, read_graph, &cov.is_r_het);
+        normalize_hap_overlaps_advance_by_p_g_t(&all_ovlp, &back_all_ovlp, &pg)?;
+
+        if collect_p_trans && !collect_p_trans_f {
+            collect_purge_trans_cov(&all_ovlp, &cov.pos_idx)?;
+        }
+
+        if options.polyploidy <= 2 {
+            mc_solve_edgeless(
+                unitig_graph,
+                &cov.is_r_het,
+                trio_flags,
+                options.flags & FLAG_PARTITION != 0 && cov.t_ch.is_some(),
+            );
+        }
+
+        if collect_p_trans && collect_p_trans_f {
+            collect_purge_trans_cov(&all_ovlp, &cov.pos_idx)?;
+        }
+
+        remove_contained_haplotig(&all_ovlp, unitig_graph, &mut pg)?;
+
+        if !just_contain {
+            // `get_hap_arch` loop: no arcs because `all_ovlp` is empty.
+            pg.pg_h_lev.cleanup();
+            pg.pg_h_lev.symmetrize();
+            clean_purge_graph(&pg.pg_h_lev, drop_ratio)?;
+            link_unitigs(&pg.pg_h_lev)?;
+        }
+
+        for v in 0..unitig_count {
+            if pg.pg_h_lev.sequences[v].coverage_class == ALTER_LABEL {
+                unitig_graph.graph.sequences[v].coverage_class = ALTER_LABEL;
+            }
+        }
+    }
+
+    // `end_coverage`.
+    read_to_unitig.clear_unitig_entries();
+    unitig_graph.graph.cleanup();
+    cov.pos_idx[..read_count].fill(u64::MAX);
+
+    Ok(())
 }

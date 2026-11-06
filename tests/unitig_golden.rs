@@ -925,7 +925,7 @@ fn popping_primary_bubbles_reproduces_the_reference_state() {
         max_hang: MAXIMUM_HANG,
         min_ovlp: MINIMUM_OVERLAP,
         is_r_het,
-        t_ch: Some(init_trans_chain(&unitig_graph, read_count)),
+        t_ch: Some(init_trans_chain(&unitig_graph, &read_graph, read_count)),
         ..HapCov::default()
     };
 
@@ -939,6 +939,7 @@ fn popping_primary_bubbles_reproduces_the_reference_state() {
         Some(&mut cov),
         &trio_labels,
         true,
+        None,
     );
 
     let golden = load_unitig_graph(&dump, "h01_after_pop_bubble");
@@ -1141,7 +1142,7 @@ fn cutting_equal_tips_reproduces_the_reference_state() {
         t_ch: Some(init_trans_chain(&UnitigGraph {
             unitigs: unitigs.clone(),
             graph: graph.clone(),
-        }, read_count)),
+        }, &read_graph, read_count)),
         ..HapCov::default()
     };
 
@@ -1265,7 +1266,7 @@ fn load_clean_probe_state(tag: &str) -> Option<CleanProbeState> {
         max_hang: MAXIMUM_HANG,
         min_ovlp: MINIMUM_OVERLAP,
         is_r_het,
-        t_ch: Some(init_trans_chain(&unitig_graph, read_count)),
+        t_ch: Some(init_trans_chain(&unitig_graph, &read_graph, read_count)),
         ..HapCov::default()
     };
 

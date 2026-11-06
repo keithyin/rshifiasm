@@ -10,6 +10,7 @@
 use crate::assembly::asg::{Asg, MaUtg};
 use crate::assembly::bubble::{BubbleBuffer, BubbleInfo, BubbleLabel};
 use crate::assembly::hap_cov::{asg_bub_backtrack_primary_cov, get_num_trio_flag, HapCov};
+use crate::assembly::hamming::FlySimp;
 use crate::assembly::hit::{ALTER_LABEL, HAP_LABEL};
 use crate::assembly::gfa_clean::{
     get_real_length, get_real_length_one, END_TIPS, LONG_TIPS_UNDER_MAX_EXT, LOOP, MUL_INPUT,
@@ -671,20 +672,20 @@ pub fn asg_pop_bubble_primary_trio(
     mut cov: Option<&mut HapCov>,
     trio_labels: &[u8],
     is_update_chain: bool,
+    mut fly: Option<&mut FlySimp>,
 ) -> u64 {
-    let UnitigGraph { unitigs, graph } = unitig_graph;
-    if !graph.is_symmetric {
-        graph.symmetrize();
+    if !unitig_graph.graph.is_symmetric {
+        unitig_graph.graph.symmetrize();
     }
 
-    let vertex_count = graph.sequences.len() * 2;
+    let vertex_count = unitig_graph.graph.sequences.len() * 2;
     let mut buffer = BubbleBuffer {
         info: vec![BubbleInfo::default(); vertex_count],
         ..BubbleBuffer::default()
     };
     let max_distance = match max_distance_override {
         Some(distance) => distance,
-        None => get_s_bub_pop_max_dist_advance(graph, &mut buffer),
+        None => get_s_bub_pop_max_dist_advance(&unitig_graph.graph, &mut buffer),
     };
     let mut bubble_flag = vec![0u8; vertex_count];
     let mut n_pop = 0u64;
@@ -695,24 +696,27 @@ pub fn asg_pop_bubble_primary_trio(
             if bubble_flag[v as usize] != 0 {
                 continue;
             }
-            if graph.arc_count(v) < 2
-                || graph.sequences[(v >> 1) as usize].deleted
-                || graph.sequences[(v >> 1) as usize].coverage_class == ALTER_LABEL
             {
-                continue;
-            }
-            let mut live_arcs = 0u32;
-            for arc in graph.arcs_of(v) {
-                if !arc.deleted {
-                    live_arcs += 1;
+                let graph = &unitig_graph.graph;
+                if graph.arc_count(v) < 2
+                    || graph.sequences[(v >> 1) as usize].deleted
+                    || graph.sequences[(v >> 1) as usize].coverage_class == ALTER_LABEL
+                {
+                    continue;
                 }
-            }
-            if live_arcs < 2 {
-                continue;
+                let mut live_arcs = 0u32;
+                for arc in graph.arcs_of(v) {
+                    if !arc.deleted {
+                        live_arcs += 1;
+                    }
+                }
+                if live_arcs < 2 {
+                    continue;
+                }
             }
 
             if asg_bub_pop1_primary_trio(
-                graph,
+                &mut unitig_graph.graph,
                 None,
                 v,
                 max_distance,
@@ -740,44 +744,69 @@ pub fn asg_pop_bubble_primary_trio(
             }
         }
 
-        // Second pass: pop the bubbles whose start vertex was flagged.
+        // Second pass: pop the bubbles whose start vertex was flagged. When a
+        // fly-simplification is attached the pop is refined through the cached
+        // phase graph, as `refine_bubble_popping` does in the reference.
         for v in 0..vertex_count as u32 {
             if bubble_flag[v as usize] != 2 {
                 continue;
             }
-            if graph.arc_count(v) < 2
-                || graph.sequences[(v >> 1) as usize].deleted
-                || graph.sequences[(v >> 1) as usize].coverage_class == ALTER_LABEL
             {
-                continue;
-            }
-            let mut live_arcs = 0u32;
-            for arc in graph.arcs_of(v) {
-                if !arc.deleted {
-                    live_arcs += 1;
+                let graph = &unitig_graph.graph;
+                if graph.arc_count(v) < 2
+                    || graph.sequences[(v >> 1) as usize].deleted
+                    || graph.sequences[(v >> 1) as usize].coverage_class == ALTER_LABEL
+                {
+                    continue;
+                }
+                let mut live_arcs = 0u32;
+                for arc in graph.arcs_of(v) {
+                    if !arc.deleted {
+                        live_arcs += 1;
+                    }
+                }
+                if live_arcs <= 1 {
+                    continue;
                 }
             }
-            if live_arcs > 1 {
-                n_pop += asg_bub_pop1_primary_trio(
-                    graph,
-                    Some(unitigs.as_slice()),
-                    v,
-                    max_distance,
-                    &mut buffer,
-                    positive_flag,
-                    negative_flag,
-                    true,
-                    cov.as_deref_mut(),
-                    trio_labels,
-                    is_update_chain,
-                    false,
-                );
+
+            match fly.as_deref_mut() {
+                Some(fly) => {
+                    n_pop += crate::assembly::hamming::refine_bubble_popping(
+                        unitig_graph,
+                        &mut buffer,
+                        v,
+                        max_distance,
+                        positive_flag,
+                        negative_flag,
+                        cov.as_deref_mut(),
+                        is_update_chain,
+                        trio_labels,
+                        fly,
+                    );
+                }
+                None => {
+                    n_pop += asg_bub_pop1_primary_trio(
+                        &mut unitig_graph.graph,
+                        Some(unitig_graph.unitigs.as_slice()),
+                        v,
+                        max_distance,
+                        &mut buffer,
+                        positive_flag,
+                        negative_flag,
+                        true,
+                        cov.as_deref_mut(),
+                        trio_labels,
+                        is_update_chain,
+                        false,
+                    );
+                }
             }
         }
     }
 
     if n_pop != 0 {
-        graph.cleanup();
+        unitig_graph.graph.cleanup();
     }
     n_pop
 }

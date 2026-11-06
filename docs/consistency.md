@@ -93,8 +93,8 @@
 | P4 精确重叠回收 | `gen_hc_r_alin_ea` / `gen_hc_r_alin_nec` 的 `el` 捷径、首条命中查询与已匹配跳过 | ✅ 完成（18 组场景、106 行黄金回放逐字节一致） |
 | P4 已存 overlap 辅助 | `dedup_chains` / `push_nec_re` / `extract_max_exact` / `push_ne_ovlp` / `check_well_cal` | ✅ 完成（22 组场景、149 行黄金回放逐字节一致） |
 | P4 纠错 | `--write-ec` 纠错读段逐字节一致 | ✅ 完成（三轮全部一致，见下文实测） |
-| P5 组装图 | `p_utg.gfa`、`p_ctg.gfa` 逐字节一致 | ⏳ 待实现 |
-| P6 单倍型 | `hap1/hap2.p_ctg.gfa`、`a_ctg.gfa` 一致 | ⏳ 待实现 |
+| P5 组装图 | `p_utg.gfa`、`p_ctg.gfa` 逐字节一致 | ✅ 完成（r_utg/p_utg 全链路一致；p_ctg 探针级 + e2e 一致，见下文实测） |
+| P6 单倍型 | `hap1/hap2.p_ctg.gfa`、`a_ctg.gfa` 一致 | ⏳ 待实现（`clean_u_trans_t_idx`/`set_trio_flag_by_cov`/`reduce_hamming_error_adv` 已探针一致） |
 | P7 Hi-C/trio | 需额外测试数据 | ⏳ 待实现 |
 | P8 ONT/UL | 需额外测试数据 | ⏳ 待实现 |
 
@@ -1202,6 +1202,26 @@ RSHIFIASM_EC_STOP_AT=<n>   只纠前 n 条读段
   未接入，当前只接受 HiFi 默认链路。
 - 日志中的时间/CPU/内存字段不参与逐字节比对（仅格式对齐），GFA/FASTA/PAF
   属于强一致范围。
+
+### P5 门禁实测（2026-11-06，r_utg/p_utg/p_ctg 逐字节一致）
+
+- **探针级**（`tests/bp_graph_golden.rs`，黄金值来自 `/tmp/bp_probe.cpp`
+  链接真实 `.o` 的转储）：
+  - `output_bp_graph` 主图半边：`probe.bp.p_ctg.gfa` / `.p_ctg.noseq.gfa` /
+    `.p_ctg.lowQ.bed` 逐字节一致（`adjust_utg_by_primary` 的 purge/tip/bubble
+    清理 + `print_utg` 写盘）；
+  - trio 转移表：`clean_u_trans_t_idx` 前后（`f15`/`f16`）逐条目一致，
+    `set_trio_flag_by_cov` 产出的 trio 标志（`f17_trio_flag.bin`）逐字节一致；
+  - 相位图：`ma_ug_gen_phase`（`/tmp/trioprobe`）逐节点一致。
+- **端到端**：`./target/release/rshifiasm -t1 -o reference/candidate_default
+  chr11-2M.fa.gz`（171.6 s，峰值 7.5 GB），`scripts/compare_outputs.sh`
+  对 `p_ctg`/`p_utg`/`r_utg` 的 gfa、noseq.gfa、lowQ.bed 共 9 个文件
+  `cmp` 无差异。
+- 运行在预期断点停下：`output_bp_graph` 写完 `bp.p_ctg.*` 后返回
+  `output_trio_graph_joint is not implemented yet`（P6 待移植）。
+- Rust 版不写 `*.ovlp.source.bin` / `*.ovlp.reverse.bin` / `*.ec.bin`
+  重跑缓存索引（仅加速用途，不影响任何比对产物），故
+  `compare_outputs.sh` 对这三个文件报 MISSING 属预期。
 
 ### P2 门禁实测（与 C++ 日志逐字节一致）
 

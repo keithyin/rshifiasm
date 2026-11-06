@@ -258,7 +258,22 @@ pub fn build_string_graph_without_clean(
         return Err("output_hic_graph is not implemented yet".to_string());
     }
     if options.flags & FLAG_PARTITION != 0 && options.purge_level_primary > 0 {
-        return Err("output_bp_graph is not implemented yet".to_string());
+        // The reference's `R_INF.trio_flag` starts out without any trio
+        // evidence and is filled by the purge/trio stages; keep a local copy
+        // so the output drivers can mutate it.
+        let mut trio_flags = reads.trio_labels.clone();
+        return crate::assembly::bp_graph::output_bp_graph(
+            &mut graph,
+            &mut coverage_cut,
+            &output_file_name,
+            &sources,
+            &reverse_sources,
+            &mut read_to_unitig,
+            &mut bubble_labels,
+            options,
+            reads,
+            &mut trio_flags,
+        );
     }
 
     Err("output_contig_graph_primary is not implemented yet".to_string())
