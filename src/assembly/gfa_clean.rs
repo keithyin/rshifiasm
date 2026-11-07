@@ -14,6 +14,7 @@ use crate::assembly::bubble_identify::{
 use crate::assembly::hit::ReadToUnitig;
 use crate::container::ksort::radix_sort_u64;
 use crate::correction::ec_driver::PafList;
+use crate::reads::read_store::ReadStore;
 
 /// Path classifications shared by the topology walkers, from `Overlaps.h`.
 pub const LONG_TIPS: u8 = 0;
@@ -2226,4 +2227,226 @@ mod tests {
         assert!(graph.get_arc(3, 1).is_none());
         assert!(graph.get_arc(0, 4).is_some());
     }
+}
+
+/// `gen_telo_end_t` (`Overlaps.cpp` 300) with its `mark_telo_ends` worker
+/// (`Overlaps.cpp` 191): scans both ends of every read for the telomere
+/// motif or any of its rotations.
+///
+/// Each end runs two passes: the first accumulates `+1` per motif hit and
+/// `-penalty` per non-hit (aborting early once the best score is reached),
+/// and a read end is telomeric only when the best score reaches
+/// `minimum_score`. The second pass repeats the scan with the rotation
+/// continuity refinement of the reference. Single-threaded: the reads are
+/// independent, so `-t1` parity holds for any thread count.
+pub fn gen_telo_ends(
+    reads: &ReadStore,
+    motif: &str,
+    minimum_score: i64,
+    penalty: i64,
+    maximum_drop: i64,
+) -> TeloEnd {
+    let motif_length = motif.len();
+    let mask = (1u64 << (motif_length * 2)) - 1;
+    let mut motif_code = 0u64;
+    for byte in motif.bytes() {
+        let code = base_code(byte).expect("the telomere motif must be A/C/G/T only");
+        motif_code = (motif_code << 2) | code;
+    }
+
+    // The rotation set of the motif (the reference's `aux->h` hash).
+    let mut rotations = std::collections::HashSet::new();
+    let mut code = motif_code;
+    for _ in 0..motif_length {
+        rotations.insert(code);
+        code = (((code >> ((motif_length - 1) << 1)) & 3) | (code << 2)) & mask;
+    }
+    let penalty = penalty.abs();
+
+    let mut hh = vec![0u8; reads.total_reads as usize];
+    for rid in 0..reads.total_reads as usize {
+        // 5' end: forward scan; 3' end: the reverse complement scanned
+        // forward, which is exactly the reference's backward `RC_CHAR` walk.
+        let forward = reads.read_sequence(rid);
+        if end_is_telomeric(
+            &forward,
+            motif_length,
+            mask,
+            &rotations,
+            minimum_score,
+            penalty,
+            maximum_drop,
+        ) && refine_end(
+            &forward,
+            motif_length,
+            mask,
+            motif_code,
+            &rotations,
+            minimum_score,
+            penalty,
+            maximum_drop,
+        ) {
+            hh[rid] |= 1;
+        }
+
+        let reverse = reads.read_sequence_reverse_complement(rid);
+        if end_is_telomeric(
+            &reverse,
+            motif_length,
+            mask,
+            &rotations,
+            minimum_score,
+            penalty,
+            maximum_drop,
+        ) && refine_end(
+            &reverse,
+            motif_length,
+            mask,
+            motif_code,
+            &rotations,
+            minimum_score,
+            penalty,
+            maximum_drop,
+        ) {
+            hh[rid] |= 2;
+        }
+    }
+
+    let t5 = hh.iter().filter(|flag| *flag & 1 != 0).count();
+    let t3 = hh.iter().filter(|flag| *flag & 2 != 0).count();
+    eprintln!(
+        "[M::gen_telo_end_t::] ==> # 5'-telomeres::{}, # 3'-telomeres::{}, # tot::{}, motif::{}, motif_len::{}",
+        t5, t3, reads.total_reads, motif, motif_length
+    );
+
+    TeloEnd { hh }
+}
+
+/// `seq_nt6_table` restricted to A/C/G/T; `None` for every other base.
+fn base_code(byte: u8) -> Option<u64> {
+    match byte {
+        b'A' => Some(0),
+        b'C' => Some(1),
+        b'G' => Some(2),
+        b'T' => Some(3),
+        _ => None,
+    }
+}
+
+/// The first (detection) pass of `mark_telo_ends`: whether the end's best
+/// score reaches `minimum_score`.
+fn end_is_telomeric(
+    sequence: &[u8],
+    motif_length: usize,
+    mask: u64,
+    rotations: &std::collections::HashSet<u64>,
+    minimum_score: i64,
+    penalty: i64,
+    maximum_drop: i64,
+) -> bool {
+    let mut code = 0u64;
+    let mut consecutive = 0i64;
+    let mut score = 0i64;
+    let mut max_score = 0i64;
+
+    for (k, byte) in sequence.iter().enumerate() {
+        let mut hit = false;
+        match base_code(*byte) {
+            Some(c) => {
+                code = ((code << 2) | c) & mask;
+                consecutive += 1;
+                if consecutive as usize >= motif_length && rotations.contains(&code) {
+                    hit = true;
+                }
+            }
+            None => {
+                consecutive = 0;
+                code = 0;
+            }
+        }
+        if k >= motif_length {
+            score += if hit { 1 } else { -penalty };
+        }
+        if score > max_score {
+            max_score = score;
+        } else if max_score - score > maximum_drop {
+            break;
+        }
+
+        if max_score >= minimum_score {
+            break;
+        }
+    }
+
+    max_score >= minimum_score
+}
+
+/// The second (refinement) pass of `mark_telo_ends`, with the rotation
+/// continuity tracking; returns whether the end still reaches
+/// `minimum_score`.
+#[allow(clippy::too_many_arguments)]
+fn refine_end(
+    sequence: &[u8],
+    motif_length: usize,
+    mask: u64,
+    motif_code: u64,
+    rotations: &std::collections::HashSet<u64>,
+    minimum_score: i64,
+    penalty: i64,
+    maximum_drop: i64,
+) -> bool {
+    let mut code = 0u64;
+    let mut consecutive = 0i64;
+    let mut score = 0i64;
+    let mut max_score = 0i64;
+    let mut expected = u64::MAX;
+
+    for (k, byte) in sequence.iter().enumerate() {
+        let mut hit = false;
+        match base_code(*byte) {
+            Some(c) => {
+                code = ((code << 2) | c) & mask;
+                consecutive += 1;
+                if consecutive as usize >= motif_length && rotations.contains(&code) {
+                    if expected != u64::MAX && expected == code {
+                        hit = true;
+                    } else {
+                        let mut z = 0usize;
+                        let mut walk = motif_code;
+                        while z < motif_length && walk != code {
+                            walk = (((walk >> ((motif_length - 1) << 1)) & 3) | (walk << 2)) & mask;
+                            z += 1;
+                        }
+                        if z < motif_length && walk == code {
+                            hit = true;
+                        }
+                    }
+                }
+            }
+            None => {
+                consecutive = 0;
+                code = 0;
+            }
+        }
+
+        if !hit {
+            expected = u64::MAX;
+        } else {
+            expected = (((code >> ((motif_length - 1) << 1)) & 3) | (code << 2)) & mask;
+        }
+        if k >= motif_length {
+            score += if hit { 1 } else { -penalty };
+        }
+        if score > max_score {
+            max_score = score;
+        } else if max_score - score > maximum_drop {
+            break;
+        }
+
+        if max_score >= minimum_score {
+            break;
+        }
+    }
+
+    max_score >= minimum_score
 }

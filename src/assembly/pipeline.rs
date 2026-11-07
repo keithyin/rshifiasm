@@ -11,7 +11,7 @@ use crate::assembly::bubble_identify::asg_arc_identify_simple_bubbles_multi;
 use crate::assembly::gfa_clean::{
     asg_arc_cut_bub_links, asg_arc_cut_chimeric, asg_arc_cut_complex_bub_links,
     asg_arc_cut_inexact, asg_arc_cut_length, asg_arc_cut_tips, asg_cut_large_indel,
-    asg_cut_semi_circ, asg_iterative_semi_circ, LIM_LEN,
+    asg_cut_semi_circ, asg_iterative_semi_circ, TeloEnd, LIM_LEN,
 };
 use crate::assembly::graph_build::gen_init_sg;
 use crate::assembly::hit::{
@@ -214,6 +214,17 @@ pub fn build_string_graph_without_clean(
         &reads.trio_labels,
     );
 
+    // `if(asm_opt.telo_motif) te = gen_telo_end_t(...)` (`Overlaps.cpp` 39347).
+    let telo_end = options.telomere_motif.as_ref().map(|motif| {
+        crate::assembly::gfa_clean::gen_telo_ends(
+            reads,
+            motif,
+            options.telomere_minimum_score,
+            options.telomere_penalty,
+            options.telomere_maximum_drop,
+        )
+    });
+
     ul_clean_gfa(
         options,
         reads,
@@ -225,6 +236,7 @@ pub fn build_string_graph_without_clean(
         &mut bubble_labels,
         &output_file_name,
         min_thres,
+        telo_end.as_ref(),
         dump_directory.as_deref(),
     )?;
 
@@ -350,6 +362,7 @@ fn ul_clean_gfa(
     bubble_labels: &mut BubbleLabel,
     output_file_name: &str,
     min_thres: i64,
+    telo_end: Option<&TeloEnd>,
     dump_directory: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let maximum_hang = options.maximum_hang_length;
@@ -376,7 +389,7 @@ fn ul_clean_gfa(
     let vertex_count = graph.sequences.len() * 2;
 
     // `asg_arc_cut_tips(sg, max_tip, &bu, is_ou, is_ou?rI:NULL, uopt->te)`.
-    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, None);
+    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
     probe::try_dump_stage(
         dump_directory,
         "d03_after_cut_tips",
@@ -393,11 +406,11 @@ fn ul_clean_gfa(
             drop = max_drop;
         }
 
-        asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, None);
+        asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, telo_end);
         asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, true, min_thres);
-        asg_arc_cut_chimeric(graph, sources, &mut buffer, u32::MAX, None);
+        asg_arc_cut_chimeric(graph, sources, &mut buffer, u32::MAX, telo_end);
 
-        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, None);
+        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
         asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
         asg_arc_cut_inexact(
             graph,
@@ -409,7 +422,7 @@ fn ul_clean_gfa(
             0,
             ou_drop_rate,
         );
-        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, None);
+        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
         asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, true, min_thres);
         asg_arc_cut_length(
@@ -427,7 +440,7 @@ fn ul_clean_gfa(
             None,
             None,
         );
-        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, None);
+        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
         asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, true, min_thres);
         // The reference allocates a fresh `buf_t` per call, so the workspace
@@ -459,7 +472,7 @@ fn ul_clean_gfa(
             false,
             bubble_labels,
         );
-        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, None);
+        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
         probe::try_dump_stage(
             dump_directory,
@@ -475,7 +488,7 @@ fn ul_clean_gfa(
         drop += step;
     }
 
-    asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, None);
+    asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, telo_end);
     asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
     asg_cut_large_indel(
         graph,
@@ -485,7 +498,7 @@ fn ul_clean_gfa(
         false,
         0,
     );
-    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, None);
+    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
     probe::try_dump_stage(
         dump_directory,
@@ -514,7 +527,7 @@ fn ul_clean_gfa(
         Some(read_to_unitig),
         None,
     );
-    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, None);
+    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
     asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
     asg_arc_cut_length(
@@ -532,7 +545,7 @@ fn ul_clean_gfa(
         Some(read_to_unitig),
         Some(2000),
     );
-    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, None);
+    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
     probe::try_dump_stage(
         dump_directory,
