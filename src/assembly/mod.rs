@@ -142,7 +142,11 @@ pub fn assemble_pair(options: &mut AssemblyOptions) -> i32 {
 
 /// `ha_ec_dbg`: overlap calculation debug entry point.
 pub fn error_correction_debug(options: &mut AssemblyOptions) -> i32 {
-    eprintln!("[ERROR] ha_ec_dbg is not implemented yet");
-    let _ = options;
-    1
+    match crate::correction::ec_driver::run_debug_overlap(options) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("[ERROR] {}", error);
+            1
+        }
+    }
 }

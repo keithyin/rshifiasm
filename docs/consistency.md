@@ -1341,14 +1341,47 @@ RSHIFIASM_EC_STOP_AT=<n>   只纠前 n 条读段
 
 - `--ul`（超长读段）静默忽略——C++ 会以 UL 读段重跑整条组装，风险
   最高的静默 no-op；`--ul-*` 参数组同样未接线。
-- `--telo-*`（端粒标记 `gen_telo_end_t`）、`--chem-c/--chem-f`、
-  `--sc-cut`、`--m-rate`（配 `--b-cov/--h-cov`）、Hi-C 参数组
-  （`--seed/--s-base/--n-weight/...`）均为静默 no-op。
+- `--chem-c/--chem-f`、`--sc-cut`、Hi-C 参数组
+  （`--seed/--s-base/--n-weight/...`）为静默 no-op。
 - trio 前端（`Trio.cpp`，`-1/-2/-3/-4/-5/--trio-dual`）与 Hi-C 分发
   （`--h1/--h2/--enzyme`）为显式 gate 错误（需测试数据）。
-- 调试项：`ha_assemble_pair`（`--sec-in`）、`ha_ec_dbg`（`--dbg-ovec`）
-  为桩；`--dbg-gfa/--prt-raw/--integer-correct/-b/--ex-list` 静默。
+- 调试项：`ha_assemble_pair`（`--sec-in`，读 `.ec0/.ec1` 旧分片缓存，
+  无产出方）为桩；`--dbg-gfa/--prt-raw/--integer-correct/-b/--ex-list`
+  静默；`--fast`（EC 快速索引）解析但不可用。
 - 双方一致地死掉的选项：`--skip-triobin`、`--low-het`、`--ul-m`。
+
+#### 输出层收尾（2026-11-07，--b-cov/--h-cov、--telo-*、--dbg-ovec）
+
+- **`break_ug_contig`**（`src/assembly/break_contig.rs`，`Overlaps.cpp`
+  11503–12565）：覆盖深度扫描（`push_cov_interval_{direct,advance}` 的
+  beg/end 键打包 + 回绕处理）、扫描线区间合并（low/high 两套合并规则）、
+  谷/峰跃迁检测 + 圆形回绕、`get_break_point_idx` 的方向感知
+  exact/inexact 拆分与无符号 `c_break` 取位、
+  `push_sub_unitig`/`break_all_contigs` 的旧→新顶点重映射。
+  `print_utg`/`output_trio_unitig_graph`/`output_contig_graph_primary`
+  三处 "not ported" 守卫替换为实际调用（low/high 与 C++ 一样单开关）。
+  门禁：`hifiasm --b-cov 20 -t1` 17/18 逐字节一致（p_ctg 相对默认运行
+  真实断裂）。
+- **端粒**（`gfa_clean.rs::gen_telo_ends`，`Overlaps.cpp` 191–347）：
+  motif 轮转集合 + 每读双端两遍扫描（检测 + 轮转连续性精化），单线程化；
+  `ul_clean_gfa` 穿线到三个切割函数（消费侧 `TeloEnd` 早已移植）。
+  门禁：`--telo-m CCCTAA -t1` 的 `gen_telo_end_t` 摘要行逐字一致
+  （0/0——chr11-2M 无端粒读段，本语料为 no-op，默认奇偶性由既有门禁
+  保证）。
+- **`--dbg-ovec`**（`ec_driver.rs::run_debug_overlap`，`Assembly.cpp`
+  1053 / `ecovlp.cpp` 6311–6452）：无过滤索引 + 每读链化精化后直接
+  落盘对齐窗口（带 cigar）——把 C++/Rust 分歧隔离在共识之前。
+  门禁：125,745,896 B 的 `.ovlp.paf` 与 C++ 逐字节一致。
+
+**introsort 差一修复（影响全局）**：klib `ks_introsort` 的深度消耗是
+`if (--d == 0)`——进入分区**先减后判**；Rust 移植原为"先判后减"，comb
+兜底晚一层才触发。oloist 超过深度上限（≥2^5=32 元素）时相等键元素的
+排列与 C++ 不同。纠错语料的 per-read olist 从未越过上限，故 P4–P6 门禁
+未暴露；dbg 的未过滤种子让 read 25 的 61 区域 olist 越线。修复后
+`--dbg-ovec` 全量一致，且默认/`--write-paf --write-ec`/`--b-cov 20`
+四条门禁复验全部保持逐字节一致。`lchain_qgen_mcopy_fast` 的两个
+`ks_introsort_or_ss/or_xs` 调用点改为逐行字面转录的
+`introsort_klib_by`（含 klib comb 排序的 gap=9/10→11 与收尾插入序）。
 
 ### P2 门禁实测（与 C++ 日志逐字节一致）
 

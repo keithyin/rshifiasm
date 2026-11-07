@@ -40,12 +40,12 @@ where
 
     loop {
         if start < end {
+            depth -= 1;
             if depth == 0 {
                 comb_sort(&mut values[start..=end], less);
                 end = start;
                 continue;
             }
-            depth -= 1;
 
             let middle = start + ((end - start) >> 1) + 1;
             let mut pivot_index = middle;
@@ -337,4 +337,162 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first[0].1, 2);
     }
+}
+
+/// A literal transcription of klib's `ks_introsort` (the `KSORT_INIT` macro in
+/// the reference's `ksort.h`), element for element.
+///
+/// The generic [`introsort_by`] implements the same algorithm, but the two
+/// diverge in the permutation they leave among *equal* elements, and the
+/// reference's output order for the overlap lists depends on it. Used for the
+/// two `ks_introsort_or_*` call sites of `lchain_qgen_mcopy_fast`.
+pub fn introsort_klib_by<T, F>(values: &mut [T], less: &F)
+where
+    F: Fn(&T, &T) -> bool,
+{
+    const INSERTION_THRESHOLD: usize = 16;
+
+    let length = values.len();
+    if length < 1 {
+        return;
+    }
+    if length == 2 {
+        if less(&values[1], &values[0]) {
+            values.swap(0, 1);
+        }
+        return;
+    }
+
+    let mut depth = 2u32;
+    while (1u64 << depth) < length as u64 {
+        depth += 1;
+    }
+    depth <<= 1;
+
+    let mut stack: Vec<(usize, usize, u32)> = Vec::new();
+    let mut left = 0usize;
+    let mut right = length - 1;
+
+    loop {
+        if left < right {
+            // `if (--d == 0)`: the depth is consumed on entry, so the comb
+            // fallback fires one level earlier than a post-decrement check.
+            depth -= 1;
+            if depth == 0 {
+                comb_sort_klib(&mut values[left..=right], less);
+                right = left;
+                continue;
+            }
+
+            // Median of three over `left`, `middle`, `right`; the median
+            // element is swapped to `right` and becomes the pivot value.
+            let middle = left + ((right - left) >> 1) + 1;
+            let mut pivot_index = middle;
+            if less(&values[middle], &values[left]) {
+                if less(&values[middle], &values[right]) {
+                    pivot_index = right;
+                }
+            } else {
+                pivot_index = if less(&values[right], &values[left]) {
+                    left
+                } else {
+                    right
+                };
+            }
+            // The C copies the pivot value (`rp = *k`) before swapping it to
+            // `right`; T is not `Copy`, so the pivot is addressed by index —
+            // it sits at `right` for the whole partition, never moving.
+            if pivot_index != right {
+                values.swap(pivot_index, right);
+            }
+
+            let mut i = left;
+            let mut j = right;
+            loop {
+                i += 1;
+                while less(&values[i], &values[right]) {
+                    i += 1;
+                }
+                j -= 1;
+                while i <= j && less(&values[right], &values[j]) {
+                    j -= 1;
+                }
+                if j <= i {
+                    break;
+                }
+                values.swap(i, j);
+            }
+            values.swap(i, right);
+
+            if i - left > right - i {
+                if i - left > INSERTION_THRESHOLD {
+                    stack.push((left, i - 1, depth));
+                }
+                left = if right - i > INSERTION_THRESHOLD { i + 1 } else { right };
+            } else {
+                if right - i > INSERTION_THRESHOLD {
+                    stack.push((i + 1, right, depth));
+                }
+                right = if i - left > INSERTION_THRESHOLD { i - 1 } else { left };
+            }
+        } else {
+            match stack.pop() {
+                None => {
+                    insertion_sort(values, less);
+                    return;
+                }
+                Some((l, r, d)) => {
+                    left = l;
+                    right = r;
+                    depth = d;
+                }
+            }
+        }
+    }
+}
+
+/// `ks_combsort`: the comb sort of the klib introsort's depth-limit fallback,
+/// including its final insertion pass.
+fn comb_sort_klib<T, F>(values: &mut [T], less: &F)
+where
+    F: Fn(&T, &T) -> bool,
+{
+    const SHRINK_FACTOR: f64 = 1.2473309501039786540366528676643;
+
+    let length = values.len();
+    let mut gap = length;
+    loop {
+        if gap > 2 {
+            gap = (gap as f64 / SHRINK_FACTOR) as usize;
+            if gap == 9 || gap == 10 {
+                gap = 11;
+            }
+        }
+
+        let mut swapped = false;
+        if gap < length {
+            for index in 0..length - gap {
+                if less(&values[index + gap], &values[index]) {
+                    values.swap(index, index + gap);
+                    swapped = true;
+                }
+            }
+        }
+
+        if !swapped && gap <= 2 {
+            break;
+        }
+    }
+
+    if gap != 1 {
+        insertion_sort(values, less);
+    }
+}
+
+#[doc(hidden)]
+pub fn comb_sort_for_test<T, F>(values: &mut [T], less: &F)
+where
+    F: Fn(&T, &T) -> bool,
+{
+    comb_sort_klib(values, less);
 }

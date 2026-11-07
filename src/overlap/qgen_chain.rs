@@ -9,7 +9,7 @@
 //! haplotype and consensus stages can look them up through
 //! `overlap_region::non_homopolymer_errors`.
 
-use crate::container::ksort::{introsort_by, radix_sort_by_key};
+use crate::container::ksort::{introsort_klib_by, radix_sort_by_key};
 use crate::overlap::chain_score::{chain_band_width, chain_link_score, INVALID_SCORE};
 use crate::overlap::engine::overlap_type;
 use crate::overlap::region::{chain_length, KmerHit, OverlapRegion};
@@ -864,7 +864,8 @@ pub fn lchain_qgen_mcopy_fast(
     // Limit the number of chains per overlap-type class.
     let maximum_chain_count = parameters.maximum_chain_count;
     if overlaps.len() as u64 > u64::from(maximum_chain_count) {
-        introsort_by(&mut overlaps, &|left: &OverlapRegion, right: &OverlapRegion| {
+        introsort_klib_by(&mut overlaps, &|left: &OverlapRegion, right: &OverlapRegion| {
+            // `oreg_ss_lt`: descending shared-seed order.
             left.shared_seed > right.shared_seed
         });
 
@@ -1009,7 +1010,8 @@ pub fn lchain_qgen_mcopy_fast(
     }
 
     // The window/pair logic of `get_interval` depends on this order.
-    introsort_by(&mut overlaps, &|left: &OverlapRegion, right: &OverlapRegion| {
+    introsort_klib_by(&mut overlaps, &|left: &OverlapRegion, right: &OverlapRegion| {
+        // `oreg_xs_lt`.
         ((u64::from(left.x_position_start) << 32) | u64::from(left.x_position_end))
             < ((u64::from(right.x_position_start) << 32) | u64::from(right.x_position_end))
     });

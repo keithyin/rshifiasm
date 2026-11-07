@@ -14,6 +14,8 @@
 //! change almost every call site of the correction pass, so they are rejected
 //! instead of silently producing different reads.
 
+use std::io::Write;
+
 use crate::command_line::options::{AssemblyOptions, FLAG_FAST, FLAG_NO_HPC};
 use crate::correction::consensus_gfa::ConsensusScratch;
 use crate::correction::dedup_chains::dedup_chains;
@@ -632,4 +634,178 @@ mod tests {
         assert_eq!(hits[0].target_start, 5);
         assert_eq!(hits[0].target_end, 10);
     }
+}
+
+/// `ha_ec_dbg` + `cal_ec_r_dbg` + `worker_hap_ec_dbg_paf`
+/// (`Assembly.cpp` 1053, `ecovlp.cpp` 6311–6375): dumps every read's aligned
+/// overlap windows, cigars included, as PAF — the pre-consensus checkpoint
+/// that isolates C++/Rust differences to chaining and alignment.
+///
+/// The index is built without a k-mer filter table; the reference processes
+/// reads in chunks of 2000 through a pipeline, which only bounds memory —
+/// the records are written in read order either way.
+pub fn run_debug_overlap(options: &mut AssemblyOptions) -> Result<(), String> {
+    let mut reads = ReadStore::load_from_files(options)
+        .map_err(|error| format!("failed to load the input reads: {}", error))?;
+
+    // `ha_pt_gen(&asm_opt, 0, 0, 0, ...)`: no filter table.
+    let counts = count_minimizers(options, &reads, None);
+    options.homozygous_coverage = counts.homozygous_coverage;
+    options.heterozygous_coverage = counts.heterozygous_coverage;
+    options.update_coverage(options.homozygous_coverage);
+    let index = counts
+        .index
+        .ok_or_else(|| "the debug-overlap index is missing".to_string())?;
+
+    let high_occurrence =
+        (f64::from(options.homozygous_coverage) * (2.0 - KMER_GOOD_RATIO)) as u32;
+    let low_occurrence = (f64::from(options.homozygous_coverage) * KMER_GOOD_RATIO) as u32;
+
+    let paf_name = format!("{}.ovlp.paf", options.output_file_name);
+    let mut output = std::io::BufWriter::new(
+        std::fs::File::create(&paf_name)
+            .map_err(|error| format!("failed to create {}: {}", paf_name, error))?,
+    );
+
+    let chaining = set_lchain_parameters(true, options.k_mer_length as u32);
+    let chain_parameters = QgenChainParameters {
+        maximum_chain_count: options.maximum_chain_count as u32,
+        maximum_skip: chaining.maximum_skip,
+        maximum_iterations: chaining.maximum_iterations,
+        maximum_distance: chaining.maximum_distance,
+        gap_penalty: chaining.gap_penalty,
+        skip_penalty: chaining.skip_penalty,
+        band_width_rate: BAND_WIDTH_THRESHOLD,
+        quick_check: chaining.quick_check != 0,
+        append_both_ends: true,
+        generate_offset: true,
+        copy_number: COPY_NUMBER,
+        copy_rate: COPY_NUMBER_RATE,
+        chain_cutoff: CHAIN_CUTOFF,
+        copy_kmer_cutoff: COPY_NUMBER_KMER_HIT_CUTOFF,
+        coverage_window: COPY_NUMBER_COVERAGE_WINDOW,
+    };
+
+    for read_identifier in 0..reads.total_reads as usize {
+        let query = reads.read_sequence(read_identifier);
+        let query_length = query.len() as u64;
+
+        let sketch_result = sketch(
+            &query,
+            options.minimizer_window_size,
+            options.k_mer_length,
+            read_identifier as u32,
+            options.flags & FLAG_NO_HPC == 0,
+            None,
+            options.minimizer_sample_distance,
+            options.minimizer_rewindow_size,
+        );
+        let seeds = collect_qgen_seeds(
+            &sketch_result.minimizers,
+            &index,
+            &reads.read_lengths,
+            high_occurrence,
+            low_occurrence,
+        );
+        let chained = lchain_qgen_mcopy_fast(
+            seeds,
+            read_identifier as u32,
+            query_length,
+            &reads.read_lengths,
+            &chain_parameters,
+        );
+
+        let mut candidates = CandidatesList::default();
+        candidates.list = chained.candidates;
+        candidates.length = chained.candidate_length as i64;
+        let mut overlaps = chained.overlaps;
+        let mut auxiliary = OverlapRegion::default();
+        let mut extz = BitExtz::new();
+        let mut exact_order: Vec<u64> = Vec::new();
+        let mut scratch: Vec<u16> = Vec::new();
+        // The dbg call passes an empty `R_INF.paf[i]` and
+        // `chem_drop = 0, align_gap_rate = -1, align_gap_max = -1`.
+        let kept = gen_hc_r_alin_ea(
+            &mut overlaps,
+            &mut candidates,
+            &reads,
+            &query,
+            &mut extz,
+            &mut auxiliary,
+            &[],
+            options.maximum_overlap_divergence_error_correction,
+            ALIGNMENT_WINDOW_LENGTH,
+            KMER_HIT_THRESHOLD,
+            &mut exact_order,
+            &mut scratch,
+            false,
+            -1.0,
+            -1,
+        );
+        overlaps.truncate(kept);
+
+        // The record loop of `worker_hap_ec_dbg_paf`.
+        for region in &overlaps {
+            if region.window_cigar.windows.is_empty() {
+                continue;
+            }
+            let target_length = reads.read_length(region.y_identifier as usize);
+            for window in &region.window_cigar.windows {
+                // `is_ualn_win(a)`: error == INT16_MAX && clen == 0 && extra_end < 0.
+                if window.error == i16::MAX && window.cigar_length == 0 && window.extra_end < 0 {
+                    continue;
+                }
+
+                let mut target_start = window.y_start as u64;
+                let mut target_end = (window.y_end + 1) as u64;
+                if region.y_strand != 0 {
+                    target_start = target_length - (window.y_end as u64) - 1;
+                    target_end = target_length - window.y_start as u64;
+                }
+
+                // `pop_trace` over the window's cells, op 0/1 → M, 2 → I, 3 → D.
+                let mut cigar = String::new();
+                let mut cell_index = window.cigar_start as usize;
+                let cell_end = cell_index + window.cigar_length as usize;
+                while cell_index < cell_end {
+                    let operation = (region.window_cigar.cells[cell_index] >> 14) as usize;
+                    let mut length =
+                        u32::from(region.window_cigar.cells[cell_index] & 0x3fff);
+                    cell_index += 1;
+                    while cell_index < cell_end
+                        && (region.window_cigar.cells[cell_index] >> 14) as usize == operation
+                    {
+                        length += u32::from(region.window_cigar.cells[cell_index] & 0x3fff);
+                        cell_index += 1;
+                    }
+                    let operation_character = ['M', 'M', 'I', 'D'][operation];
+                    cigar.push_str(&format!("{}{}", length, operation_character));
+                }
+
+                // The reference prints the TARGET (y) read first and the
+                // QUERY (x) read second, with the strand character taken from
+                // `"+-"[y_pos_strand]`.
+                writeln!(
+                    output,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t255\tcg:Z:{}",
+                    reads.read_name(region.y_identifier as usize),
+                    reads.read_length(region.y_identifier as usize),
+                    target_start,
+                    target_end,
+                    ['+', '-'][region.y_strand as usize],
+                    reads.read_name(region.x_identifier as usize),
+                    reads.read_length(region.x_identifier as usize),
+                    window.x_start,
+                    window.x_end + 1,
+                    cigar,
+                )
+                .map_err(|error| format!("failed to write {}: {}", paf_name, error))?;
+            }
+        }
+    }
+
+    output
+        .flush()
+        .map_err(|error| format!("failed to write {}: {}", paf_name, error))?;
+    Ok(())
 }
