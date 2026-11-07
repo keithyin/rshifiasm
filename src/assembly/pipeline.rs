@@ -25,7 +25,9 @@ use crate::assembly::rescue::{
     rescue_missing_overlaps_backward, RescueParameters,
 };
 use crate::assembly::unitig::{output_contig_graph_primary_pre, output_unitig_graph, ug_ext_gfa};
-use crate::command_line::options::{AssemblyOptions, FLAG_PARTITION, MINIMUM_CHAIN_COUNT};
+use crate::command_line::options::{
+    AssemblyOptions, FLAG_BAN_ASSEMBLY, FLAG_PARTITION, MINIMUM_CHAIN_COUNT,
+};
 use crate::correction::ec_driver::{CorrectionState, PafList};
 use crate::overlap::paf::PafHit;
 use crate::reads::read_store::ReadStore;
@@ -91,6 +93,7 @@ pub fn build_string_graph_without_clean(
     options: &mut AssemblyOptions,
     reads: &ReadStore,
     state: CorrectionState,
+    write_caches: bool,
 ) -> Result<(), String> {
     // `ha_opt_update_cov_min(&asm_opt, asm_opt.hom_cov, MIN_N_CHAIN)`.
     options.update_coverage_with_minimum(options.homozygous_coverage, MINIMUM_CHAIN_COUNT);
@@ -106,8 +109,27 @@ pub fn build_string_graph_without_clean(
 
     let mut read_to_unitig = ReadToUnitig::new(reads.total_reads as usize);
 
+    // `if (asm_opt.write_index_to_disk && write) write_all_data_to_disk(...)`
+    // (`Overlaps.cpp` 39707), before `try_rescue_overlaps`: the caches hold
+    // the pre-rescue overlaps. A run that loaded them passes `write = 0`.
+    if write_caches && options.write_index_to_disk != 0 {
+        crate::assembly::read_cache::write_all_data_to_disk(
+            options,
+            reads,
+            &state.forward,
+            &state.reverse,
+        )
+        .map_err(|error| format!("failed to write the restart caches: {}", error))?;
+    }
+
     let (mut forward, forward_flags) = split_paf_lists(state.forward);
     let (mut reverse, reverse_flags) = split_paf_lists(state.reverse);
+
+    // `if (asm_opt.flag & HA_F_BAN_ASSEMBLY)` (`Overlaps.cpp` 39714): with
+    // `-e` the reference stops after the caches are written and exits 0.
+    if options.flags & FLAG_BAN_ASSEMBLY != 0 {
+        return Ok(());
+    }
 
     // Stage dumps for local debugging; see `assembly::probe`.
     let dump_directory = probe::prepare_directory().ok().flatten();
@@ -303,6 +325,13 @@ pub fn build_string_graph_without_clean(
         &trio_flags,
         options,
     )?;
+
+    // The last statement of `build_string_graph_without_clean`
+    // (`Overlaps.cpp` 39673), reached by every dispatch branch.
+    eprintln!(
+        "Inconsistency threshold for low-quality regions in BED files: {}%",
+        options.bed_inconsistency_rate
+    );
 
     Ok(())
 }

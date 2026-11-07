@@ -66,14 +66,16 @@ pub fn corrected_read_from_cigar(original: &[u8], cigar: &CigarRecord) -> Vec<u8
 }
 
 /// `sl_ec_r` for one read: replaces the stored sequence with its corrected
-/// version and updates the length and total base counters.
+/// version and updates the length counter.
+///
+/// `total_reads_bases` deliberately stays at its load-time value, matching
+/// the reference: `ha_insert_read_len` counts the original bases and no
+/// correction path updates `All_reads::total_reads_bases`.
 pub fn write_corrected_read_back(
     reads: &mut ReadStore,
     read_identifier: usize,
     corrected: &[u8],
 ) {
-    let previous_length = reads.read_length(read_identifier);
-    reads.total_bases = reads.total_bases - previous_length + corrected.len() as u64;
     reads.read_lengths[read_identifier] = corrected.len() as u64;
     reads.sequences[read_identifier] =
         crate::sequence::encoding::PackedSequence::from_ascii(corrected);
@@ -229,13 +231,13 @@ mod tests {
     }
 
     #[test]
-    fn writeback_updates_length_and_total_bases() {
+    fn writeback_updates_length_and_keeps_the_total_frozen() {
         let mut reads = store();
         assert_eq!(reads.total_bases, 16);
         write_corrected_read_back(&mut reads, 0, b"ACG");
         assert_eq!(reads.read_length(0), 3);
         assert_eq!(reads.read_sequence(0), b"ACG");
-        assert_eq!(reads.total_bases, 11);
+        assert_eq!(reads.total_bases, 16);
     }
 
     #[test]

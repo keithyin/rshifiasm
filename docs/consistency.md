@@ -1219,9 +1219,10 @@ RSHIFIASM_EC_STOP_AT=<n>   只纠前 n 条读段
   `cmp` 无差异。
 - 运行在预期断点停下：`output_bp_graph` 写完 `bp.p_ctg.*` 后返回
   `output_trio_graph_joint is not implemented yet`（P6 待移植）。
-- Rust 版不写 `*.ovlp.source.bin` / `*.ovlp.reverse.bin` / `*.ec.bin`
-  重跑缓存索引（仅加速用途，不影响任何比对产物），故
-  `compare_outputs.sh` 对这三个文件报 MISSING 属预期。
+- Rust 版当时不写 `*.ovlp.source.bin` / `*.ovlp.reverse.bin` / `*.ec.bin`
+  重跑缓存索引；重启缓存现已在选项空间轮次实现（见下文），`compare_outputs.sh`
+  对 `ovlp` 两个 bin 报 identical，对 `ec.bin` 报 DIFFERS 属预期
+  （C++ 侧非确定性 padding，以 `read_cache_golden` 分节比对为准）。
 
 ### P6 门禁实测（2026-11-07，hap1/hap2 逐字节一致）
 
@@ -1267,6 +1268,87 @@ RSHIFIASM_EC_STOP_AT=<n>   只纠前 n 条读段
   索引读段 id（本项目测试读取已正确跳过）。
 - 定位工具：`/tmp/flag_probe.cpp`（加载 d20 转储，逐步打印
   `R_INF.trio_flag` 分布），其 hap 输出与正式参考逐字节一致。
+
+### 选项空间门禁实测（2026-11-07，--primary / -e / 重启缓存）
+
+#### `--primary` 分支（`output_contig_graph_primary` + `output_contig_graph_alternative`）
+
+- 非 partition 分发（`clean_graph` 末尾 else，`Overlaps.cpp` 39659）：
+  primary 图在**活的读图**上跑 `adjust_utg_by_primary`（读段类别被改写、
+  未认领读段被 drop），alternative 图再从改写后的读图生成
+  `ma_ug_gen_primary(ALTER_LABLE)`——两个驱动的先后依赖与 C++ 相同。
+- 门禁：`hifiasm --primary -t1` vs Rust `--primary -t1`——
+  `p_ctg`/`a_ctg`/`r_utg`/`p_utg` 各 gfa/noseq/lowQ.bed 全部逐字节一致
+  （165.9 s，exit 0）。输出前缀无 `.bp` 段（`get_outfile_name` 在
+  `HA_F_PARTITION` 清除后返回原名），与 C++ 一致。
+- `break_ug_contig`（`--b-cov/--h-cov`）仍为显式 Err（默认不触发）。
+
+#### `-e`（`HA_F_BAN_ASSEMBLY`）
+
+- `build_string_graph_without_clean` 在缓存写盘后检查
+  `HA_F_BAN_ASSEMBLY`（`Overlaps.cpp` 39714），命中即返回 Ok、exit 0、
+  不产出任何 GFA。
+- 门禁：归一化时间/CPU 字段后与 `hifiasm -e -t1` 日志逐行一致，
+  包括写盘日志 7 行（`Writing reads to disk...` …
+  `bin files have been written.`）。
+- 顺带补齐了默认路径缺失的
+  `Inconsistency threshold for low-quality regions in BED files: 70%`
+  收尾日志行（`Overlaps.cpp` 39673）。
+
+#### 重启缓存（`*.ec.bin` / `*.ovlp.source.bin` / `*.ovlp.reverse.bin`）
+
+新模块 `src/assembly/read_cache.rs`，对应 `write_all_data_to_disk` /
+`load_all_data_from_disk`（`Overlaps.cpp` 23567/23590）与
+`write_All_reads` / `write_ma_hit_ts` / `write_ma` 的逐字段格式
+（`Process_Read.cpp` 69/127，`Overlaps.cpp` 23442/23420）。
+
+- **格式要点**：`ec.bin` 头部携带 `index_size`/`name_index_size`——这是
+  C 的分配容量（`READ_INIT_NUMBER=1000` 起，`< total_reads+2` 时
+  `*2+2`，5626 读 → 8014），不是条目数；`name_index` 有效条目为
+  `[0..=total_reads]`（哨兵 = `total_name_length`）；每读 packed 序列
+  写 `len/4+1` 字节。`ovlp.bin` 为 `i64 n_read` + 每读
+  (u8 fully_corrected, u8 abnormal, u32 length) + 每 hit 42 字节流
+  （u64 qns、u32 qe/tn/ts/te、u8 el/no_l_indel、u32 ml/rev/bl/del；
+  `cc` 位字段不序列化）。
+- **写盘门禁**：`ovlp.source/reverse.bin` 与 C++ 逐字节一致（默认、
+  `--primary`、`-i`、`-e` 四个 profile 全部）；`ec.bin` 分节一致
+  （`tests/read_cache_golden.rs`，掩码见下）。
+- **加载门禁**：同目录第二遍运行打印
+  `[M::ha_assemble::0.041*0.96] ==> loaded corrected reads and overlaps
+  from disk`，跳过全部纠错（0 行 pec 日志），17 个组装产物仍与 C++
+  逐字节一致，且缓存不被重写（`write = !ovlp_loaded = 0`）。
+  `het_cov == -1024` 时按 `hap_recalculate_peaks`
+  （`Assembly.cpp` 1881）重建峰值（本语料不触发：写入值为 36/18）。
+  `-i` 时完整重算，产物一致。
+- **`ec.bin` 的两处 C++ 非确定性**（字节门禁必须掩码，见
+  `read_cache` 模块文档与 `tests/read_cache_golden.rs`）：
+  1. 每读最后一个 packed 字节的 padding 位（`len%4==0` 时整字节）——
+     C 的堆残渣，同命令重跑也不一致（实测 7–24 字节差异，全部位于
+     padding）；`.ec.fa` 不受影响（只读有效碱基）。
+  2. `name_index` 哨兵之后的容量槽——malloc 残渣（实测跨命令恰好
+     相同，但语义上未初始化）。
+  `compare_outputs.sh` 对 `ec.bin` 报 DIFFERS 属预期，以
+  `read_cache_golden` 的分节比对为准；`ovlp` 两个 bin 可裸 `cmp`。
+- **`total_reads_bases` 语义修复**：C++ 在载入时冻结该计数
+  （`ha_insert_read_len` 之后无任何更新），而 Rust 的
+  `write_corrected_read_back` 曾同步更新 `total_bases`——导致缓存头部
+  写出修正后总长（84042711 vs 84042542）。已改为冻结语义（长度数组
+  仍随纠错更新，与 C++ 相同）。
+- 写盘时机在 `try_rescue_overlaps` **之前**（`Overlaps.cpp` 39707），
+  缓存内容是 pre-rescue overlap。
+
+#### 选项空间剩余缺口（已知静默差异，未在本轮）
+
+- `--ul`（超长读段）静默忽略——C++ 会以 UL 读段重跑整条组装，风险
+  最高的静默 no-op；`--ul-*` 参数组同样未接线。
+- `--telo-*`（端粒标记 `gen_telo_end_t`）、`--chem-c/--chem-f`、
+  `--sc-cut`、`--m-rate`（配 `--b-cov/--h-cov`）、Hi-C 参数组
+  （`--seed/--s-base/--n-weight/...`）均为静默 no-op。
+- trio 前端（`Trio.cpp`，`-1/-2/-3/-4/-5/--trio-dual`）与 Hi-C 分发
+  （`--h1/--h2/--enzyme`）为显式 gate 错误（需测试数据）。
+- 调试项：`ha_assemble_pair`（`--sec-in`）、`ha_ec_dbg`（`--dbg-ovec`）
+  为桩；`--dbg-gfa/--prt-raw/--integer-correct/-b/--ex-list` 静默。
+- 双方一致地死掉的选项：`--skip-triobin`、`--low-het`、`--ul-m`。
 
 ### P2 门禁实测（与 C++ 日志逐字节一致）
 
