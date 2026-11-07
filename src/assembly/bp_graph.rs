@@ -1572,3 +1572,220 @@ pub fn output_trio_graph_joint(
 
     Ok(())
 }
+
+
+// ---------------------------------------------------------------------------
+// `output_contig_graph_primary` / `output_contig_graph_alternative`
+// (`Overlaps.cpp` 32644 / 32699): the `--primary` tail of `clean_graph`.
+// ---------------------------------------------------------------------------
+
+/// The `ma_ug_seq` + GFA triple shared by the two `--primary` drivers.
+///
+/// The C++ duplicates this block per driver with a fixed log line and tag;
+/// the log text is part of the consistency scope, so it stays parameterised.
+#[allow(clippy::too_many_arguments)]
+fn print_primary_contig_graph(
+    unitig_graph: &mut UnitigGraph,
+    read_graph: &mut Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+    new_rtg_edges: &[AsgArc],
+    output_file_name: &str,
+    file_tag: &str,
+    gfa_tag: &str,
+    log_line: &str,
+    reads: &ReadStore,
+    trio_labels: &[u8],
+    options: &AssemblyOptions,
+) -> Result<(), String> {
+    ma_ug_seq(
+        unitig_graph,
+        read_graph,
+        coverage_cut,
+        sources,
+        new_rtg_edges,
+        None,
+        options.maximum_hang_length,
+        options.minimum_overlap_length,
+        true,
+        reads,
+        options.maximum_hang_rate,
+    );
+
+    eprintln!("{}", log_line);
+    let gfa_name = format!("{}.{}.gfa", output_file_name, file_tag);
+    let mut output = BufWriter::new(
+        File::create(&gfa_name).map_err(|error| format!("failed to create {}: {}", gfa_name, error))?,
+    );
+    ma_ug_print(
+        unitig_graph,
+        read_graph,
+        Some(coverage_cut),
+        Some(sources),
+        Some(read_to_unitig),
+        gfa_tag,
+        &mut output,
+        reads,
+        trio_labels,
+    )
+    .map_err(|error| format!("failed to write {}: {}", gfa_name, error))?;
+    output
+        .flush()
+        .map_err(|error| format!("failed to write {}: {}", gfa_name, error))?;
+
+    let noseq_name = format!("{}.{}.noseq.gfa", output_file_name, file_tag);
+    let mut output = BufWriter::new(
+        File::create(&noseq_name)
+            .map_err(|error| format!("failed to create {}: {}", noseq_name, error))?,
+    );
+    ma_ug_print_simple(
+        unitig_graph,
+        read_graph,
+        Some(coverage_cut),
+        Some(sources),
+        Some(read_to_unitig),
+        gfa_tag,
+        &mut output,
+        reads,
+        trio_labels,
+    )
+    .map_err(|error| format!("failed to write {}: {}", noseq_name, error))?;
+    output
+        .flush()
+        .map_err(|error| format!("failed to write {}: {}", noseq_name, error))?;
+
+    if options.bed_inconsistency_rate != 0 {
+        let bed_name = format!("{}.{}.lowQ.bed", output_file_name, file_tag);
+        let mut output = BufWriter::new(
+            File::create(&bed_name)
+                .map_err(|error| format!("failed to create {}: {}", bed_name, error))?,
+        );
+        ma_ug_print_bed(
+            unitig_graph,
+            read_graph,
+            coverage_cut,
+            sources,
+            new_rtg_edges,
+            options.maximum_hang_length,
+            options.minimum_overlap_length,
+            options.bed_inconsistency_rate as u32,
+            gfa_tag,
+            &mut output,
+            reads,
+            options.maximum_hang_rate,
+        )
+        .map_err(|error| format!("failed to write {}: {}", bed_name, error))?;
+        output
+            .flush()
+            .map_err(|error| format!("failed to write {}: {}", bed_name, error))?;
+    }
+
+    Ok(())
+}
+
+/// `output_contig_graph_primary`: the primary contig output of the
+/// non-partition (`--primary`) dispatch.
+///
+/// Runs [`adjust_utg_by_primary`] on the live read graph — the reference
+/// passes `sg` itself here, so the read classes are relabelled and the
+/// unclaimed reads dropped before [`output_contig_graph_alternative`] runs —
+/// and writes the `p_ctg` triple. `break_ug_contig` for
+/// `b_low_cov`/`b_high_cov` is not ported; both switches are off in the
+/// default configuration.
+#[allow(clippy::too_many_arguments)]
+pub fn output_contig_graph_primary(
+    read_graph: &mut Asg,
+    coverage_cut: &mut [CoverageCut],
+    output_file_name: &str,
+    sources: &[PafList],
+    reverse_sources: &[PafList],
+    read_to_unitig: &mut ReadToUnitig,
+    bubble_labels: &mut BubbleLabel,
+    options: &mut AssemblyOptions,
+    reads: &ReadStore,
+    trio_flags: &mut [u8],
+) -> Result<(), String> {
+    let mut unitig_graph = ma_ug_gen_primary(read_graph, PRIMARY_LABEL);
+    let new_rtg_edges: Vec<AsgArc> = Vec::new();
+
+    adjust_utg_by_primary(
+        &mut unitig_graph,
+        read_graph,
+        coverage_cut,
+        sources,
+        reverse_sources,
+        read_to_unitig,
+        primary_tips_length(options),
+        0.15,
+        3,
+        0.05,
+        0.9,
+        options.maximum_hang_length,
+        options.minimum_overlap_length,
+        &new_rtg_edges,
+        Some(bubble_labels),
+        options,
+        trio_flags,
+        false,
+        false,
+    )?;
+
+    if options.breakpoint_low_coverage > 0 || options.breakpoint_high_coverage > 0 {
+        return Err(
+            "output_contig_graph_primary needs break_ug_contig (b_low_cov/b_high_cov), which is not ported yet"
+                .to_string(),
+        );
+    }
+
+    print_primary_contig_graph(
+        &mut unitig_graph,
+        read_graph,
+        coverage_cut,
+        sources,
+        read_to_unitig,
+        &new_rtg_edges,
+        output_file_name,
+        "p_ctg",
+        "ptg",
+        "Writing primary contig GFA to disk... ",
+        reads,
+        trio_flags,
+        options,
+    )
+}
+
+/// `output_contig_graph_alternative`: the alternate contig output of the
+/// non-partition dispatch. The read graph has already been relabelled by
+/// [`output_contig_graph_primary`], so the alternate unitig graph is built
+/// from the dropped reads.
+#[allow(clippy::too_many_arguments)]
+pub fn output_contig_graph_alternative(
+    read_graph: &mut Asg,
+    coverage_cut: &[CoverageCut],
+    output_file_name: &str,
+    sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+    reads: &ReadStore,
+    trio_labels: &[u8],
+    options: &AssemblyOptions,
+) -> Result<(), String> {
+    let mut unitig_graph = ma_ug_gen_primary(read_graph, ALTER_LABEL);
+    let new_rtg_edges: Vec<AsgArc> = Vec::new();
+
+    print_primary_contig_graph(
+        &mut unitig_graph,
+        read_graph,
+        coverage_cut,
+        sources,
+        read_to_unitig,
+        &new_rtg_edges,
+        output_file_name,
+        "a_ctg",
+        "atg",
+        "Writing alternate contig GFA to disk... ",
+        reads,
+        trio_labels,
+        options,
+    )
+}

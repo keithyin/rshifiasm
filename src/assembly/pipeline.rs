@@ -276,7 +276,35 @@ pub fn build_string_graph_without_clean(
         );
     }
 
-    Err("output_contig_graph_primary is not implemented yet".to_string())
+    // The reference's final `else` clears `HA_F_PARTITION` defensively
+    // (`Overlaps.cpp` 39660) and writes the primary and alternate contig
+    // graphs from the same, now relabelled, read graph.
+    options.flags &= !FLAG_PARTITION;
+    let mut trio_flags = reads.trio_labels.clone();
+    crate::assembly::bp_graph::output_contig_graph_primary(
+        &mut graph,
+        &mut coverage_cut,
+        &output_file_name,
+        &sources,
+        &reverse_sources,
+        &mut read_to_unitig,
+        &mut bubble_labels,
+        options,
+        reads,
+        &mut trio_flags,
+    )?;
+    crate::assembly::bp_graph::output_contig_graph_alternative(
+        &mut graph,
+        &coverage_cut,
+        &output_file_name,
+        &sources,
+        &read_to_unitig,
+        reads,
+        &trio_flags,
+        options,
+    )?;
+
+    Ok(())
 }
 
 /// `ul_clean_gfa`: the cleaning loop, the post-rescue pass and the read
