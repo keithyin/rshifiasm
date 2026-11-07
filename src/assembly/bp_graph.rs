@@ -412,12 +412,30 @@ pub fn print_utg(
     trio_labels: &[u8],
     options: &AssemblyOptions,
 ) -> Result<(), String> {
-    // `break_ug_contig` for `b_low_cov`/`b_high_cov` is not ported; both
-    // switches are off in the default configuration.
-    if options.breakpoint_low_coverage > 0 || options.breakpoint_high_coverage > 0 {
-        return Err(
-            "print_utg needs break_ug_contig (b_low_cov/b_high_cov), which is not ported yet"
-                .to_string(),
+    if options.breakpoint_low_coverage > 0 {
+        crate::assembly::break_contig::break_ug_contig(
+            unitig_graph,
+            read_graph,
+            reads,
+            sources,
+            read_to_unitig,
+            new_rtg_edges,
+            Some(options.breakpoint_low_coverage),
+            None,
+            options.exact_match_rate,
+        );
+    }
+    if options.breakpoint_high_coverage > 0 {
+        crate::assembly::break_contig::break_ug_contig(
+            unitig_graph,
+            read_graph,
+            reads,
+            sources,
+            read_to_unitig,
+            new_rtg_edges,
+            None,
+            Some(options.breakpoint_high_coverage),
+            options.exact_match_rate,
         );
     }
 
@@ -914,10 +932,30 @@ pub fn output_trio_unitig_graph(
         trio_flags,
     )?;
 
-    if options.breakpoint_low_coverage > 0 || options.breakpoint_high_coverage > 0 {
-        return Err(
-            "output_trio_unitig_graph needs break_ug_contig (b_low_cov/b_high_cov), which is not ported yet"
-                .to_string(),
+    if options.breakpoint_low_coverage > 0 {
+        crate::assembly::break_contig::break_ug_contig(
+            &mut unitig_graph,
+            read_graph,
+            _reads,
+            sources,
+            read_to_unitig,
+            &new_rtg_edges,
+            Some(options.breakpoint_low_coverage),
+            None,
+            options.exact_match_rate,
+        );
+    }
+    if options.breakpoint_high_coverage > 0 {
+        crate::assembly::break_contig::break_ug_contig(
+            &mut unitig_graph,
+            read_graph,
+            _reads,
+            sources,
+            read_to_unitig,
+            &new_rtg_edges,
+            None,
+            Some(options.breakpoint_high_coverage),
+            options.exact_match_rate,
         );
     }
 
@@ -1731,10 +1769,30 @@ pub fn output_contig_graph_primary(
         false,
     )?;
 
-    if options.breakpoint_low_coverage > 0 || options.breakpoint_high_coverage > 0 {
-        return Err(
-            "output_contig_graph_primary needs break_ug_contig (b_low_cov/b_high_cov), which is not ported yet"
-                .to_string(),
+    if options.breakpoint_low_coverage > 0 {
+        crate::assembly::break_contig::break_ug_contig(
+            &mut unitig_graph,
+            read_graph,
+            reads,
+            sources,
+            read_to_unitig,
+            &new_rtg_edges,
+            Some(options.breakpoint_low_coverage),
+            None,
+            options.exact_match_rate,
+        );
+    }
+    if options.breakpoint_high_coverage > 0 {
+        crate::assembly::break_contig::break_ug_contig(
+            &mut unitig_graph,
+            read_graph,
+            reads,
+            sources,
+            read_to_unitig,
+            &new_rtg_edges,
+            None,
+            Some(options.breakpoint_high_coverage),
+            options.exact_match_rate,
         );
     }
 

@@ -22,6 +22,7 @@ pub mod tangle;
 pub mod trans_clean;
 pub mod trans_cov;
 pub mod trio_clean;
+pub mod break_contig;
 pub mod read_cache;
 pub mod unitig;
 
