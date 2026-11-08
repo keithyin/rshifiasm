@@ -97,6 +97,7 @@ pub fn output_bp_graph(
         trio_flags,
         true,
         true,
+        true,
     )?;
 
     print_utg(
@@ -186,6 +187,11 @@ pub fn adjust_utg_by_primary(
     trio_flags: &mut [u8],
     collect_p_trans: bool,
     collect_p_trans_f: bool,
+    // Whether the caller passes an `i_cov` out-pointer (`&cov`): the skip
+    // condition below is `i_cov && collect_p_trans == 0`. Callers that pass
+    // `NULL` (only `output_contig_graph_primary` in the reference) keep the
+    // purge running even with `collect_p_trans == 0`.
+    has_cov_out: bool,
 ) -> Result<HapCov, String> {
     // `(asm_opt.purge_level_primary > 0 || i_cov) ? 1 : 0`: every caller of
     // this port asks for the coverage object, so `i_cov` is non-null.
@@ -241,6 +247,11 @@ pub fn adjust_utg_by_primary(
     delete_useless_nodes(unitig_graph);
     renew_utg(unitig_graph, read_graph, new_rtg_edges);
 
+    // `if(i_cov && collect_p_trans == 0) goto skip_purge;` — the skip jumps
+    // over the purge, the post-join rescues, the tip cut, the read relabel
+    // and the coverage-range defaults, straight to `recover_utg_by_coverage`.
+    let skip_purge = has_cov_out && !collect_p_trans;
+    if !skip_purge {
     if options.purge_level_primary > 0 {
         // `just_contain = (purge_level_primary == 1)`.
         let just_contain = options.purge_level_primary == 1;
@@ -376,6 +387,7 @@ pub fn adjust_utg_by_primary(
             options.recover_alternate_contig_coverage_minimum
         );
     }
+    } // `skip_purge` end
 
     let is_r_het = if cov.t_ch.is_some() {
         Some(&mut cov.is_r_het[..])
@@ -1764,6 +1776,7 @@ pub fn output_contig_graph_primary(
         Some(bubble_labels),
         options,
         trio_flags,
+        false,
         false,
         false,
     )?;

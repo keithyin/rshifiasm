@@ -255,7 +255,7 @@ fn get_xy_pos_by_pos(
 /// `cmp_hap_alignment_chaining`: orders by `x.el`, then x position, then y
 /// position. The reference calls `qsort`, which is a stable merge sort in
 /// glibc, so the port sorts stably.
-fn compare_arc_offsets(left: &ArcOffset, right: &ArcOffset) -> std::cmp::Ordering {
+pub fn compare_arc_offsets(left: &ArcOffset, right: &ArcOffset) -> std::cmp::Ordering {
     left.arc
         .exact_region
         .cmp(&right.arc.exact_region)

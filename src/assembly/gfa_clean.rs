@@ -30,6 +30,13 @@ pub const LOOP: u8 = 7;
 /// [`asg_cut_semi_circ`].
 pub const LIM_LEN: u32 = 100;
 
+/// `TRIO_THRES` (`Overlaps.h` 29): a tip belongs to a haplotype only when the
+/// dominant label covers more than this share of its flagged reads.
+const TRIO_THRES: f64 = 0.9;
+/// `DOUBLE_CHECK_THRES` (`Overlaps.h` 30): the same tip must also cover at
+/// least this share of its whole walk.
+const DOUBLE_CHECK_THRES: f64 = 0.1;
+
 /// `telo_end_t`: which reads carry a telomere motif on either end.
 ///
 /// Bit 0 marks a 5' telomere and bit 1 a 3' telomere; the cleaning passes only
@@ -63,6 +70,74 @@ pub fn get_real_length_one(graph: &Asg, v: u32) -> Option<u32> {
         .iter()
         .find(|arc| !arc.deleted)
         .map(|arc| arc.v)
+}
+
+/// `get_tip_trio_infor` (`Overlaps.cpp` 6890): walks the unitary chain that
+/// starts at `begin_node` and classifies it by the trio labels of the reads
+/// it covers.
+///
+/// The walk advances while the current vertex has exactly one live arc whose
+/// target has exactly one live arc into the reverse complement, stopping at
+/// the first branching vertex (or when the walk returns to `begin_node`). A
+/// chain is labelled with the dominant label only when it covers more than
+/// [`TRIO_THRES`] of the flagged reads *and* at least
+/// [`DOUBLE_CHECK_THRES`] of the whole walk; otherwise it stays ambiguous.
+pub fn get_tip_trio_infor(graph: &Asg, begin_node: u32, trio_labels: &[u8]) -> u8 {
+    let mut v = begin_node;
+    let mut walk_length = 0u32;
+    let mut father_occurrence = 0u32;
+    let mut mother_occurrence = 0u32;
+    // The reference counts `ambigious_occ` but never reads it; keep the
+    // counter for the sake of the mirror.
+    #[allow(unused_assignments)]
+    let mut ambiguous_occurrence = 0u32;
+
+    loop {
+        let live_arcs = get_real_length(graph, v);
+        walk_length += 1;
+
+        let label = trio_labels[(v >> 1) as usize];
+        if label == crate::command_line::options::TRIO_FATHER {
+            father_occurrence += 1;
+        } else if label == crate::command_line::options::TRIO_MOTHER {
+            mother_occurrence += 1;
+        } else if label == crate::command_line::options::TRIO_UNKNOWN
+            || u32::from(label) == crate::assembly::trio_clean::DROP
+        {
+            ambiguous_occurrence += 1;
+        }
+
+        if live_arcs != 1 {
+            break;
+        }
+        // `live_arcs == 1`, so the single live arc exists; the reference
+        // refetches it through the optional output of `get_real_length`.
+        let w = get_real_length_one(graph, v).expect("the single live arc exists");
+        if get_real_length(graph, w ^ 1) != 1 {
+            break;
+        }
+        v = w;
+        if v == begin_node {
+            break;
+        }
+    }
+
+    let flagged_length = father_occurrence + mother_occurrence;
+    if flagged_length == 0 {
+        return crate::command_line::options::TRIO_UNKNOWN;
+    }
+    if father_occurrence >= mother_occurrence {
+        if (father_occurrence as f64) > TRIO_THRES * (flagged_length as f64)
+            && (father_occurrence as f64) >= DOUBLE_CHECK_THRES * (walk_length as f64)
+        {
+            return crate::command_line::options::TRIO_FATHER;
+        }
+    } else if (mother_occurrence as f64) > TRIO_THRES * (flagged_length as f64)
+        && (mother_occurrence as f64) >= DOUBLE_CHECK_THRES * (walk_length as f64)
+    {
+        return crate::command_line::options::TRIO_MOTHER;
+    }
+    crate::command_line::options::TRIO_UNKNOWN
 }
 
 /// The `for (i = kv = 0; ...) { if (av[i].del) continue; kv++; break; }` test
@@ -794,8 +869,9 @@ pub fn asg_arc_cut_chimeric(
 /// `asg_arc_cut_inexact`: removes an inexact edge that competes with a better
 /// supported path.
 ///
-/// The trio-specific filtering of the reference is not part of the default
-/// run; passing `is_trio` is rejected until that mode is ported.
+/// With `is_trio` set (the `-3/-4`/`-1/-2` front ends), an arc whose target
+/// tip belongs to the opposite haplotype of the split never counts as the
+/// better supported path ([`get_tip_trio_infor`]).
 #[allow(clippy::too_many_arguments)]
 pub fn asg_arc_cut_inexact(
     graph: &mut Asg,
@@ -806,8 +882,8 @@ pub fn asg_arc_cut_inexact(
     is_trio: bool,
     min_diff: u32,
     occurrence_ratio: f32,
+    trio_labels: &[u8],
 ) -> u32 {
-    assert!(!is_trio, "trio-aware inexact cutting is not ported yet");
 
     let vertex_count = graph.sequences.len() * 2;
     let mut count = 0u32;
@@ -866,6 +942,25 @@ pub fn asg_arc_cut_inexact(
             continue;
         }
 
+        // `if(is_trio) { speedup; trioF = get_tip_trio_infor(g, v^1);
+        // ntrioF = opposite }`: the haplotype an arc must not be matched by.
+        let mut opposite_flag = u32::MAX;
+        if is_trio {
+            if get_real_length(graph, v) <= 1 && get_real_length(graph, w) <= 1 {
+                continue;
+            }
+            let trio_flag = get_tip_trio_infor(graph, v ^ 1, trio_labels);
+            opposite_flag = match trio_flag {
+                crate::command_line::options::TRIO_FATHER => {
+                    u32::from(crate::command_line::options::TRIO_MOTHER)
+                }
+                crate::command_line::options::TRIO_MOTHER => {
+                    u32::from(crate::command_line::options::TRIO_FATHER)
+                }
+                _ => u32::MAX,
+            };
+        }
+
         // The mirror arc `w -> v^1`; the graph is kept symmetric, so it is
         // present even when it has been deleted.
         let (w_start, _) = graph.arc_range(w);
@@ -890,6 +985,11 @@ pub fn asg_arc_cut_inexact(
                 continue;
             }
             kv += 1;
+            if is_trio
+                && u32::from(get_tip_trio_infor(graph, arc.v, trio_labels)) == opposite_flag
+            {
+                continue;
+            }
             if v_max_overlap < arc.overlap {
                 v_max_overlap = arc.overlap;
                 v_max = Some((v_start + i as usize, arc));
@@ -922,6 +1022,11 @@ pub fn asg_arc_cut_inexact(
                 continue;
             }
             kw += 1;
+            if is_trio
+                && u32::from(get_tip_trio_infor(graph, arc.v, trio_labels)) == opposite_flag
+            {
+                continue;
+            }
             if w_max_overlap < arc.overlap {
                 w_max_overlap = arc.overlap;
             }
@@ -1100,8 +1205,9 @@ pub fn trans_path_check(
 /// `asg_arc_cut_length`: cuts the shorter side of a split whose overlaps are
 /// too short relative to the longest alternative.
 ///
-/// The trio branch is not ported because the primary path always passes
-/// `is_trio = 0`; the call is rejected rather than silently approximated.
+/// With `is_trio` set, an arc whose target tip belongs to the opposite
+/// haplotype of the split never counts as the longest alternative
+/// ([`get_tip_trio_infor`]).
 #[allow(clippy::too_many_arguments)]
 pub fn asg_arc_cut_length(
     graph: &mut Asg,
@@ -1117,8 +1223,8 @@ pub fn asg_arc_cut_length(
     reverse_sources: Option<&[PafList]>,
     read_to_unitig: Option<&ReadToUnitig>,
     maximum_drop_length: Option<u32>,
+    trio_labels: &[u8],
 ) -> u32 {
-    assert!(!is_trio, "trio-aware length cutting is not ported yet");
 
     buffer.clear();
     let vertex_count = graph.sequences.len() * 2;
@@ -1185,6 +1291,25 @@ pub fn asg_arc_cut_length(
             continue;
         }
 
+        // `if(is_trio) { speedup; trioF = get_tip_trio_infor(g, v^1);
+        // ntrioF = opposite }`, as in [`asg_arc_cut_inexact`].
+        let mut opposite_flag = u32::MAX;
+        if is_trio {
+            if get_real_length(graph, v) <= 1 && get_real_length(graph, w) <= 1 {
+                continue;
+            }
+            let trio_flag = get_tip_trio_infor(graph, v ^ 1, trio_labels);
+            opposite_flag = match trio_flag {
+                crate::command_line::options::TRIO_FATHER => {
+                    u32::from(crate::command_line::options::TRIO_MOTHER)
+                }
+                crate::command_line::options::TRIO_MOTHER => {
+                    u32::from(crate::command_line::options::TRIO_FATHER)
+                }
+                _ => u32::MAX,
+            };
+        }
+
         let mirror_offset = graph
             .arcs_of(w)
             .iter()
@@ -1207,6 +1332,11 @@ pub fn asg_arc_cut_length(
                 continue;
             }
             kv += 1;
+            if is_trio
+                && u32::from(get_tip_trio_infor(graph, arc.v, trio_labels)) == opposite_flag
+            {
+                continue;
+            }
             if overlap_max < arc.overlap {
                 overlap_max = arc.overlap;
                 v_max = Some(start + i);
@@ -1244,6 +1374,11 @@ pub fn asg_arc_cut_length(
                 continue;
             }
             kw += 1;
+            if is_trio
+                && u32::from(get_tip_trio_infor(graph, arc.v, trio_labels)) == opposite_flag
+            {
+                continue;
+            }
             if overlap_max < arc.overlap {
                 overlap_max = arc.overlap;
                 w_max = Some(start + i);
@@ -2210,6 +2345,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         );
         assert_eq!(count, 1);
         assert!(graph.get_arc(0, 2).is_none());

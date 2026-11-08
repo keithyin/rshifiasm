@@ -703,7 +703,7 @@ fn init_p_g_t(unitig_graph: &UnitigGraph, read_graph: &Asg, is_r_het: &[u8]) -> 
 
 /// `clean_visit_flag`: clears the vote marks of the unitigs a read list votes
 /// for.
-fn clean_visit_flag(
+pub(crate) fn clean_visit_flag(
     visit: &mut [u8],
     read_graph: &Asg,
     read_to_unitig: &ReadToUnitig,
@@ -738,103 +738,76 @@ fn clean_visit_flag(
     }
 }
 
-/// The vote-counting half of `hap_alignment_advance_worker`.
-///
-/// Every read of unitig `x_uid` votes for the unitigs that hold the reads it
-/// overlaps. A unitig with at least one vote makes the reference enter its
-/// haplotype-alignment candidate scan; that scan is not ported yet, so a vote
-/// is reported as an explicit error instead of being ignored.
-fn hap_alignment_advance_worker(
-    unitig_graph: &UnitigGraph,
-    read_graph: &Asg,
-    reverse_sources: &[PafList],
-    read_to_unitig: &ReadToUnitig,
-    x_uid: u32,
-    votes: &mut [u64],
-    visit: &mut [u8],
-) -> Result<(), String> {
-    let nsg = &unitig_graph.graph;
-    if nsg.sequences[x_uid as usize].deleted
-        || nsg.sequences[x_uid as usize].coverage_class == ALTER_LABEL
-    {
-        return Ok(());
-    }
-
-    votes.fill(0);
-    visit.fill(0);
-    let contig_count = nsg.sequences.len();
-    let x_reads = &unitig_graph.unitigs[x_uid as usize];
-
-    for &packed in &x_reads.reads {
-        let x_reverse = &reverse_sources[(packed >> 33) as usize];
-        for hit in &x_reverse.hits {
-            let mut r_id = hit.target_identifier;
-            if read_graph.sequences[r_id as usize].deleted {
-                let (mapped, is_unitig) = read_to_unitig.get(r_id);
-                r_id = mapped;
-                if r_id == u32::MAX
-                    || is_unitig == 1
-                    || read_graph.sequences[r_id as usize].deleted
-                {
-                    continue;
-                }
-            }
-
-            let (hap_uid, is_unitig) = read_to_unitig.get(r_id);
-            if is_unitig == 0 || hap_uid == u32::MAX {
-                continue;
-            }
-            if visit[hap_uid as usize] != 0 {
-                continue;
-            }
-            visit[hap_uid as usize] = 1;
-            if votes[hap_uid as usize] < u64::MAX {
-                votes[hap_uid as usize] += 1;
-            }
-        }
-
-        clean_visit_flag(visit, read_graph, read_to_unitig, contig_count, &x_reverse.hits);
-    }
-
-    let mut voted = 0usize;
-    for (i, &vote) in votes.iter().enumerate() {
-        if i as u32 == x_uid || vote == 0 {
-            continue;
-        }
-        voted += 1;
-    }
-    if voted == 0 {
-        return Ok(());
-    }
-    Err(format!(
-        "purge_dups: unitig {} votes for {} candidate unitig(s); the \
-         haplotype-alignment candidate scan (Purge_Dups.cpp \
-         hap_alignment_advance_worker) is not ported yet",
-        u64::from(x_uid) + 1,
-        voted
-    ))
-}
-
-/// `kt_for(hap_alignment_advance_worker)`, single-threaded.
+/// `init_hap_alignment_struct_pip` + `kt_for(hap_alignment_advance_worker)`,
+/// single-threaded: builds the per-read `hh` weights, then runs the vote and
+/// candidate scan for every unitig into `all_ovlp`.
+#[allow(clippy::too_many_arguments)]
 fn hap_alignment_advance(
     unitig_graph: &UnitigGraph,
     read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
     reverse_sources: &[PafList],
     read_to_unitig: &ReadToUnitig,
+    position_index: &[u64],
+    density: f32,
+    max_hang: i32,
+    min_ovlp: i32,
+    cov_threshold: i64,
+    cov: &HapCov,
+    options: &AssemblyOptions,
+    all_ovlp: &mut HapOverlapsList,
 ) -> Result<(), String> {
+    let _ = sources;
+    // `init_hap_alignment_struct_pip`'s `sc` derivation.
+    let mut sc: i64 = -1;
+    if options.global_homozygous_coverage_is_set != 0 {
+        sc = (f64::from(options.global_homozygous_coverage) * 1.75) as i64;
+    } else if options.global_homozygous_coverage > 0 {
+        sc = ((((f64::from(options.global_homozygous_coverage)) / HOM_PEAK_RATE) as i32) as f64
+            * 1.75) as i64;
+    }
+    if sc <= 0 {
+        sc = -1;
+    }
+    let hh = crate::assembly::hap_alignment::init_pip_hh(read_graph, reverse_sources, coverage_cut, sc);
+
+    let ctx = crate::assembly::hap_alignment::HapAlignmentContext {
+        read_graph,
+        reverse_sources,
+        read_to_unitig,
+        coverage_cut,
+        position_index,
+        maximum_hang: max_hang,
+        maximum_hang_rate: options.maximum_hang_rate,
+        minimum_overlap: min_ovlp,
+        purge_level: options.purge_level_primary as u32,
+    };
     let unitig_count = unitig_graph.graph.sequences.len();
-    let mut votes = vec![0u64; unitig_count];
-    let mut visit = vec![0u8; unitig_count];
+    let mut scratch = crate::assembly::hap_alignment::HapAlignmentScratch::new(unitig_count);
+    let cov_threshold_u64 = if cov_threshold < 0 { u64::MAX } else { cov_threshold as u64 };
     for v in 0..unitig_count {
-        hap_alignment_advance_worker(
+        crate::assembly::hap_alignment::hap_alignment_scan_worker(
             unitig_graph,
-            read_graph,
-            reverse_sources,
-            read_to_unitig,
+            &ctx,
             v as u32,
-            &mut votes,
-            &mut visit,
-        )?;
+            &hh,
+            density,
+            0.1,
+            cov_threshold_u64,
+            cov,
+            all_ovlp,
+            &mut scratch,
+            &|visit, contig_count, hits| {
+                clean_visit_flag(
+                    visit,
+                    read_graph,
+                    read_to_unitig,
+                    contig_count as usize,
+                    hits,
+                );
+            },
+        );
     }
     Ok(())
 }
@@ -981,8 +954,6 @@ pub fn purge_dups(
     options: &mut AssemblyOptions,
     trio_flags: &mut [u8],
 ) -> Result<(), String> {
-    // The candidate scan is the only reader of these arguments.
-    let _ = (density, max_hang, min_ovlp);
 
     let read_count = read_graph.sequences.len();
     if cov.pos_idx.len() < read_count {
@@ -1062,8 +1033,40 @@ pub fn purge_dups(
     }
 
     if !just_coverage {
-        hap_alignment_advance(unitig_graph, read_graph, reverse_sources, read_to_unitig)?;
+        hap_alignment_advance(
+            unitig_graph,
+            read_graph,
+            coverage_cut,
+            sources,
+            reverse_sources,
+            read_to_unitig,
+            &cov.pos_idx,
+            density,
+            max_hang,
+            min_ovlp,
+            cov_threshold,
+            cov,
+            options,
+            &mut all_ovlp,
+        )?;
+        if std::env::var("RSHIFIASM_PURGE_DEBUG").is_ok() {
+            let total: usize = all_ovlp.x.iter().map(|l| l.len()).sum();
+            let nonempty = all_ovlp.x.iter().filter(|l| !l.is_empty()).count();
+            eprintln!("[M::purge_dups_debug] after scan: total overlaps {} across {} unitig lists (pre-filter)", total, nonempty);
+            for (uid, list) in all_ovlp.x.iter().enumerate() {
+                for o in list {
+                    eprintln!("[M::purge_dups_debug]   ovlp x={} y={} xid=[{},{}] yid=[{},{}] xpos=[{},{}] ypos=[{},{}] rev={} kind={} w={} sc={}",
+                        o.x_uid, o.y_uid, o.x_beg_id, o.x_end_id, o.y_beg_id, o.y_end_id,
+                        o.x_beg_pos, o.x_end_pos, o.y_beg_pos, o.y_end_pos,
+                        o.reverse, o.kind, o.weight, o.score);
+                }
+            }
+        }
         filter_hap_overlaps_by_length(&mut all_ovlp, purge_min_len);
+        if std::env::var("RSHIFIASM_PURGE_DEBUG").is_ok() {
+            let total: usize = all_ovlp.x.iter().map(|l| l.len()).sum();
+            eprintln!("[M::purge_dups_debug] after filter(min_len={}): total overlaps {}", purge_min_len, total);
+        }
 
         let mut pg = init_p_g_t(unitig_graph, read_graph, &cov.is_r_het);
         normalize_hap_overlaps_advance_by_p_g_t(&all_ovlp, &back_all_ovlp, &pg)?;

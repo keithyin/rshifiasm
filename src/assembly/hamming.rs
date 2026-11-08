@@ -954,7 +954,7 @@ fn asg_bub_backtrack_check_switch(
 ///
 /// The second return value is `Some(is_switch)` only when a bubble was found;
 /// the reference then leaves the caller's `is_switch` untouched.
-fn asg_bub_pop1_primary_trio_switch_check(
+pub fn asg_bub_pop1_primary_trio_switch_check(
     graph: &mut Asg,
     unitigs: &[MaUtg],
     v0: u32,

@@ -486,7 +486,7 @@ fn get_edge_from_source_into(
 /// `get_best_contained_read`: the deleted overlap whose target is a contained
 /// read with the longest overlap to `query`.
 #[allow(clippy::too_many_arguments)]
-fn get_best_contained_read<'a>(
+pub fn get_best_contained_read<'a>(
     unitig_graph: &Asg,
     read_graph: &Asg,
     sources: &'a [PafList],

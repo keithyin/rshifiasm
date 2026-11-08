@@ -51,7 +51,7 @@
 | P3 overlap 追加 | `append_inexact_overlap_region_alloc` 与真实 `.o` 逐字段一致 | ✅ 完成（4 组黄金用例，含 f_cigar 全部条目） |
 | P3 每条读的驱动 | `ha_get_new_candidates` 的链数限制与 `ha_ov_type` 分类 | ✅ 完成（单测覆盖 4 类 containment） |
 | P3 overlap 落盘 | `push_overlaps` 与 `Output_PAF` 的字段/格式 | ✅ 完成（含反向坐标镜像的单测） |
-| P3 overlap 精化 | `append_window_list` / `ovlp_chain_gen` / `worker_ovec` | ⏳ 待实现（依赖 P4 的比对与 POA） |
+| P3 overlap 精化 | `append_window_list` / `ovlp_chain_gen` / `worker_ovec` | 旧路径遗留，非缺口（2026-11-07 核实：仅 `ha_overlap_cal`（`--sec-in` pair 模式）与 C++ 死代码 `rescue_hp_reads`/`ha_overlap_and_correct` 走此路；默认纠错 `cal_ec_r` 与 `--dbg-ovec` 的 `cal_ec_r_dbg` 均不经此，Rust 已由新路径逐字节覆盖。随 `--sec-in` 前端一并实现） |
 | P4 纠错 cigar | `Cigar_record` 打包、合并、`lost_base` 累积 | ✅ 完成（与真实 `.o` 三组黄金用例一致） |
 | P4 POA 图 | `Node`/`Edge` 布局与四类边权重更新 | ✅ 完成（整图逐节点逐边对拍 C 探针） |
 | P4 窗口 cigar | `window_list` 的 `op<<14\|len` 打包与共享 cell 缓冲 | ✅ 完成 |
@@ -1337,18 +1337,22 @@ RSHIFIASM_EC_STOP_AT=<n>   只纠前 n 条读段
 - 写盘时机在 `try_rescue_overlaps` **之前**（`Overlaps.cpp` 39707），
   缓存内容是 pre-rescue overlap。
 
-#### 选项空间剩余缺口（已知静默差异，未在本轮）
+#### 选项空间剩余缺口（2026-11-07 收尾后，见文末记录）
 
-- `--ul`（超长读段）静默忽略——C++ 会以 UL 读段重跑整条组装，风险
-  最高的静默 no-op；`--ul-*` 参数组同样未接线。
-- `--chem-c/--chem-f`、`--sc-cut`、Hi-C 参数组
-  （`--seed/--s-base/--n-weight/...`）为静默 no-op。
+- `--ul` 现为 parse 时显式错误；`--ul-*` 参数组（`--ul-rate/--ul-tip/
+  --ul-cut/--ul-round/--path-max/--path-min`）单独设置时 C++ 同样无效
+  （仅 UL 路径消费），保持静默以对齐参照语义。
+- `--chem-c/--chem-f`、`--rl-cut/--sc-cut`、`--kpt-rate`、
+  `--integer-correct` 同上：仅 ONT/UL/trio 路径消费，单独设置无效，静默。
+  Hi-C 参数组（`--seed/--s-base/--n-weight/...`）为静默 no-op（Hi-C 前端
+  `--h1/--h2` 本身已是显式错误）。
 - trio 前端（`Trio.cpp`，`-1/-2/-3/-4/-5/--trio-dual`）与 Hi-C 分发
   （`--h1/--h2/--enzyme`）为显式 gate 错误（需测试数据）。
 - 调试项：`ha_assemble_pair`（`--sec-in`，读 `.ec0/.ec1` 旧分片缓存，
-  无产出方）为桩；`--dbg-gfa/--prt-raw/--integer-correct/-b/--ex-list`
-  静默；`--fast`（EC 快速索引）解析但不可用。
-- 双方一致地死掉的选项：`--skip-triobin`、`--low-het`、`--ul-m`。
+  无产出方）为桩；`--dbg-gfa/--prt-raw/-b/--dbg-het-cnt/--ex-list/
+  --ex-iter` 与 `--ont/--fast` 现均为 parse 时显式错误（`check_supported`）。
+- 双方一致地死掉的选项：`--skip-triobin`、`--low-het`、`--ul-m`、
+  `--bin-only`（2026-11-07 核实：C++ 全库亦无消费点）。
 
 #### 输出层收尾（2026-11-07，--b-cov/--h-cov、--telo-*、--dbg-ovec）
 
@@ -1587,3 +1591,204 @@ reverse_be1 x=0..599 y=200..999    cigar=[(0,0),(499,0),(99,2),(599,2)]
   基准脚本会重新生成）。
 - `--primary` 未开启时只输出 `bp.p_ctg.gfa` 系列；默认（`HA_F_PARTITION`）还输出
   `bp.hap1.p_ctg.gfa`、`bp.hap2.p_ctg.gfa`，两者都在比对范围内。
+
+## 收尾：选项拒绝、introsort 黄金用例与死代码（2026-11-07）
+
+本轮不触碰任何默认执行路径，只为消除"选项被解析但静默无效"的误导与
+遗留杂物。门禁基线（`--write-ec`/`--write-paf`/`--primary`/`-e`/`-i` 全组
+SHA-256）在收尾后复跑不变。
+
+### `check_supported`（`command_line/parser.rs`）
+
+`check_options` 通过后追加一轮 Rust 侧支持面检查，把"参照实现会进入未实现
+分支"的开关在 parse 时显式拒绝（此前 `--ont/--fast` 在纠错驱动里才拒绝，
+其余完全静默）。消息沿用现有 gate 风格（`[ERROR] ... is not implemented yet`）。
+
+- 拒绝：`--ul`、`--dbg-gfa`、`--prt-raw`、`-b`、`--dbg-het-cnt`、
+  `--ex-list`/`--ex-iter`、`--ont`（连带 `single_cell_mode`）、`--fast`。
+  逐项核实过 C++ 消费点：`--dbg-gfa` 触发 `.pt_flt` 索引检查点与调试图
+  dump（`htab.cpp:1144`/`Assembly.cpp:2078`），`--prt-raw` 在 `gen_init_sg`
+  dump raw GFA（`Overlaps.cpp:39248`），`-b` 单读调试（`Assembly.cpp:1003`），
+  `--dbg-het-cnt` 末轮 het 计数（`Assembly.cpp:1014`），`--ex-list/
+  --ex-iter` checkpoint 抽取（`extract.cpp`）——这些在默认 HiFi 模式下就
+  生效，Rust 字段此前赋值后无任何消费点，属真实静默分歧。
+- 有意不拒绝（C++ 单独设置同样无效，报错反而偏离参照语义）：
+  `--ul-rate/--ul-tip/--ul-cut/--ul-round/--path-max/--path-min`（仅 UL 路径）、
+  `--chem-c/--chem-f/--rl-cut/--sc-cut`（仅 ONT/is_sc 路径）、
+  `--kpt-rate`（仅 `output_trio_graph`）、`--integer-correct`（仅
+  `gfa_ut.cpp:17648` 的 `ul_re_correct`）。
+- 双方一致死掉的选项维持不动：`--skip-triobin`、`--low-het`、`--unskew`、
+  `--ul-m`、`--bin-only`（本轮核实 C++ 全库亦无 `binning_only` 消费点）。
+- `ec_driver.rs` 的运行时 ONT/单细胞/partial/`--fast` 防御检查保留。
+- parse 失败退出码仍为 0，忠实 C++ `main` 行为（报错走 stderr）。
+
+### introsort 回归测试固化
+
+HEAD（d5f3ce7）introsort 深度 off-by-one 修复的临时对拍脚本
+`tests/klib_sort_tmp.rs` 依赖 `/tmp` 黄金数据，已将两组 61 条
+`(i32,u32,u32)` 记录内嵌为 `container/ksort.rs` 的黄金用例
+（`introsort_klib_matches_the_c_reference_permutation`，比较器
+`(second<<32)|third`，锁定相等键的参照排列），删除临时文件。
+
+### 死代码与注释
+
+- 删除 `src/correction/pipeline.rs`：早期单轮 `ha_ec` 路径，无生产调用点
+  （仅 mod.rs 导出），git 历史保留。
+- 修正 `bp_graph.rs` `output_contig_graph_primary` 文档注释：`break_ug_contig`
+  自 f685eec 起已移植并在该函数内调用，旧注释仍称"not ported"。
+- P3 阶段表中 "overlap 精化" 行由 ⏳ 改注：`append_window_list/
+  ovlp_chain_gen/worker_ovec` 属旧 `ha_overlap_cal` 路径（仅 `--sec-in` 与
+  C++ 死代码经过），默认纠错与 `--dbg-ovec` 均不经此，非缺口。
+
+## Trio Stage A 进行中（2026-11-07，门 A 未过，定位到 rescue_bubble_by_chain）
+
+### 已落地并验证正确的部分
+
+- 语料：`scripts/gen_trio_corpus.sh`（读名 cksum 奇偶拆两个伪单倍型），名单
+  `reference/trio_l1.txt`（2752, FATHER）/`trio_l2.txt`（2874, MOTHER）；
+  C++ 基线 `reference/reference_trio.*`（`-t1 -3 l1 -4 l2`）。
+- 前端：`assembly/trio_bin.rs`（`ha_triobin`/`_list`/`_set_list`，Trio.cpp
+  450/328/294；khashl 换 std HashMap，首现优先语义保持；gz 嗅探；日志三行
+  逐字一致——flagged 2752/2874 与 C++ 相同）。调用点在 `assemble()` 重算
+  分支 `write_requested_outputs` 之后（Assembly.cpp:2113 语义）。
+- `hit.rs::drop_edges_by_trio`（Overlaps.cpp:1590），插在两次
+  `normalize_ma_hit_t_single_side_advance` 之后——gdb 取
+  `cxx_predrop/cxx_postdrop2` 与 Rust d00a/d00b 掩码比对**完全一致**
+  （del=127414 相同）。
+- `gfa_clean.rs::get_tip_trio_infor`（Overlaps.cpp:6890，本地
+  TRIO_THRES/DOUBLE_CHECK_THRES 用 f64 对齐 Overlaps.h 宏）+
+  `asg_arc_cut_inexact`/`asg_arc_cut_length` 的 `is_trio` 三处分支
+  （gfa_ut.cpp:1007-1041/1326-1366），assert 拆除，`ul_clean_gfa` 传
+  `is_trio`（轮内两次传 trio，轮后 3157/3163 按 C++ 传 0）。
+- 分发：pipeline.rs 按 Overlaps.cpp 39605-39651 顺序——`-5` poly Err →
+  trio+Hi-C benchmark Err → trio → `output_trio_graph_joint`
+  （清 HA_F_PARTITION、`(max_short_tip*2,0.15,3,…)`、打印收尾
+  Inconsistency 行）→ Hi-C Err。
+- **清洗全程逐轮验证一致**（gdb 断点 + write_debug_graph，掩码后）：
+  round 0-3（cxx_r0-r3 vs d04-d07）、large_indel（d08）、
+  cut_length_final（d09）、semi_circ（p10 vs d10）全部 **0 差异**。
+
+### 剩余缺口（门 A 的唯一阻塞）
+
+`post_rescue` 末尾的 `rescue_bubble_by_chain`（gfa_ut.cpp:3024 →
+Overlaps.cpp:36832）。先前会话在默认语料上探测为 no-op 而跳过；trio
+语料下 C++ 2387→2396 条活弧（p10→p14），Rust 停在 2387→2390。需移植：
+
+- `bubble_type`（hic.h:37-53）、`get_bubbles`（hic.cpp:2217）、
+  `dfs_bubble_broken`（hic.cpp:2232）、`identify_bubbles`
+  （hic.cpp:2354-2607，Hi-C Phase 3 的机械提前入场）
+- `reset_bub`（Overlaps.cpp:36534）
+- `rescue_bubbles_by_contained_reads`（35620）、
+  `rescue_bubbles_by_missing_ovlp`（36092）、
+  `rescue_bubbles_by_missing_ovlp_backward`（36247）
+- `rescue_bubble_by_chain` 本体（36832：ma_ug_gen_primary → 副本上调
+  `adjust_utg_by_primary`（第三参 TRIO_THRES）→ reset_bub ×3 → 三个
+  rescue；trio_recover 块在 0.25 已被注释，`no_trio_recover` 实参未用）
+- Rust 已有可复用：`copy_read_graph`/`copy_untig_graph`/
+  `ma_ug_gen_primary`/`adjust_utg_by_primary`（bp_graph.rs/unitig.rs）、
+  `asg_bub_pop1_primary_trio`（bubble_identify.rs）、
+  `asg_bub_pop1_primary_trio_switch_check`（hamming.rs:957）、
+  `TransChain`（hap_cov.rs）。
+
+### 侦察方法论备忘（下次直接用）
+
+1. gdb `finish` 不可靠（cxx_postdrop 首次为假象）；应在**调用后的行**下
+   断点（如 Overlaps.cpp:39375）再 dump。
+2. `write_debug_ma_hit_ts`/`write_asg_t` dump 的掩码比对：ma_hit 的
+   `cc/bl`（cigar 缓冲偏移，重算运行留陈旧值、装载运行为零、输出不可见、
+   缓存不序列化）与 asg 弧的 `ou`（=min(bl,0x3fff)，Overlaps.cpp:3012，
+   仅 UL 模式消费，Rust 有意置零——graph_build.rs:146）必须掩码。
+3. `--dbg-gfa` 运行在 build_string_graph_without_clean 头部走
+   `load_debug_graph` 分支且 HA_F_VERBOSE_GFA 改变纠错轮的 r_out 行为，
+   其 39436 dump（1514 弧）与普通运行（2397 弧）不可比；一律用 gdb 在
+   普通运行上取 dump。
+4. pipeline.rs 现有临时探针 d00a_after_normalize/d00b_after_drop_edges
+   （待门 A 过后决定去留）。
+
+## Trio Stage A 续（2026-11-08，气泡子系统移植完成，门 A 推进到 purge 深链）
+
+- `src/assembly/bubble_chain.rs`（~4200 行 Rust）：簇 1-4 全部落地——
+  BubbleType/Pdq/identify_bubbles/build_bub_graph/get·detect_bub_graph/
+  update·resolve_bubble_chain/tangle 簇/三 rescue/reset_bub/
+  rescue_bubble_by_chain 驱动；hamming.rs 的 switch_check 转 pub；
+  rescue.rs 的 get_best_contained_read/update_unitig 复用。
+  cargo test 294 全绿。
+- 接入：pipeline post_rescue 的 d15 之后（C++ post_rescue 末行），
+  **暂限 trio_binning_requested()** 进入——默认语料 C++ 证明 no-op
+  （d15==d16），跳过等价；默认门禁已复验通过（17 identical + ec.bin 豁免）。
+- 已修 bug：驱动内 beg_idx 误用 s_bub，应为 f_bub（C++ rescue_bubble_by_chain
+  的 beg_idx = bub.f_bub，只处理链/tangle 新增气泡）。
+- 门 A 现行阻塞：rescue 内 adjust_utg_by_primary（trio 标签下）触发
+  Purge_Dups.cpp:2964-3179 的 hap_alignment_advance_worker 候选扫描
+  （purge_level_primary=3 在 trio 模式照样生效）→ 其 DP 链化助手簇
+  （get_candidate_hap_alignment 等，~2000 行 C++）未移植。这是此前
+  purge 深链 stub 清单的既知项，详见 bubble_rescue_map.md 的 ⚠️ 节。
+- 遗留：簇 3 shortest_path 有一个未定位的越界 panic（默认语料触发过一次，
+  trio 门控后当前不可达；hap-alignment 移植后 trio 全链路会暴露）。
+
+## Trio Stage A 续二（2026-11-08，purge 深链打通 + 气泡子系统五处修复，门 A 差异收敛到 3 个读段）
+
+### adjust_utg_by_primary 的 skip_purge 语义（根因修复之一）
+
+C++ `adjust_utg_by_primary`（Overlaps.cpp:32425）在 `i_cov != NULL && collect_p_trans == 0`
+时 `goto skip_purge`——跳过 purge、post-join rescue、tip 切割、读段重标记与
+coverage-range 默认值，直接进 `recover_utg_by_coverage`。此前 Rust 移植漏掉该短路，
+导致 trio 流程里 rescue 内的 adjust 白跑了整套 purge（产出 6 条 hap overlap，
+后续 normalize 桩 Err）。`i_cov` 的有无在 Rust 中以新增 `has_cov_out: bool`
+形参表达：rescue/ug_ext_gfa 调用点（`&cov, 0, 0` → skip）、`output_bp_graph`
+（17642，`&cov, 1, 1` → 不跳）、`output_contig_graph_primary`（32654，`NULL`
+→ 即使 collect_p_trans=0 也不跳）。**修改后 trio 运行的 purge 阈值打印次数
+与 C++ 一致（1 次）**。
+
+### hap-alignment 候选扫描簇（新模块 src/assembly/hap_alignment.rs）
+
+`Purge_Dups.cpp` 611-3216 的活代码全量移植：prefilter/get_xy_pos/
+deduplicate_edge/比较器/get_hap_overlapLen/classify_hap_overlap/
+get_pair_hap_similarity(_by_base)/check_hap_match/determin_..._single_side/
+bi_direction_.../get_hap_alignment_boundary/get_idx_by_base/get_base_boundary_
+chain/advance(_back)/get_chain_score/determine_hap_overlap_type_advance(_back)/
+calculate_pair_hap_similarity_advance/hap_chaining/get_candidate_hap_alignment/
+filter_secondary_chain/init_pip_hh + `hap_alignment_scan_worker`（投票半部 +
+候选扫描，替代 purge_dups.rs 的 Err 桩）。浮点混合精度（f32/f64 各比较点）、
+无符号回绕、`push_hap_can` 不写 index_beg/score 的未初始化行为（Rust 取 0 并
+注释）均在模块头记录。**接线后 trio 语料的 all_ovlp 现在能真实产出**（6 条），
+但 skip_purge 修复后 C++ 在该语料不触发扫描——扫描代码为后续 purge 级语料
+与 Hi-C 复用保留，当前默认/trio 路径不可达。
+
+### 气泡子系统五处移植 bug（gdb 逐检查点对拍 C++ 后修复）
+
+gdb 检查点（每次 `reset_bub` 后）：HIT1 14/74/13、HIT2 16/96/15、rescue 入口
+18/106/17（num.n/list.n/b_g 节点数）——修复后 Rust 三处全部逐项一致，num 数组
+逐字节相同，b_bub=2/b_end=2/tangle=0 一致：
+
+1. **Pdq::id_mode 移位方向**：C `((uint64_t)-1)>>（64-i）`（低 i 位），Rust 误写
+   `>>i`（2^56-1），unpack 出 `(dis<<8)|v` 的垃圾顶点（文档记载的
+   shortest_path panic，本次终获定位）。
+2. **get_bubbles 哨兵**：C 只在请求 body 时读 `num[id+1]`；update_bubble_graph
+   新推气泡无哨兵，Rust 无条件读越界。Rust 改为缺哨兵时回退 list.len()
+   （参考在该处读未初始化内存且 body 从不被消费）。
+3. **扫描接受条件反相**：C `i == b.b.n` 为"校验循环完整跑完=接受"，Rust 写成
+   反相——所有候选都被标 bit31 拒绝，气泡排序退化、b_s_idx/update 全盘失配。
+4. **m_het/p_het 定义颠倒**：hic.h 实际 `P_het=num.n、M_het=num.n+1`
+   （bubble_rescue_map 旧记录写反），Rust 跟随错误文档导致 index 分类错位、
+   update_bubble_graph 的 hom 过滤吞掉 broken 集合。
+5. **update_bubble_chain 三处**：end 分支弧计数须用链条图（bub_ug.graph）的
+   `(i<<1)+1`/`(i<<1)`（Rust 误用 bsg）；middle 的 p_t 须为 bsg 弧槽位
+   （C 持指针原地置 del，影响链条再生成；Rust 改传槽位下标）；`arc_first`
+   无 count 守卫（按 offset 取槽位）。
+
+另有 `update_unitig` revert 打包修复：C 的 `mode<<31` 后整体 `<<32`，mode 落在
+bit63；Rust 直接 `mode<<31` 侵入 uId 字段（panic 0x80000012）。
+
+### 门 A 现状
+
+trio 运行完整跑通（exit 0），默认 9-profile 门禁无回归，294 单测全绿。
+12 个 GFA/bed 产物仍有差异；d12 掩码对拍（write_debug_graph 转储 + ruIndex
+解析）显示唯一分歧为 **3 个读段（1361/1455/1460）的容器指派**：C++ 未恢复
+（0xffffffff），Rust 保留了陈旧的 contained 映射（0x549 等）——即
+rescue_bubbles_by_contained_reads 的 chain_edges 收集在 Rust 侧漏了这 3 条。
+下一层对拍点：rescue 内 chain 链收集（get_edge2existing_node_advance_by_
+broken_bub / bub_complex 一带）对这 3 个读段的决策。
+
+调试钩子（仅定位用，默认关闭）：`RSHIFIASM_PURGE_DEBUG`（打印 purge 后
+all_ovlp 计数）；C++ 侧对拍脚本 /tmp/gdb_bub*.gdb（gdb 检查点转储）。

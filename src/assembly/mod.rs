@@ -13,6 +13,7 @@ pub mod gfa_clean;
 pub mod graph_build;
 pub mod hamming;
 pub mod hap_cov;
+pub mod hap_alignment;
 pub mod hit;
 pub mod pipeline;
 pub mod probe;
@@ -20,8 +21,10 @@ pub mod purge_dups;
 pub mod rescue;
 pub mod tangle;
 pub mod trans_clean;
+pub mod bubble_chain;
 pub mod trans_cov;
 pub mod trio_clean;
+pub mod trio_bin;
 pub mod break_contig;
 pub mod read_cache;
 pub mod unitig;
@@ -115,6 +118,13 @@ pub fn assemble(options: &mut AssemblyOptions) -> i32 {
             ) {
                 eprintln!("[ERROR] failed to write the requested outputs: {}", error);
                 return 1;
+            }
+            // `Output_PAF(); ha_triobin(&asm_opt);` — binning runs on the
+            // freshly computed overlaps only; a run that loaded the caches
+            // replays it from the phase checkpoints instead (`Trio.cpp`,
+            // `load_yak_binning`).
+            if options.trio_binning_requested() {
+                trio_bin::run_trio_binning(options, &mut read_store);
             }
             (read_store, corrected.state, true)
         }

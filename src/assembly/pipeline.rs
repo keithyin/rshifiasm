@@ -163,8 +163,36 @@ pub fn build_string_graph_without_clean(
     // `clean_graph`: mirror both sides, then drop the weakly supported hits.
     normalize_ma_hit_t_single_side_advance(&mut forward, is_ont, None, 0);
     normalize_ma_hit_t_single_side_advance(&mut reverse, false, None, 0);
-    // With no trio binning the reference memsets every `R_INF.trio_flag`
-    // entry to `AMBIGU`; the store already holds `TRIO_LABEL_UNKNOWN` (0).
+    probe::try_dump_stage_raw(
+        dump_directory.as_deref(),
+        "d00a_after_normalize",
+        None,
+        &forward,
+        &forward_flags,
+        &reverse,
+        &reverse_flags,
+        None,
+        &read_to_unitig,
+        &reads.trio_labels,
+    );
+    // `if (ha_opt_triobin(&asm_opt)) drop_edges_by_trio(sources, n_read);
+    // else memset(R_INF.trio_flag, AMBIGU, ...)` — the else half is a no-op
+    // here because the store already holds `TRIO_UNKNOWN` (0) everywhere.
+    if options.trio_binning_requested() {
+        crate::assembly::hit::drop_edges_by_trio(&mut forward, &reads.trio_labels);
+    }
+    probe::try_dump_stage_raw(
+        dump_directory.as_deref(),
+        "d00b_after_drop_edges",
+        None,
+        &forward,
+        &forward_flags,
+        &reverse,
+        &reverse_flags,
+        None,
+        &read_to_unitig,
+        &reads.trio_labels,
+    );
     clean_weak_ma_hit_t(&mut forward, &reverse, &reads.read_lengths, u32::MAX);
     probe::try_dump_stage_raw(
         dump_directory.as_deref(),
@@ -280,13 +308,52 @@ pub fn build_string_graph_without_clean(
     )
     .map_err(|error| format!("failed to write the primary unitig GFA: {}", error))?;
 
-    // Output dispatch of `clean_graph`. Only the HiFi/partition branch can be
-    // reached here; the trio and Hi-C branches need their own front ends.
+    // Output dispatch of `clean_graph` (`Overlaps.cpp` 39605-39651), in the
+    // reference's order: polyploid, trio+Hi-C benchmark, trio, Hi-C, default.
+    if options.trio_polyploid_file_name.is_some() {
+        return Err("output_poly_trio (-5) is not implemented yet".to_string());
+    }
     if options.trio_binning_requested() && options.hic_partition_requested() {
         return Err("benchmark_hic_graph is not implemented yet".to_string());
     }
     if options.trio_binning_requested() {
-        return Err("output_trio_graph_joint is not implemented yet".to_string());
+        if options.trio_heterozygous_overlap_coverage > 0 {
+            return Err("output_bp_trio_graph (--trio-dual) is not implemented yet".to_string());
+        }
+        // `if(asm_opt.flag & HA_F_PARTITION) asm_opt.flag -= HA_F_PARTITION;`
+        options.flags &= !FLAG_PARTITION;
+        // `output_trio_graph_joint(sg, coverage_cut, o_file, sources,
+        // reverse_sources, (asm_opt.max_short_tip*2), 0.15, 3, ruIndex,
+        // 0.05, 0.9, max_hang_length, mini_overlap_length, gap_fuzz,
+        // &b_mask_t, NULL, NULL, &uopt)`.
+        let mut trio_flags = reads.trio_labels.clone();
+        let joint_status = crate::assembly::bp_graph::output_trio_graph_joint(
+            &mut graph,
+            &mut coverage_cut,
+            &output_file_name,
+            &sources,
+            &reverse_sources,
+            i64::from(options.maximum_short_tip_read_count) * 2,
+            0.15,
+            3,
+            &mut read_to_unitig,
+            0.05,
+            0.9,
+            maximum_hang,
+            minimum_overlap,
+            options.gap_fuzz,
+            &mut bubble_labels,
+            options,
+            &mut trio_flags,
+            reads,
+        );
+        // The reference prints the BED threshold at the end of `clean_graph`,
+        // after every dispatch branch.
+        eprintln!(
+            "Inconsistency threshold for low-quality regions in BED files: {}%",
+            options.bed_inconsistency_rate
+        );
+        return joint_status;
     }
     if options.hic_partition_requested() {
         return Err("output_hic_graph is not implemented yet".to_string());
@@ -377,6 +444,9 @@ fn ul_clean_gfa(
     let max_tip_i32 = max_tip as i32;
     let large_bubble_population_size = options.large_bubble_population_size as u64;
     let maximum_short_tip_read_count = options.maximum_short_tip_read_count;
+    // `clean_graph` passes `ha_opt_triobin(&asm_opt)` into `ul_clean_gfa`
+    // (`Overlaps.cpp` 39447); the round-loop cutters consume it.
+    let is_trio = options.trio_binning_requested();
 
     let step = if clean_round == 1 {
         max_drop
@@ -418,9 +488,10 @@ fn ul_clean_gfa(
             &mut buffer,
             max_tip_i32,
             false,
-            false,
+            is_trio,
             0,
             ou_drop_rate,
+            &reads.trio_labels,
         );
         asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
@@ -432,13 +503,14 @@ fn ul_clean_gfa(
             drop as f32,
             ou_drop_rate,
             false,
-            false,
+            is_trio,
             true,
             0,
             1,
             None,
             None,
             None,
+            &reads.trio_labels,
         );
         asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
@@ -512,6 +584,8 @@ fn ul_clean_gfa(
     );
 
     asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
+    // The two post-loop passes pass `0/**is_trio**/` in the reference
+    // (`gfa_ut.cpp` 3157/3163); only the round loop is trio aware.
     asg_arc_cut_length(
         graph,
         &mut buffer,
@@ -526,6 +600,7 @@ fn ul_clean_gfa(
         Some(reverse_sources),
         Some(read_to_unitig),
         None,
+        &reads.trio_labels,
     );
     asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
@@ -544,6 +619,7 @@ fn ul_clean_gfa(
         Some(reverse_sources),
         Some(read_to_unitig),
         Some(2000),
+        &reads.trio_labels,
     );
     asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
@@ -754,7 +830,39 @@ fn post_rescue(
         trio_labels,
     );
 
-    // `rescue_bubble_by_chain` follows here in the reference. It needs the
-    // purge-trans chain (`ir_het`) that is not ported yet; the stage does not
-    // change the graph on the chr11-2M corpus (probe d15 == d16).
+    // `rescue_bubble_by_chain(sg, uopt->coverage_cut, src, rev,
+    // (asm_opt.max_short_tip*2), 0.15, 3, rI, 0.05, 0.9, uopt->max_hang,
+    // uopt->min_ovlp, 10, uopt->gap_fuzz, b_mask_t, 0, NULL)` — the final
+    // pass of `post_rescue`. The reference mutates `R_INF.trio_flag` through
+    // it; the label writes of the live trio path are read-only, so a local
+    // copy stands in for the global (the trio gate validates this).
+    // The reference runs this pass unconditionally; on a non-trio corpus it
+    // is a no-op (probe d15 == d16), so the port only enters it when the
+    // trio front end is active until its remaining dependencies
+    // (the Purge_Dups hap-alignment candidate scan) are ported.
+    if !options.trio_binning_requested() {
+        return;
+    }
+    let mut rescue_trio_labels = reads.trio_labels.clone();
+    if let Err(error) = crate::assembly::bubble_chain::rescue_bubble_by_chain(
+        graph,
+        coverage_cut,
+        sources,
+        reverse_sources,
+        read_to_unitig,
+        bubble_labels,
+        options,
+        &mut rescue_trio_labels,
+        i64::from(options.maximum_short_tip_read_count) * 2,
+        0.15,
+        3,
+        0.05,
+        0.9,
+        options.maximum_hang_length,
+        options.minimum_overlap_length,
+        10,
+        min_thres,
+    ) {
+        eprintln!("[ERROR] rescue_bubble_by_chain failed: {}", error);
+    }
 }

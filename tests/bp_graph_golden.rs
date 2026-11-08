@@ -302,6 +302,7 @@ fn the_trio_stage_reproduces_the_reference_flags() {
         &mut trio_flags,
         true,
         true,
+        true,
     )
     .expect("adjust_utg_by_primary must succeed");
 

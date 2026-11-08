@@ -129,6 +129,31 @@ pub fn set_reverse_overlap(destination: &mut PafHit, source: &PafHit) {
     destination.block_length = source.block_length;
 }
 
+/// `drop_edges_by_trio` (`Overlaps.cpp` 1590): with the trio front end
+/// active, deletes every overlap whose two reads carry disagreeing
+/// non-ambiguous trio labels. The reference runs it in `clean_graph` right
+/// after the overlap normalization; without binning the labels are all
+/// `AMBIGU` and every hit is left untouched.
+pub fn drop_edges_by_trio(sources: &mut [Vec<PafHit>], trio_labels: &[u8]) {
+    for hits in sources.iter_mut() {
+        for hit in hits.iter_mut() {
+            if hit.deleted {
+                continue;
+            }
+            let query_label = trio_labels[hit.query_identifier as usize];
+            let target_label = trio_labels[hit.target_identifier as usize];
+            if query_label != crate::command_line::options::TRIO_UNKNOWN
+                && target_label != crate::command_line::options::TRIO_UNKNOWN
+                && query_label != target_label
+            {
+                hit.deleted = true;
+                continue;
+            }
+            hit.deleted = false;
+        }
+    }
+}
+
 /// `normalize_ma_hit_t_single_side_advance`: makes both halves of every
 /// overlap pair agree, adding a reverse hit when a pair is one-sided.
 ///
