@@ -1905,3 +1905,16 @@ Rust 缓存，stdout 逐字节）：
 `cargo test` 326 全绿；默认 9-profile（102 个 gfa/bed 的 SHA-256）与 trio 门 A
 均无回归。实现：`src/assembly/extract.rs`（新），接线在
 `assembly::assemble` 的缓存加载分支、`hap_recalculate_peaks` 之前。
+
+## `--prt-raw`（2026-11-08，`gen_init_sg` 的原始 unitig 转储）
+
+`asm_opt.prt_dbg_gfa` 在 `gen_init_sg` 的 `ma_sg_gen` 之后、`asg_arc_del_trans`
+之前触发一次 `prt_dbg_gfa(sg, "raw", ...)`：
+`get_outfile_name()` 前缀 + `.raw`，再经 `print_debug_gfa(ug=NULL, is_seq=1)`
+执行 `ma_ug_gen` → `ma_ug_seq(..., is_polish=0)` → `ma_ug_print`，写出
+`{o}.{bp|dip|hic}.raw.r_utg.gfa`（带序列、A 行与 HG 标签）。
+
+门禁：default `-t1 --prt-raw` 与 trio `-3/-4 --prt-raw` 的
+`*.bp.raw.r_utg.gfa`、`*.dip.raw.r_utg.gfa` 均与 C++ 逐字节一致
+（29,881,620 / 42,477,043 字节）；关闭该选项时行为不变（默认 9-profile 与
+trio 门 A 复验全绿，`cargo test` 326 项）。实现：`graph_build::write_raw_debug_gfa`。

@@ -14,9 +14,11 @@ use crate::assembly::hit::{
     CoverageCut, ReadToUnitig,
 };
 use crate::command_line::options::AssemblyOptions;
+use crate::correction::ec_driver::PafList;
 use crate::logging;
 use crate::overlap::paf::PafHit;
 use crate::reads::ReadStore;
+use std::io::Write;
 
 /// `asg_arc_del_trans`: Myers' transitive reduction with a length tolerance.
 ///
@@ -230,6 +232,21 @@ pub fn gen_init_sg(
         minimum_overlap,
         options.maximum_hang_rate,
     );
+    if options.print_debug_gfa != 0 {
+        // `if(asm_opt.prt_dbg_gfa) prt_dbg_gfa(sg, "raw", ...)`: a dump of the
+        // raw unitig graph with sequences, taken before the transitive
+        // reduction (`print_debug_gfa(..., is_seq = 1)`).
+        write_raw_debug_gfa(
+            &mut graph,
+            sources,
+            &coverage_cut,
+            read_to_unitig,
+            reads,
+            options,
+            maximum_hang,
+            minimum_overlap,
+        );
+    }
     asg_arc_del_trans(&mut graph, gap_fuzz);
 
     let threshold_count = thread_count.clamp(0, 10) as u32;
@@ -242,6 +259,64 @@ pub fn gen_init_sg(
         coverage_cut,
         bubble_label,
         coverage,
+    }
+}
+
+/// The `--prt-raw` dump of `gen_init_sg`: `print_debug_gfa` with `ug == NULL`
+/// and `is_seq = 1`, i.e. `ma_ug_gen`, `ma_ug_seq(... is_polish = 0)` and the
+/// full GFA writer.
+#[allow(clippy::too_many_arguments)]
+fn write_raw_debug_gfa(
+    read_graph: &mut Asg,
+    sources: &[Vec<PafHit>],
+    coverage_cut: &[CoverageCut],
+    read_to_unitig: &ReadToUnitig,
+    reads: &ReadStore,
+    options: &AssemblyOptions,
+    maximum_hang: i32,
+    minimum_overlap: i32,
+) {
+    let lists: Vec<PafList> = sources
+        .iter()
+        .map(|hits| PafList {
+            hits: hits.clone(),
+            ..PafList::default()
+        })
+        .collect();
+    let mut unitig_graph = crate::assembly::unitig::ma_ug_gen(read_graph);
+    let edges: Vec<crate::assembly::asg::AsgArc> = Vec::new();
+    crate::assembly::unitig::ma_ug_seq(
+        &mut unitig_graph,
+        read_graph,
+        coverage_cut,
+        &lists,
+        &edges,
+        None,
+        maximum_hang,
+        minimum_overlap,
+        false,
+        reads,
+        options.maximum_hang_rate,
+    );
+    let prefix = crate::assembly::pipeline::get_outfile_name(options);
+    let path = format!("{}.raw.r_utg.gfa", prefix);
+    let result = std::fs::File::create(&path).and_then(|file| {
+        let mut output = std::io::BufWriter::new(file);
+        crate::assembly::unitig::ma_ug_print(
+            &unitig_graph,
+            read_graph,
+            Some(coverage_cut),
+            Some(&lists),
+            Some(read_to_unitig),
+            "utg",
+            &mut output,
+            reads,
+            &reads.trio_labels,
+        )?;
+        output.flush()
+    });
+    if let Err(error) = result {
+        eprintln!("[ERROR] failed to write {}: {}", path, error);
     }
 }
 

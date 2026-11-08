@@ -959,10 +959,6 @@ fn check_supported(options: &AssemblyOptions) -> bool {
         );
         return false;
     }
-    if options.print_debug_gfa != 0 {
-        eprintln!("[ERROR] --prt-raw (the raw-GFA debug dump) is not implemented yet");
-        return false;
-    }
     if options.required_read_name.is_some() {
         eprintln!("[ERROR] -b (single-read correction debugging) is not implemented yet");
         return false;
