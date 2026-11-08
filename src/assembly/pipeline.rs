@@ -7,7 +7,9 @@
 
 use crate::assembly::asg::Asg;
 use crate::assembly::bubble::{BubbleBuffer, BubbleInfo, BubbleLabel};
-use crate::assembly::bubble_identify::asg_arc_identify_simple_bubbles_multi;
+use crate::assembly::bubble_identify::{
+    asg_arc_identify_simple_bubbles_multi, flat_soma_v,
+};
 use crate::assembly::gfa_clean::{
     asg_arc_cut_bub_links, asg_arc_cut_chimeric, asg_arc_cut_complex_bub_links,
     asg_arc_cut_inexact, asg_arc_cut_length, asg_arc_cut_tips, asg_cut_large_indel,
@@ -108,6 +110,10 @@ pub fn build_string_graph_without_clean(
     let min_thres = i64::from(max_short_tip + 1);
 
     let mut read_to_unitig = ReadToUnitig::new(reads.total_reads as usize);
+    // `R_INF.trio_flag`: one live array threaded through the cleaning, the
+    // bubble rescue and the output dispatch (the reference mutates the
+    // global in place).
+    let mut trio_flags = reads.trio_labels.clone();
 
     // `if (asm_opt.write_index_to_disk && write) write_all_data_to_disk(...)`
     // (`Overlaps.cpp` 39707), before `try_rescue_overlaps`: the caches hold
@@ -152,7 +158,7 @@ pub fn build_string_graph_without_clean(
         &reverse_flags,
         None,
         &read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
     // `clean_graph` head: `if(!cmk) renew_graph_init(...)`. On the HiFi path
@@ -173,13 +179,13 @@ pub fn build_string_graph_without_clean(
         &reverse_flags,
         None,
         &read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
     // `if (ha_opt_triobin(&asm_opt)) drop_edges_by_trio(sources, n_read);
     // else memset(R_INF.trio_flag, AMBIGU, ...)` — the else half is a no-op
     // here because the store already holds `TRIO_UNKNOWN` (0) everywhere.
     if options.trio_binning_requested() {
-        crate::assembly::hit::drop_edges_by_trio(&mut forward, &reads.trio_labels);
+        crate::assembly::hit::drop_edges_by_trio(&mut forward, &trio_flags);
     }
     probe::try_dump_stage_raw(
         dump_directory.as_deref(),
@@ -191,7 +197,7 @@ pub fn build_string_graph_without_clean(
         &reverse_flags,
         None,
         &read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
     clean_weak_ma_hit_t(&mut forward, &reverse, &reads.read_lengths, u32::MAX);
     probe::try_dump_stage_raw(
@@ -204,7 +210,7 @@ pub fn build_string_graph_without_clean(
         &reverse_flags,
         None,
         &read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
     let initial = gen_init_sg(
@@ -239,7 +245,7 @@ pub fn build_string_graph_without_clean(
         &reverse_sources,
         Some(&coverage_cut),
         &read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
     // `if(asm_opt.telo_motif) te = gen_telo_end_t(...)` (`Overlaps.cpp` 39347).
@@ -256,6 +262,7 @@ pub fn build_string_graph_without_clean(
     ul_clean_gfa(
         options,
         reads,
+        &mut trio_flags,
         &mut graph,
         &sources,
         &reverse_sources,
@@ -290,7 +297,7 @@ pub fn build_string_graph_without_clean(
         &reverse_sources,
         Some(&coverage_cut),
         &read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
     output_contig_graph_primary_pre(
@@ -326,7 +333,6 @@ pub fn build_string_graph_without_clean(
         // reverse_sources, (asm_opt.max_short_tip*2), 0.15, 3, ruIndex,
         // 0.05, 0.9, max_hang_length, mini_overlap_length, gap_fuzz,
         // &b_mask_t, NULL, NULL, &uopt)`.
-        let mut trio_flags = reads.trio_labels.clone();
         let joint_status = crate::assembly::bp_graph::output_trio_graph_joint(
             &mut graph,
             &mut coverage_cut,
@@ -362,7 +368,6 @@ pub fn build_string_graph_without_clean(
         // The reference's `R_INF.trio_flag` starts out without any trio
         // evidence and is filled by the purge/trio stages; keep a local copy
         // so the output drivers can mutate it.
-        let mut trio_flags = reads.trio_labels.clone();
         return crate::assembly::bp_graph::output_bp_graph(
             &mut graph,
             &mut coverage_cut,
@@ -381,7 +386,6 @@ pub fn build_string_graph_without_clean(
     // (`Overlaps.cpp` 39660) and writes the primary and alternate contig
     // graphs from the same, now relabelled, read graph.
     options.flags &= !FLAG_PARTITION;
-    let mut trio_flags = reads.trio_labels.clone();
     crate::assembly::bp_graph::output_contig_graph_primary(
         &mut graph,
         &mut coverage_cut,
@@ -421,6 +425,7 @@ pub fn build_string_graph_without_clean(
 fn ul_clean_gfa(
     options: &mut AssemblyOptions,
     reads: &ReadStore,
+    trio_flags: &mut Vec<u8>,
     graph: &mut Asg,
     sources: &[PafList],
     reverse_sources: &[PafList],
@@ -468,7 +473,7 @@ fn ul_clean_gfa(
         reverse_sources,
         Some(coverage_cut),
         read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
     for round in 0..clean_round {
@@ -491,7 +496,7 @@ fn ul_clean_gfa(
             is_trio,
             0,
             ou_drop_rate,
-            &reads.trio_labels,
+            &trio_flags,
         );
         asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
@@ -510,7 +515,7 @@ fn ul_clean_gfa(
             None,
             None,
             None,
-            &reads.trio_labels,
+            &trio_flags,
         );
         asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
@@ -554,7 +559,7 @@ fn ul_clean_gfa(
             reverse_sources,
             Some(coverage_cut),
             read_to_unitig,
-            &reads.trio_labels,
+            &trio_flags,
         );
 
         drop += step;
@@ -580,7 +585,7 @@ fn ul_clean_gfa(
         reverse_sources,
         Some(coverage_cut),
         read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
     asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
@@ -600,7 +605,7 @@ fn ul_clean_gfa(
         Some(reverse_sources),
         Some(read_to_unitig),
         None,
-        &reads.trio_labels,
+        &trio_flags,
     );
     asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
@@ -619,7 +624,7 @@ fn ul_clean_gfa(
         Some(reverse_sources),
         Some(read_to_unitig),
         Some(2000),
-        &reads.trio_labels,
+        &trio_flags,
     );
     asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
@@ -631,7 +636,7 @@ fn ul_clean_gfa(
         reverse_sources,
         Some(coverage_cut),
         read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
     asg_cut_semi_circ(graph, LIM_LEN, true);
@@ -643,12 +648,12 @@ fn ul_clean_gfa(
         reverse_sources,
         Some(coverage_cut),
         read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
     post_rescue(
         options,
-        reads,
+        trio_flags,
         graph,
         sources,
         reverse_sources,
@@ -677,7 +682,7 @@ fn ul_clean_gfa(
         reverse_sources,
         Some(coverage_cut),
         read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
     output_unitig_graph(
@@ -702,12 +707,25 @@ fn ul_clean_gfa(
         reverse_sources,
         Some(coverage_cut),
         read_to_unitig,
-        &reads.trio_labels,
+        &trio_flags,
     );
 
-    // `flat_soma_v(sg, src, rI)` follows here in the reference. It needs the
-    // soma/bubble machinery that is not ported yet; the stage does not change
-    // the graph on the chr11-2M corpus (probe d18 == d19).
+    // `flat_soma_v(sg, src, rI)` closes `ul_clean_gfa`: it collapses the
+    // heterozygous bubbles of the read graph, which is what turns the raw
+    // unitigs into the primary ones that `output_contig_graph_primary_pre`
+    // later writes.
+    flat_soma_v(options, graph, sources, read_to_unitig);
+    probe::try_dump_stage(
+        dump_directory,
+        "d19_after_flat_soma",
+        Some(graph),
+        sources,
+        reverse_sources,
+        Some(coverage_cut),
+        read_to_unitig,
+        &trio_flags,
+    );
+
     Ok(())
 }
 
@@ -715,7 +733,7 @@ fn ul_clean_gfa(
 #[allow(clippy::too_many_arguments)]
 fn post_rescue(
     options: &mut AssemblyOptions,
-    reads: &ReadStore,
+    trio_flags: &mut Vec<u8>,
     graph: &mut Asg,
     sources: &[PafList],
     reverse_sources: &[PafList],
@@ -731,7 +749,7 @@ fn post_rescue(
         minimum_overlap: options.minimum_overlap_length,
         minimum_length_threshold: min_thres,
     };
-    let trio_labels: &[u8] = &reads.trio_labels;
+    let trio_labels: &[u8] = trio_flags;
 
     rescue_contained_reads_aggressive(
         None,
@@ -843,7 +861,6 @@ fn post_rescue(
     if !options.trio_binning_requested() {
         return;
     }
-    let mut rescue_trio_labels = reads.trio_labels.clone();
     if let Err(error) = crate::assembly::bubble_chain::rescue_bubble_by_chain(
         graph,
         coverage_cut,
@@ -852,7 +869,7 @@ fn post_rescue(
         read_to_unitig,
         bubble_labels,
         options,
-        &mut rescue_trio_labels,
+        trio_flags,
         i64::from(options.maximum_short_tip_read_count) * 2,
         0.15,
         3,
@@ -865,4 +882,14 @@ fn post_rescue(
     ) {
         eprintln!("[ERROR] rescue_bubble_by_chain failed: {}", error);
     }
+    probe::try_dump_stage(
+        dump_directory,
+        "d16_after_bubble_chain",
+        Some(graph),
+        sources,
+        reverse_sources,
+        Some(coverage_cut),
+        read_to_unitig,
+        trio_flags,
+    );
 }

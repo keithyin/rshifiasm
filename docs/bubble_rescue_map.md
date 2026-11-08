@@ -2,9 +2,12 @@
 
 目标：移植 `rescue_bubble_by_chain`（Overlaps.cpp:36832）及其全部传递依赖，
 使 trio 门 A（`-3/-4` hap1/hap2 逐字节）通过。全部机械随后被 Hi-C Phase 3
-复用（hic.cpp 气泡半区）。当前已验证：清洗 rounds/semi_circ 之前与 C++
-逐字节一致（见 consistency.md「Trio Stage A 进行中」节），分歧只在
-post_rescue 的这个函数（C++ 2387→2396 活弧，Rust 停在 2390）。
+复用（hic.cpp 气泡半区）。
+
+> **状态（2026-11-08）：门 A 已通过。** trio 的 12 个 GFA/bed 产物与 C++
+> `reference_trio.dip.*` 逐字节一致，9-profile 默认回归无变化。收尾修复
+> （索引失效 ×2、backward `beg_idx`、缺失的 `flat_soma_v`）见
+> consistency.md「Trio Stage A 完成」一节。下文保留移植期地图，供 Hi-C 复用。
 
 ## 已确认的 Rust 可复用件
 
@@ -126,17 +129,11 @@ rescue 系的 R_INF.trio_flag 全部改传 `trio_labels: &mut [u8]`（bub_comple
 ### rescue_bubble_by_chain 驱动；已接入 pipeline post_rescue d15 后——暂限
 ### trio_binning_requested() 才进入，非 trio 语料 C++ 证明 no-op）。
 ###
-### ⚠️ 新发现的下一个缺口（门 A 的现行阻塞）：
-### rescue 内部的 adjust_utg_by_primary 在 trio 标签下触发 Purge_Dups 的
-### hap_alignment_advance_worker 候选扫描（Purge_Dups.cpp:2964-3179，215 行，
-### 默认语料不触发）——含 get_xy_pos/deduplicate_edge/get_candidate_hap_alignment
-### (DP 链化)/calculate_pair_hap_similarity_advance/prefilter/
-### filter_secondary_chain/cmp_hap_candidates 助手簇，估 ~2000 行 C++。
-### 这是此前 purge_dups 深链 stub 清单中的"hap_alignment_advance_worker
-### candidate scan"项。另：簇 3 有一个未解 panic（默认语料曾触发
-### shortest_path len=92 vs src=217345——trio 门控后默认不进入；trio 语料
-### 走到该处前会先撞上述 Err，故暂不可达；簇 4 完成后 trio 全链路会暴露它，
-### 需用 RUST_BACKTRACE=1 重新定位）。
+### ✅ 后续补齐（同日）：rescue 内 adjust_utg_by_primary 所需 Purge_Dups
+### hap_alignment 候选扫描已移植（hap_alignment.rs），门 A 已通过。
+### 另补 `flat_soma_v`/`flat_bubbles_advance`/`clean_sg_by_utg`/
+### `get_primary_path_len`（bubble_identify.rs）——trio p_utg 从 95 条
+### unitig 收缩到 20 条的真正来源；这是门 A 收尾的最后一块。
 ###
 ### 簇 4 原始清单（ historical）：Overlaps.cpp 33409-36891，~1400 行 C++：
 ### get_edge2existing_node_advance_by_broken_bub(33409,inline ~90)/

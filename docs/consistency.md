@@ -1792,3 +1792,63 @@ broken_bub / bub_complex 一带）对这 3 个读段的决策。
 
 调试钩子（仅定位用，默认关闭）：`RSHIFIASM_PURGE_DEBUG`（打印 purge 后
 all_ovlp 计数）；C++ 侧对拍脚本 /tmp/gdb_bub*.gdb（gdb 检查点转储）。
+
+## Trio Stage A 完成（2026-11-08，门 A 通过：12 个产物逐字节一致）
+
+### 收尾修复（bubble_chain.rs）
+
+1. **`finish_bubble_rescue` 缺索引失效**：C++ 在 `asg_cleanup`/`asg_symm` 前执行
+   `free(r_g->idx); r_g->idx = 0; r_g->is_srt = 0;`。Rust 的 `push_arc` 只追加，
+   索引还指向旧区间——新增弧对 `arcs_of` 不可见，`symmetrize` 又把它当作
+   非对称弧删掉。修法：push 之后、cleanup 之前 `index.clear(); is_sorted = false;`。
+2. **backward rescue 的 `beg_idx` 传错**：C++ 传 `bub.f_bub`（full bubble 数），
+   Rust 传了 `simple_bubble_count`，导致遍历的 m_bub 落在 [12,15) 而不是
+   [15,18)（本语料 f_bub=15、s_bub=12）。
+3. **backward rescue 的最终 recover_edges 回填同样缺索引失效**：修复同 (1)；
+   修后 d16 与 C++ b3 转储在 ruIndex/trio 标签/coverage_cut/source/reverse/
+   4786 条弧/序列上全部一致。
+
+### 缺失的收尾阶段：`flat_soma_v`（关键）
+
+`ul_clean_gfa` 末尾在 `output_unitig_graph` 之后还调用
+`flat_soma_v(sg, src, rI)` → `flat_bubbles_advance`（Overlaps.cpp:38992）。
+它在**读图**上反复弹出杂合气泡（`asg_bub_pop1_primary_trio` 先试探后真弹），
+最后用 `clean_sg_by_utg`（Overlaps.cpp:38733）把读图重写成展开后的 unitig 图。
+本语料 r_utg 有 95 条 unitig，展开后 p_utg 只剩 20 条——这正是此前
+"Rust p_utg == r_utg（95 条）而 C++ p_utg 20 条"的根因；不是 ALTER_LABLE
+（trio 模式下 `hic_clean_adv` 根本不执行：调用点 gfa_ut.cpp:39452 被
+`if(!ha_opt_triobin(&asm_opt))` 门控）。
+
+新增移植（bubble_identify.rs）：
+
+- `flat_soma_v`：`dip_thre_max` 的三种来源（`somatic_cov >= 0` /
+  `hom_global_coverage_set` / `hom_global_coverage / HOM_PEAK_RATE`），
+  再 `*1.15 / polyploidy` 并截断为 u64（与 C++ 两次 double→u64 截断一致）。
+- `flat_bubbles_advance`：`tLen = get_bub_pop_max_dist_advance`；每轮按
+  `bs_flag` 状态（0 未试→1、1 跳过、2 已弹可重试）扫描；对每个成泡先用
+  `is_pop=0` 试探并统计 r_flag/C_bases，`C_bases/R_bases <= het_thres` 时
+  以 `is_pop=1` 真弹；轮次由 `n_pop` 驱动。
+- `get_primary_path_len`：沿 `BubbleInfo.parent` 从 sink 回溯到（不含）v0。
+- `clean_sg_by_utg`：先全删读图弧，再恢复 primary unitig 内部弧与端到端弧；
+  ALTER_LABLE unitig 的读段整条删除；最后 `cleanup`。
+
+接入点：`pipeline.rs` 的 `ul_clean_gfa` 等价段，`output_unitig_graph` 之后、
+`clean_graph` 的 `output_contig_graph_primary_pre` 之前（新增 dump
+`d19_after_flat_soma`）。
+
+### 门禁结果
+
+- **门 A（trio）**：`rshifiasm -t1 -3 reference/trio_l1.txt -4
+  reference/trio_l2.txt -o /tmp/trio_wip/out chr11-2M.fa.gz`，
+  `scripts/compare_outputs.sh reference/reference_trio.dip
+  /tmp/trio_wip/out.dip` → 12 个产物（r_utg/p_utg 的 gfa/noseq/lowQ.bed +
+  hap1/hap2 的 p_ctg gfa/noseq/lowQ.bed）**全部逐字节一致**。
+- **9-profile 默认回归**：default / write_paf_ec / primary / bcov / telo /
+  dbg / e / i / load 共 102 个 gfa/bed 的 SHA-256 与改动前完全相同；
+  default 与 C++ `reference.bp.*`、write_paf_ec 与 C++ 同名产物（除已记录的
+  `.ec.bin` padding 豁免）逐字节一致。`flat_soma_v` 在默认语料是 no-op
+  （`hom_global_coverage` 路径下阈值不触发弹泡）。
+- `cargo test`：326 项全绿。
+
+调试钩子已全部移除（`RSHIFIASM_CHAIN_DEBUG`/`RSHIFIASM_BSG_DEBUG`、
+BW-*/IR_HET/BUB/reset2/reset3 打印、b1/b2/ug_before_backward 临时转储）。

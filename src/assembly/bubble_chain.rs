@@ -3093,6 +3093,11 @@ fn finish_bubble_rescue(
         read_graph.push_arc(*arc);
     }
     if !new_edges.is_empty() {
+        // `free(r_g->idx); r_g->idx = 0; r_g->is_srt = 0;` before
+        // `asg_cleanup`/`asg_symm`: without the reset the appended arcs stay
+        // invisible to `arcs_of`, and `asg_symm` then drops them as asymmetric.
+        read_graph.index.clear();
+        read_graph.is_sorted = false;
         read_graph.cleanup();
         read_graph.symmetrize();
     }
@@ -3259,7 +3264,7 @@ pub fn rescue_bubbles_by_contained_reads(
 
                     if ava_max > 0 {
                         let k = best.expect("a best hit exists");
-                        if !get_contained_reads_chain_by_broken_bub(
+                        let recollect = get_contained_reads_chain_by_broken_bub(
                             unitigs,
                             unitig_graph,
                             read_graph,
@@ -3278,8 +3283,8 @@ pub fn rescue_bubbles_by_contained_reads(
                             &mut circle_vis,
                             None,
                             1,
-                        ) || chain_edges.is_empty()
-                        {
+                        );
+                        if !recollect || chain_edges.is_empty() {
                             continue;
                         }
                         let t_max = *chain_edges.last().expect("non-empty chain");
@@ -3318,7 +3323,7 @@ pub fn rescue_bubbles_by_contained_reads(
                             coverage_cut[(t_max.v >> 1) as usize].class =
                                 crate::assembly::hit::PRIMARY_LABEL;
 
-                            if let Some(t) = get_edge_from_source(
+                            let forward = get_edge_from_source(
                                 sources,
                                 coverage_cut,
                                 parameters.maximum_hang,
@@ -3326,10 +3331,8 @@ pub fn rescue_bubbles_by_contained_reads(
                                 parameters.minimum_overlap,
                                 (t_max.ul >> 32) as u32,
                                 t_max.v,
-                            ) {
-                                new_edges.push(t);
-                            }
-                            if let Some(t) = get_edge_from_source(
+                            );
+                            let reverse = get_edge_from_source(
                                 sources,
                                 coverage_cut,
                                 parameters.maximum_hang,
@@ -3337,7 +3340,11 @@ pub fn rescue_bubbles_by_contained_reads(
                                 parameters.minimum_overlap,
                                 t_max.v ^ 1,
                                 ((t_max.ul >> 32) as u32) ^ 1,
-                            ) {
+                            );
+                            if let Some(t) = forward {
+                                new_edges.push(t);
+                            }
+                            if let Some(t) = reverse {
                                 new_edges.push(t);
                             }
                         }
@@ -3619,7 +3626,21 @@ pub fn rescue_bubbles_by_missing_ovlp_backward(
                     continue;
                 }
 
+                let mut rbub_edges: Vec<AsgArc> = Vec::new();
+                let mut round = 0u32;
                 for k_v in 0..2u32 {
+                    // `if(rbub_edges.n > 0)` uses the previous side's result:
+                    // once one side finds edges, the other may only walk back
+                    // to just before that position (`nsu->n - round - 1`,
+                    // unsigned, then clamped to `backward_steps`).
+                    let cur_backward_steps = if !rbub_edges.is_empty() {
+                        let remaining =
+                            (unitig.reads.len() as u32).wrapping_sub(round).wrapping_sub(1);
+                        if remaining > backward_steps { backward_steps } else { remaining }
+                    } else {
+                        backward_steps
+                    };
+
                     let v = ((u_id as u32) << 1) + k_v;
                     if get_real_length(unitig_graph, v) != 0 {
                         continue;
@@ -3631,14 +3652,12 @@ pub fn rescue_bubbles_by_missing_ovlp_backward(
                         (unitig.reads.len() as i64 - 1, -1i64, 0u32)
                     };
 
-                    let mut rbub_edges: Vec<AsgArc> = Vec::new();
-                    let mut cur_backward_steps = backward_steps;
-                    let mut round = 0u32;
+                    rbub_edges.clear();
+                    round = 0;
                     while round < cur_backward_steps && init >= 0 && (init as usize) < unitig.reads.len() {
                         let mut end_rid = (unitig.reads[init as usize] >> 32) as u32;
                         end_rid ^= mode;
 
-                        rbub_edges.clear();
                         let mut scan_index = 0usize;
                         let mut r_edge = AsgArc::default();
                         while get_edge2existing_node_advance_by_broken_bub(
@@ -3665,15 +3684,6 @@ pub fn rescue_bubbles_by_missing_ovlp_backward(
 
                         init += step;
                         round += 1;
-                        if rbub_edges.is_empty() && round < backward_steps {
-                            let remaining = unitig.reads.len() as i64 - round as i64 - 1;
-                            cur_backward_steps = if remaining > backward_steps as i64 {
-                                backward_steps
-                            } else {
-                                remaining.max(0) as u32
-                            };
-                            let _ = cur_backward_steps;
-                        }
                     }
 
                     if !rbub_edges.is_empty() {
@@ -3723,7 +3733,7 @@ pub fn rescue_bubbles_by_missing_ovlp_backward(
                                 continue;
                             }
                             new_edges.push(t);
-                            if let Some(t) = get_edge_from_source(
+                            let comp = get_edge_from_source(
                                 sources,
                                 coverage_cut,
                                 parameters.maximum_hang,
@@ -3731,7 +3741,8 @@ pub fn rescue_bubbles_by_missing_ovlp_backward(
                                 parameters.minimum_overlap,
                                 t.v ^ 1,
                                 ((t.ul >> 32) as u32) ^ 1,
-                            ) {
+                            );
+                            if let Some(t) = comp {
                                 new_edges.push(t);
                             }
                         }
@@ -3799,6 +3810,11 @@ pub fn rescue_bubbles_by_missing_ovlp_backward(
     }
 
     if recov_occ != 0 {
+        // `free(r_g->idx); r_g->idx = 0; r_g->is_srt = 0;` before
+        // `asg_cleanup`/`asg_symm`: the stale index hides the restored arcs
+        // and `asg_symm` then drops them as asymmetric.
+        read_graph.index.clear();
+        read_graph.is_sorted = false;
         read_graph.cleanup();
         read_graph.symmetrize();
     }
@@ -3891,14 +3907,6 @@ pub fn rescue_bubble_by_chain(
 
     let mut bub = BubbleType::default();
     reset_bub(&mut bub, &mut unitig_graph.graph, &unitig_graph.unitigs, &ir_het, &mut new_rtg_edges);
-    eprintln!(
-        "[M::rescue_bubble_by_chain] f_bub: {}, s_bub: {}, b_bub: {}, b_end: {}, tangle: {}",
-        bub.full_bubble_count,
-        bub.simple_bubble_count,
-        bub.broken_bubble_count,
-        bub.broken_end_bubble_count,
-        bub.tangle_bubble_count
-    );
     rescue_bubbles_by_contained_reads(
         &mut unitig_graph.graph,
         &unitig_graph.unitigs,
@@ -3952,7 +3960,7 @@ pub fn rescue_bubble_by_chain(
         bubble_labels,
         parameters,
         10,
-        bub.simple_bubble_count as u32,
+        bub.full_bubble_count as u32,
         (bub.broken_bubble_count + bub.broken_end_bubble_count + bub.tangle_bubble_count) as u32,
     );
 

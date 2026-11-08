@@ -11,12 +11,15 @@ use crate::assembly::asg::{Asg, MaUtg};
 use crate::assembly::bubble::{BubbleBuffer, BubbleInfo, BubbleLabel};
 use crate::assembly::hap_cov::{asg_bub_backtrack_primary_cov, get_num_trio_flag, HapCov};
 use crate::assembly::hamming::FlySimp;
-use crate::assembly::hit::{ALTER_LABEL, HAP_LABEL};
+use crate::assembly::hit::{ReadToUnitig, ALTER_LABEL, HAP_LABEL, PRIMARY_LABEL};
 use crate::assembly::gfa_clean::{
     get_real_length, get_real_length_one, END_TIPS, LONG_TIPS_UNDER_MAX_EXT, LOOP, MUL_INPUT,
     MUL_OUTPUT, TWO_INPUT, TWO_OUTPUT,
 };
-use crate::assembly::unitig::{UnitigGraph, FATHER, MOTHER};
+use crate::assembly::purge_dups::HOM_PEAK_RATE;
+use crate::assembly::unitig::{ma_ug_gen, UnitigGraph, FATHER, MOTHER};
+use crate::command_line::options::AssemblyOptions;
+use crate::correction::ec_driver::PafList;
 use crate::logging;
 
 /// `get_unitig`: walks the unambiguous chain from `beg_node`, measuring it.
@@ -809,6 +812,262 @@ pub fn asg_pop_bubble_primary_trio(
         unitig_graph.graph.cleanup();
     }
     n_pop
+}
+
+/// `get_primary_path_len`: the number of read bases on the primary side of a
+/// popped bubble, from the sink back to (excluding) `v0`.
+fn get_primary_path_len(
+    read_graph: &Asg,
+    unitig_graph: &UnitigGraph,
+    v0: u32,
+    buffer: &BubbleBuffer,
+) -> u64 {
+    let mut v = buffer.sources[0];
+    let mut length = 0u64;
+    loop {
+        let u = buffer.info[v as usize].parent;
+        if u == v0 {
+            break;
+        }
+        for &read in &unitig_graph.unitigs[(u >> 1) as usize].reads {
+            length += u64::from(read_graph.sequences[(read >> 33) as usize].length);
+        }
+        v = u;
+    }
+    length
+}
+
+/// `clean_sg_by_utg`: rewrites the read graph so that it holds exactly the
+/// unitig graph that was built from it.
+///
+/// Every read-graph arc is cleared first, then the arcs inside every primary
+/// unitig and the arcs between its ends are restored. Reads of an alternate
+/// unitig are deleted outright.
+fn clean_sg_by_utg(read_graph: &mut Asg, unitig_graph: &UnitigGraph) {
+    for arc in read_graph.arcs.iter_mut() {
+        arc.deleted = true;
+    }
+
+    for i in 0..unitig_graph.unitigs.len() {
+        if unitig_graph.graph.sequences[i].deleted {
+            continue;
+        }
+        let unitig = &unitig_graph.unitigs[i];
+        if unitig_graph.graph.sequences[i].coverage_class == ALTER_LABEL {
+            for &read in &unitig.reads {
+                read_graph.delete_sequence((read >> 33) as u32);
+            }
+        } else {
+            for k in 0..unitig.reads.len().saturating_sub(1) {
+                let v = (unitig.reads[k] >> 32) as u32;
+                let w = (unitig.reads[k + 1] >> 32) as u32;
+                read_graph.delete_arc(v, w, false);
+                read_graph.delete_arc(w ^ 1, v ^ 1, false);
+            }
+
+            for direction in 0..2u32 {
+                let v = ((i as u32) << 1) | direction;
+                let targets: Vec<u32> = unitig_graph
+                    .graph
+                    .arcs_of(v)
+                    .iter()
+                    .filter(|arc| !arc.deleted)
+                    .map(|arc| arc.v)
+                    .collect();
+                // `vx` is the read vertex of unitig `i` that `v` points at.
+                let own = &unitig_graph.unitigs[(v >> 1) as usize];
+                let vx = if v & 1 != 0 {
+                    (own.reads[0] >> 32) as u32 ^ 1
+                } else {
+                    (own.reads[own.reads.len() - 1] >> 32) as u32
+                };
+                for w in targets {
+                    let other = &unitig_graph.unitigs[(w >> 1) as usize];
+                    let wx = if w & 1 != 0 {
+                        (other.reads[other.reads.len() - 1] >> 32) as u32 ^ 1
+                    } else {
+                        (other.reads[0] >> 32) as u32
+                    };
+                    read_graph.delete_arc(vx, wx, false);
+                    read_graph.delete_arc(wx ^ 1, vx ^ 1, false);
+                }
+            }
+        }
+    }
+
+    read_graph.cleanup();
+}
+
+/// `flat_bubbles_advance`: collapses the heterozygous bubbles of the read
+/// graph.
+///
+/// Every bubble whose alternate bases are at most `het_thres` times the bases
+/// on its primary path is popped in the unitig graph, then the read graph is
+/// rewritten from the flattened unitig graph by [`clean_sg_by_utg`].
+pub fn flat_bubbles_advance(
+    read_graph: &mut Asg,
+    sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+    het_thres: u64,
+) {
+    let mut unitig_graph = ma_ug_gen(read_graph);
+    let vertex_count = unitig_graph.graph.sequences.len() * 2;
+    let mut buffer = BubbleBuffer {
+        info: vec![BubbleInfo::default(); vertex_count],
+        ..BubbleBuffer::default()
+    };
+    let mut bubble_flag = vec![0u8; vertex_count];
+    let mut read_flag = vec![0u8; read_graph.sequences.len()];
+    let max_distance = get_s_bub_pop_max_dist_advance(&unitig_graph.graph, &mut buffer);
+
+    for v in 0..unitig_graph.graph.sequences.len() {
+        if unitig_graph.graph.sequences[v].deleted {
+            continue;
+        }
+        unitig_graph.graph.sequences[v].coverage_class = PRIMARY_LABEL;
+        unitig_graph.unitigs[v].start = unitig_graph.unitigs[v].reads.len() as u32;
+    }
+
+    let mut n_pop = 1u64;
+    while n_pop > 0 {
+        n_pop = 0;
+        for v in 0..vertex_count as u32 {
+            if unitig_graph.graph.sequences[(v >> 1) as usize].deleted {
+                continue;
+            }
+            if unitig_graph.graph.arc_count(v) < 2 {
+                continue;
+            }
+            if get_real_length(&unitig_graph.graph, v) < 2 {
+                continue;
+            }
+            if bubble_flag[v as usize] == 1 {
+                continue;
+            }
+            if bubble_flag[v as usize] == 0 {
+                bubble_flag[v as usize] = 1;
+            }
+
+            let found = asg_bub_pop1_primary_trio(
+                &mut unitig_graph.graph,
+                Some(unitig_graph.unitigs.as_slice()),
+                v,
+                max_distance,
+                &mut buffer,
+                u32::MAX,
+                u32::MAX,
+                false,
+                None,
+                &[],
+                false,
+                false,
+            );
+            if found == 0 {
+                continue;
+            }
+
+            let sink = buffer.sources[0];
+            bubble_flag[v as usize] = 2;
+            bubble_flag[(sink ^ 1) as usize] = 2;
+
+            for &node in &buffer.visited {
+                for &read in &unitig_graph.unitigs[(node >> 1) as usize].reads {
+                    read_flag[(read >> 33) as usize] = 1;
+                }
+            }
+            for &read in &unitig_graph.unitigs[(v >> 1) as usize].reads {
+                read_flag[(read >> 33) as usize] = 1;
+            }
+            for &read in &unitig_graph.unitigs[(sink >> 1) as usize].reads {
+                read_flag[(read >> 33) as usize] = 1;
+            }
+
+            let mut alternate_bases = 0u64;
+            for &node in &buffer.visited {
+                let sequence = node >> 1;
+                if sequence == (v >> 1) || sequence == (sink >> 1) {
+                    continue;
+                }
+                for &read in &unitig_graph.unitigs[sequence as usize].reads {
+                    let read_id = (read >> 33) as u32;
+                    for hit in &sources[read_id as usize].hits {
+                        let mut target = hit.target_identifier;
+                        if read_graph.sequences[target as usize].deleted {
+                            let (mapped, is_unitig) = read_to_unitig.get(target);
+                            target = mapped;
+                            if target == u32::MAX
+                                || is_unitig == 1
+                                || read_graph.sequences[target as usize].deleted
+                            {
+                                continue;
+                            }
+                        }
+                        if read_graph.sequences[target as usize].deleted {
+                            continue;
+                        }
+                        if read_flag[target as usize] == 0 {
+                            continue;
+                        }
+                        alternate_bases += u64::from(hit.query_end - hit.query_start);
+                    }
+                }
+            }
+
+            let primary_bases = get_primary_path_len(read_graph, &unitig_graph, v, &buffer);
+            if alternate_bases / primary_bases <= het_thres {
+                asg_bub_pop1_primary_trio(
+                    &mut unitig_graph.graph,
+                    Some(unitig_graph.unitigs.as_slice()),
+                    v,
+                    max_distance,
+                    &mut buffer,
+                    u32::MAX,
+                    u32::MAX,
+                    true,
+                    None,
+                    &[],
+                    false,
+                    false,
+                );
+                n_pop += 1;
+            }
+
+            for &node in &buffer.visited {
+                for &read in &unitig_graph.unitigs[(node >> 1) as usize].reads {
+                    read_flag[(read >> 33) as usize] = 0;
+                }
+            }
+            for &read in &unitig_graph.unitigs[(v >> 1) as usize].reads {
+                read_flag[(read >> 33) as usize] = 0;
+            }
+            for &read in &unitig_graph.unitigs[(sink >> 1) as usize].reads {
+                read_flag[(read >> 33) as usize] = 0;
+            }
+        }
+    }
+
+    clean_sg_by_utg(read_graph, &unitig_graph);
+}
+
+/// `flat_soma_v`: [`flat_bubbles_advance`] with the diploid threshold derived
+/// from the homozygous coverage.
+pub fn flat_soma_v(
+    options: &AssemblyOptions,
+    read_graph: &mut Asg,
+    sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+) {
+    let dip_thre_max = if options.somatic_coverage >= 0 {
+        options.somatic_coverage as u64
+    } else {
+        let coverage = if options.global_homozygous_coverage_is_set != 0 {
+            f64::from(options.global_homozygous_coverage)
+        } else {
+            f64::from(options.global_homozygous_coverage) / HOM_PEAK_RATE
+        };
+        ((coverage as u64) as f64 * 1.15 / f64::from(options.polyploidy)) as u64
+    };
+    flat_bubbles_advance(read_graph, sources, read_to_unitig, dip_thre_max);
 }
 
 /// `asg_bub_backtrack_primary`: records a successful primary pop in the graph
