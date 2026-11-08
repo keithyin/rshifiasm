@@ -1728,9 +1728,8 @@ fn print_primary_contig_graph(
 /// Runs [`adjust_utg_by_primary`] on the live read graph — the reference
 /// passes `sg` itself here, so the read classes are relabelled and the
 /// unclaimed reads dropped before [`output_contig_graph_alternative`] runs —
-/// and writes the `p_ctg` triple. `break_ug_contig` for
-/// `b_low_cov`/`b_high_cov` is not ported; both switches are off in the
-/// default configuration.
+/// and writes the `p_ctg` triple. `break_ug_contig` runs below for
+/// `--b-cov`/`--h-cov`; both switches are off in the default configuration.
 #[allow(clippy::too_many_arguments)]
 pub fn output_contig_graph_primary(
     read_graph: &mut Asg,

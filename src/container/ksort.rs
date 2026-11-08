@@ -337,6 +337,161 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first[0].1, 2);
     }
+
+    /// Golden records from a C++ probe of `ks_introsort` over `(i32, u32,
+    /// u32)` tuples ordered by `(second << 32) | third`, the overlap list
+    /// layout. Recorded on 2026-11-07 when the recursion-depth off-by-one in
+    /// `introsort_klib_by` was fixed; the permutation among equal keys is the
+    /// point of the test.
+    const KLIB_PRESORT_INPUT: &str = "\
+0 0 9181
+1 0 9785
+2 0 8761
+3 0 10831
+4 0 10586
+5 0 10831
+6 0 10831
+7 0 7891
+8 0 8575
+9 0 10831
+10 0 10831
+11 0 9275
+12 0 8942
+13 0 9467
+14 0 8387
+15 0 10831
+16 0 10831
+17 0 10831
+18 0 10831
+19 0 10831
+20 0 10831
+21 0 9603
+22 0 10831
+23 0 10629
+24 0 10831
+26 20 10831
+27 1032 10831
+28 1215 10831
+29 1458 10831
+30 1584 10831
+31 1675 10831
+32 2054 10831
+33 3039 10831
+34 3045 10831
+35 3076 10831
+36 3655 10831
+37 4061 10831
+38 4127 10831
+39 4253 10831
+40 4349 10831
+41 4784 10831
+42 4942 10831
+43 5233 10831
+44 5335 10831
+45 5459 10831
+46 5837 10831
+47 6042 10831
+48 6515 10831
+49 7045 10831
+50 7098 10831
+51 7459 10831
+52 7515 10831
+53 7553 10831
+54 8453 10831
+55 8624 10831
+56 8784 10831
+57 8954 10831
+58 9139 10831
+59 9638 10831
+60 9681 10831
+61 9827 10831";
+
+    const KLIB_SORT_EXPECTED: &str = "\
+7 0 7891
+14 0 8387
+8 0 8575
+2 0 8761
+12 0 8942
+0 0 9181
+11 0 9275
+13 0 9467
+21 0 9603
+1 0 9785
+4 0 10586
+23 0 10629
+10 0 10831
+9 0 10831
+6 0 10831
+15 0 10831
+16 0 10831
+17 0 10831
+18 0 10831
+19 0 10831
+20 0 10831
+5 0 10831
+22 0 10831
+3 0 10831
+24 0 10831
+26 20 10831
+27 1032 10831
+28 1215 10831
+29 1458 10831
+30 1584 10831
+31 1675 10831
+32 2054 10831
+33 3039 10831
+34 3045 10831
+35 3076 10831
+36 3655 10831
+37 4061 10831
+38 4127 10831
+39 4253 10831
+40 4349 10831
+41 4784 10831
+42 4942 10831
+43 5233 10831
+44 5335 10831
+45 5459 10831
+46 5837 10831
+47 6042 10831
+48 6515 10831
+49 7045 10831
+50 7098 10831
+51 7459 10831
+52 7515 10831
+53 7553 10831
+54 8453 10831
+55 8624 10831
+56 8784 10831
+57 8954 10831
+58 9139 10831
+59 9638 10831
+60 9681 10831
+61 9827 10831";
+
+    #[test]
+    fn introsort_klib_matches_the_c_reference_permutation() {
+        let mut values: Vec<(i32, u32, u32)> = KLIB_PRESORT_INPUT
+            .lines()
+            .map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                (
+                    fields[0].parse().unwrap(),
+                    fields[1].parse().unwrap(),
+                    fields[2].parse().unwrap(),
+                )
+            })
+            .collect();
+        introsort_klib_by(&mut values, &|a: &(i32, u32, u32), b: &(i32, u32, u32)| {
+            ((a.1 as u64) << 32 | a.2 as u64) < ((b.1 as u64) << 32 | b.2 as u64)
+        });
+        let actual: String = values
+            .iter()
+            .map(|value| format!("{} {} {}", value.0, value.1, value.2))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(actual, KLIB_SORT_EXPECTED, "the klib transcription diverges");
+    }
 }
 
 /// A literal transcription of klib's `ks_introsort` (the `KSORT_INIT` macro in

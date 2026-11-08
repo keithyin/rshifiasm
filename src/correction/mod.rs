@@ -25,7 +25,6 @@ pub mod haplotype_evidence;
 pub mod interval;
 pub mod non_trim;
 pub mod ovlp_base;
-pub mod pipeline;
 pub mod poa;
 pub mod recalculate;
 pub mod read_writeback;

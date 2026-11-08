@@ -613,7 +613,7 @@ pub fn parse_arguments(arguments: &[String], options: &mut AssemblyOptions) -> b
         options.base_quality_cutoff = 1;
     }
 
-    check_options(options)
+    check_options(options) && check_supported(options)
 }
 
 /// `--pri-range`: `INT1[,INT2]`, where `-1` disables the range filter.
@@ -937,6 +937,56 @@ fn check_options(options: &AssemblyOptions) -> bool {
         }
     }
 
+    true
+}
+
+/// Rejects options that would enter pipeline branches this port has not
+/// implemented yet. The reference would run those branches, so staying silent
+/// would make such a run diverge without any warning. Parameter-only options
+/// of the missing modes (`--ul-rate`, `--path-max`, `--chem-c`, `--kpt-rate`,
+/// ...) are deliberately not rejected: without their mode switch the
+/// reference ignores them too. `--low-het`, `--unskew`, `--skip-triobin`,
+/// `--bin-only` and `--ul-m` are dead in the reference itself and stay
+/// equally dead here.
+fn check_supported(options: &AssemblyOptions) -> bool {
+    if options.ultra_long_read_files.is_some() {
+        eprintln!("[ERROR] the ultra-long integration (--ul) is not implemented yet");
+        return false;
+    }
+    if options.flags & super::options::FLAG_VERBOSE_GFA != 0 {
+        eprintln!(
+            "[ERROR] --dbg-gfa (the .pt_flt index checkpoint and verbose GFA dump) is not implemented yet"
+        );
+        return false;
+    }
+    if options.print_debug_gfa != 0 {
+        eprintln!("[ERROR] --prt-raw (the raw-GFA debug dump) is not implemented yet");
+        return false;
+    }
+    if options.required_read_name.is_some() {
+        eprintln!("[ERROR] -b (single-read correction debugging) is not implemented yet");
+        return false;
+    }
+    if options.debug_heterozygosity_count != 0 {
+        eprintln!(
+            "[ERROR] --dbg-het-cnt (the last-round heterozygosity count debug) is not implemented yet"
+        );
+        return false;
+    }
+    if options.extract_list_file_name.is_some() || options.extract_iteration != 0 {
+        eprintln!(
+            "[ERROR] --ex-list/--ex-iter (extracting reads from a loaded checkpoint) is not implemented yet"
+        );
+        return false;
+    }
+    if options.ont_mode != 0 {
+        eprintln!("[ERROR] the ONT correction branch is not implemented yet");
+        return false;
+    }
+    if options.flags & super::options::FLAG_FAST != 0 {
+        eprintln!("[ERROR] the fast-mode correction index is not implemented yet");
+        return false;
+    }
     true
 }
 
