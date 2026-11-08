@@ -264,6 +264,11 @@ fn correct_round(
     let started = logging::realtime_seconds();
     let mut total_bases = 0u64;
     let mut corrected_bases = 0u64;
+    // `if(round == asm_opt.number_of_round-1 && asm_opt.is_dbg_het_cnt)
+    // CALLOC(het_cnt, R_INF.total_reads);` — the live `cal_ec_r` worker never
+    // fills the array (only the dead `worker_ovec*` drivers do), so the log
+    // is all zeros, exactly like the reference.
+    let is_final_round = round + 1 == number_of_rounds;
     for read_identifier in 0..corrected_read_count {
         let (bases, corrected) = correct_read(
             options,
@@ -284,6 +289,9 @@ fn correct_round(
         total_bases,
         corrected_bases
     );
+    if options.debug_heterozygosity_count != 0 && is_final_round {
+        write_het_cnt_log(options, reads);
+    }
 
     // `sl_ec_r`: the consensus cigar replaces the stored sequence.
     for read_identifier in 0..corrected_read_count {
@@ -303,7 +311,6 @@ fn correct_round(
     // The reference flips both the reads and their overlap lists except on
     // the last round of an even number of rounds; `is_cr` alternates so that
     // two consecutive flips restore the original orientation.
-    let is_final_round = round + 1 == number_of_rounds;
     let is_reverse_round = round % 2 == 1;
     if !is_final_round || (is_final_round && is_reverse_round) {
         reverse_complement_round(state, reads);
@@ -500,6 +507,35 @@ fn correct_read(
     reads.trio_labels[read_identifier] = TRIO_LABEL_UNKNOWN;
 
     (query_length, corrected_bases)
+}
+
+/// `print_het_cnt_log`: writes `<output>.het_cnt.log` with one
+/// `>name<TAB>count` line per read. The counts are all zero because the live
+/// correction worker never records them.
+fn write_het_cnt_log(options: &AssemblyOptions, reads: &ReadStore) {
+    use std::io::Write;
+    let path = format!("{}.het_cnt.log", options.output_file_name);
+    let file = match std::fs::File::create(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("[ERROR] failed to write {}: {}", path, error);
+            return;
+        }
+    };
+    let mut output = std::io::BufWriter::new(file);
+    eprintln!(
+        "[M::print_het_cnt_log::] ==> print cnt of het sites to {}...",
+        path
+    );
+    for name in &reads.read_names {
+        if let Err(error) = writeln!(output, ">{}\t{}", name, 0) {
+            eprintln!("[ERROR] failed to write {}: {}", path, error);
+            return;
+        }
+    }
+    if let Err(error) = output.flush() {
+        eprintln!("[ERROR] failed to write {}: {}", path, error);
+    }
 }
 
 /// `cal_update_ec_multiple`: re-checks every stored overlap against the

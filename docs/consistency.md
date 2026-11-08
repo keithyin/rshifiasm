@@ -1918,3 +1918,17 @@ Rust 缓存，stdout 逐字节）：
 `*.bp.raw.r_utg.gfa`、`*.dip.raw.r_utg.gfa` 均与 C++ 逐字节一致
 （29,881,620 / 42,477,043 字节）；关闭该选项时行为不变（默认 9-profile 与
 trio 门 A 复验全绿，`cargo test` 326 项）。实现：`graph_build::write_raw_debug_gfa`。
+
+## `--dbg-het-cnt`（2026-11-08，`het_cnt.log` 兼容）
+
+`asm_opt.is_dbg_het_cnt` 在最后一轮纠错分配 `het_cnt`，`cal_ec_r` 结束后由
+`print_het_cnt_log` 写 `{o}.het_cnt.log`（`>{name}\t{count}` 每读一行）。
+**0.25.0-r726 的活路径里数组从不会被填充**——只有已死的 `worker_ovec` /
+`worker_ovec_cal0` 会写 `het_cnt`，`cal_ec_r` 的 `worker_hap_ec` 不写。因此
+C++ 的日志 5626 行全为 0；移植按同一行为写出全零，并在 `ec_driver` 注释中
+记录原因（不移植死 worker）。
+
+门禁：`-t1 -i --dbg-het-cnt` 的 C++ 与 Rust 运行
+（`/tmp/hetcheck/cxx|rs`）`.het_cnt.log` 逐字节一致（5626 行全 0），
+且同一次运行的全部 GFA/bed 产物也逐字节一致；`cargo test` 326 项；
+默认/trio 门禁无回归。

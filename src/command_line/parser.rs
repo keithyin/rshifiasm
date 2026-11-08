@@ -963,12 +963,6 @@ fn check_supported(options: &AssemblyOptions) -> bool {
         eprintln!("[ERROR] -b (single-read correction debugging) is not implemented yet");
         return false;
     }
-    if options.debug_heterozygosity_count != 0 {
-        eprintln!(
-            "[ERROR] --dbg-het-cnt (the last-round heterozygosity count debug) is not implemented yet"
-        );
-        return false;
-    }
     if options.ont_mode != 0 {
         eprintln!("[ERROR] the ONT correction branch is not implemented yet");
         return false;
