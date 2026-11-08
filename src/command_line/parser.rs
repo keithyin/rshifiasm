@@ -973,12 +973,6 @@ fn check_supported(options: &AssemblyOptions) -> bool {
         );
         return false;
     }
-    if options.extract_list_file_name.is_some() || options.extract_iteration != 0 {
-        eprintln!(
-            "[ERROR] --ex-list/--ex-iter (extracting reads from a loaded checkpoint) is not implemented yet"
-        );
-        return false;
-    }
     if options.ont_mode != 0 {
         eprintln!("[ERROR] the ONT correction branch is not implemented yet");
         return false;

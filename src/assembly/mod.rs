@@ -9,6 +9,7 @@ pub mod bubble;
 pub mod bubble_identify;
 pub mod chimeric;
 pub mod corrected_output;
+pub mod extract;
 pub mod gfa_clean;
 pub mod graph_build;
 pub mod hamming;
@@ -51,6 +52,15 @@ pub fn assemble(options: &mut AssemblyOptions) -> i32 {
                 logging::realtime_seconds(),
                 logging::cpu_usage()
             );
+            // `if (asm_opt.extract_list) { ha_extract_print_list(...); exit(0); }`
+            // (`Assembly.cpp` 2065), before any other output of the loaded run.
+            if options.extract_list_file_name.is_some() {
+                if let Err(error) = extract::print_requested_list(options, &store, &state) {
+                    eprintln!("[ERROR] failed to print the extracted overlaps: {}", error);
+                    return 1;
+                }
+                return 0;
+            }
             // `if (asm_opt.het_cov == -1024) hap_recalculate_peaks(...)`.
             if options.heterozygous_coverage == -1024 {
                 read_cache::hap_recalculate_peaks(options, &store);

@@ -1852,3 +1852,56 @@ all_ovlp 计数）；C++ 侧对拍脚本 /tmp/gdb_bub*.gdb（gdb 检查点转储
 
 调试钩子已全部移除（`RSHIFIASM_CHAIN_DEBUG`/`RSHIFIASM_BSG_DEBUG`、
 BW-*/IR_HET/BUB/reset2/reset3 打印、b1/b2/ug_before_backward 临时转储）。
+
+### 门 A 之后的 trio 剩余分支勘察（2026-11-08）
+
+- **`--kpt-rate`（335）在 0.25.0-r726 的活路径上是死选项**：`asm_opt.kpt_rate`
+  只在 `output_trio_graph`（Overlaps.cpp:21329-21363）里被读取，而该函数在
+  `clean_graph` 的 trio 分发处已被注释（Overlaps.cpp:39636 起走
+  `output_trio_graph_joint`）。Rust 现在不拒绝也不使用该参数，与 C++ 等价；
+  不需要再实现。
+- **`--trio-dual`（`output_bp_trio_graph`，Overlaps.cpp:17680）** 的缺口：
+  `hic_clean`（已移植）→ `adjust_utg_by_primary`（已移植，需
+  `collect_trans=1`）→ `trio_phasing_refine`（hic.cpp:17741）→
+  `output_trio_graph_joint`（已移植）。`trio_phasing_refine` 还缺：
+  `clean_u_trans_t_idx_filter_adv`（Overlaps.cpp:15503）、`asg_seq_set`、
+  `ug_occ_w`/`ug_occ_hap_w`、`init_ps_t`/`destory_ps_t`（小件），以及
+  `mc_solve`（rcut.cpp:3710，含 `mc_opt_init`/`init_mc_g_t`/`update_mc_edges`/
+  `mb_solve_core`/`mc_solve_core_adv`/`p_nodes` 的完整 maxcut 簇，约 2k 行）。
+  即 `--trio-dual` 与 Hi-C Phase 4 共用同一个 maxcut 依赖。
+- **`-5` 多倍体（`output_poly_trio`，Overlaps.cpp:14682）** 额外需要
+  `output_trio_unitig_graph` 的多倍体分支与 `mc_solve_general`（同一
+  maxcut 模块），且需要多倍体测试语料（`-5` 三亲本名单），后置。
+- **`--dual-scaf`（`self_scaffolding`）** 走
+  `gen_self_scaf`/`gen_contig_path`/`double_scaffold`/`output_hap_sc_graph`
+  与 `scaf_res_t` 簇（Overlaps.cpp:21585-23240，约 1.5k 行），独立于 maxcut，
+  后置。
+
+因此 trio 剩余分支的下一步是 maxcut（rcut.cpp）整体移植，它同时解锁
+`--trio-dual`、`-5` 与 Hi-C Phase 4；`--dual-scaf` 的 scaffolding 簇次之；
+`--kpt-rate` 已可视为完成。
+
+## `--ex-list` / `--ex-iter`（2026-11-08，`extract.cpp` 全量移植）
+
+语义（`ha_extract_print`，extract.cpp:82）：
+
+1. 名单来自逗号串或 `@file`（gzip 透明，取每行首个空白前的 token）。
+2. 命名的读段标为第 `-1` 层；随后 `--ex-iter` 轮逐层扩展：对两侧 overlap
+   表逐读逐命中，恰有一端 `< round` 时把另一端登记为 `round` 层。
+3. **轮次循环只扩展、不打印**；循环结束后一次性转储所有「至少一端已被发现」
+   的命中，字段为
+   `qname qlen qs qe ± tname tlen ts te ml bl !l`（`!l` 对 forward 表为 1、
+   reverse 表为 0）。
+4. 仅在重启缓存加载成功时触发（`Assembly.cpp:2065`），打印后 `exit(0)`；
+   `-i`（不读缓存）时与 C++ 一样被忽略。
+
+门禁（`reference/reference` 的 C++ 缓存 vs `reference/candidate_default` 的
+Rust 缓存，stdout 逐字节）：
+
+| 名单 | 逗号 1 名 | 逗号 3 名 | `@file` | `@file.gz` |
+|---|---|---|---|---|
+| `--ex-iter 0/1/2/3` | 114/5358/8748/12256 行，全部 identical | 364/5878/8748/12256 行，全部 identical | identical | identical |
+
+`cargo test` 326 全绿；默认 9-profile（102 个 gfa/bed 的 SHA-256）与 trio 门 A
+均无回归。实现：`src/assembly/extract.rs`（新），接线在
+`assembly::assemble` 的缓存加载分支、`hap_recalculate_peaks` 之前。
