@@ -1485,6 +1485,31 @@ fn get_ug_coverage(
     read_to_unitig: &ReadToUnitig,
     read_flags: &mut [u8],
 ) -> u32 {
+    let (read_bases, covered_bases) = get_ug_coverage_bases(
+        unitig,
+        read_graph,
+        coverage_cut,
+        sources,
+        read_to_unitig,
+        read_flags,
+    );
+    if read_bases == 0 {
+        0
+    } else {
+        (covered_bases / read_bases) as u32
+    }
+}
+
+/// The `rR`/`rC` out-parameters of `get_ug_coverage`
+/// (`Overlaps.cpp` 10753): total read bases and covered bases.
+pub(crate) fn get_ug_coverage_bases(
+    unitig: &MaUtg,
+    read_graph: &Asg,
+    coverage_cut: &[CoverageCut],
+    sources: &[PafList],
+    read_to_unitig: &ReadToUnitig,
+    read_flags: &mut [u8],
+) -> (u64, u64) {
     let mut read_bases: i64 = 0;
     let mut covered_bases: i64 = 0;
 
@@ -1535,11 +1560,7 @@ fn get_ug_coverage(
         read_flags[(element >> 33) as usize] = 0;
     }
 
-    if read_bases == 0 {
-        0
-    } else {
-        (covered_bases / read_bases) as u32
-    }
+    (read_bases as u64, covered_bases as u64)
 }
 
 /// `cal_circle_ov`: the overlap that closes a circular unitig.

@@ -2058,3 +2058,142 @@ maxcut 边数 62，C++ 64；gdb 抓到的 C++ `in` 列表里多出
 
 名单由读名哈希确定性生成（`x_<1+hash%hapN>\t<read_name>`），C++ 与 Rust 使用
 同一文件。trio 剩余分支只剩 `--dual-scaf`。
+
+## `--dual-scaf` 的 UL 基础（2026-11-08，进行中）
+
+`--dual-scaf` 是 trio 的最后一个分支（`output_trio_graph_joint` 内，
+Overlaps.cpp:23282 `gen_self_scaf`）。它与 `--ul` 共用 `inter.cpp` 的
+ultra-long 索引/链化引擎，规模远大于此前各分支。本轮先落地可独立验证的
+基础层，新增 `src/assembly/ul.rs`：
+
+| Rust | C++ |
+|---|---|
+| `UlOv` / `UcBlock` / `UlVec` / `ScafRes` | `ul_ov_t` / `uc_block_t` / `ul_vec_t` / `scaf_res_t` |
+| `UtgRid` / `UtgRidDt` / `gen_r_ug_idx` | `utg_rid_t` / `utg_rid_dt` / `gen_r_ug_idx`（21278） |
+| `get_r_ug_region` | 13268 |
+| `rov2uov_ctg` | 16223 |
+| `get_unique_rctg_aln` | 16269 |
+| `ctg_rg2ug_gen` | 16323 |
+| `linear_ctg_chain_dp_adv` | 16391 |
+| `gen_linear_chains_ctg` | 16497 |
+
+要点：
+
+- `gen_r_ug_idx` 的 CSR 填充复刻参考的「末槽 `off` 兼作游标」写法；前缀和
+  从 `k = 0` 开始（`idx[0]` 也必须置 0），`keep_offset` 时 `off = k`。
+- `rov2uov_ctg` / `get_unique_rctg_aln` 的 `rev` 取反、`adjust_rev_tse`
+  的坐标翻转、`over_bd` 的圆环裁剪均按原文；`IS_SCAF_READ` 在纯 HiFi 输入
+  下恒为假，故省略。
+- 线性链 DP 的 `f`/`p`（`i32`/`i64`）与 `t` 跳过计数、`max_ii` 距离窗口、
+  链压缩后 `qn = k + chain_offset`、`sv` 的 `adjust_rev_tse` 全部逐行对应；
+  排序使用稳定排序并按 `qe` → 组内 `qs` 二级键，等价于参考的两次 radix
+  sort（同为稳定排序，平序置换一致）。
+- `gen_linear_chains_ctg` 的 `tn >>= 1` 发生在 DP 之前，`is_available_ctg_aln`
+  的 16 bp 容差与 `sec >= n*0.333333` 门槛保持不变。
+
+单元测试覆盖：合成 unitig 上的 `r_ug` 索引偏移、连续读段合并、
+`sec` 累加与全长对齐保留（`cargo test --release --lib assembly::ul`）。
+
+### 已打通（2026-11-08 续）
+
+- `gl_chain_linear`、`find_mg_lchain_max`、`set_ul_ov_t_by_mg_lchain_t`、
+  `infer_rovlp`、`get_ecov_adv`（mode 0）、`select_max_ctg_chain`、
+  `gen_gchain_track`、`hc_shortest_k`、`dump_linear_chain`、`push_ctg_res`、
+  `gen_contig_path` 全部落地于 `ul.rs`；`gen_contig_path` 对 cp0/cp1
+  与参考在 gdb 断点（`double_scaffold` 入口）处逐块比对，6+2 条 contig 的
+  链头与数据块（hid/qs/qe/ts/te/aidx/rev）完全一致。
+- 关键修正：`select_max_ctg_chain` 的链头 `g_item` 必须在 `gen_gchain_track`
+  之前 `kv_pushp`（此前漏推，导致 `gchains[len-res_n-1]` 下溢 panic）；
+  `push_ctg_res` 的数据块写到 `bb[header.ts + z]`，不是 `bb[k + z]`。
+- `ul_vec_t.bb.n` 语义：参考只把**链头数**记入 `n`，数据块位于容量区
+  （`bb[ts..te]`）。Rust 新增 `UlVec::n` 保存链头数，`bb` 保留全部数据。
+- `gen_contig_path` 的 `diff_ec_ul` 是 `asm_opt.ul_error_rate`（默认 **0.2**，
+  不是图链的 `N_GCHAIN_RATE=0.04`）；`bw=G_CHAIN_BW=16`。
+
+### `double_scaffold` 前半（新增 `src/assembly/dual_scaf.rs`）
+
+| Rust | C++ |
+|---|---|
+| `gen_clean_ug` / `gen_shallow_clean_ug` | Overlaps.cpp 21623 / 21685 |
+| `gen_shallow_ref_trans` / `gen_deep_ref_trans` | 22850 / 22868 |
+| `merge_utgs` / `merge_scaf_res` / `get_scp_len` / `gen_scaf_res_via` | 22910 / 22970 / 22992 / 23020 |
+| `gen_double_scaffold_gfa` / `gen_scaf_path_lst` / `get_arcs` | 22689 / 22578 / gfa_ut.cpp 463 |
+| `gen_scaffold_bases` / `ma_scg_print` | 23162 / 11025 |
+| `gen_self_scaf` | 23209 |
+
+要点：
+
+- `gen_clean_ug` 先把**所有** seq/arc 置 `del=1`，再沿 cp0/cp1 的链把节点
+  复活、把链上相邻弧 `asg_arc_del(..., 0)` **复活**；`gen_shallow_clean_ug`
+  只对 `bubble.index < f_bub`（无需打断的小气泡）相关弧做删除。
+- `gen_deep_ref_trans` 的 `ccref = copy_untig_graph(cref)` 必须在
+  `adjust_utg_by_primary` **之前**取快照；`ma_ug_seq(ccref, sg, ..., NULL, 0)`
+  是 `is_polish=0`、`edge=NULL`（仅物化序列）。
+- 本语料（chr11-2M + 2752/2874 条 trio 读段）C++ 的
+  `work_ctg_path_trans_self` 打印 `# try:8, # done:0`；`# done` 是
+  `direct_ctg_trans_chain` 的恒定返回值（push 后即 `return 0`），
+  不代表空表——实际产出 10 条过渡，见下文“过渡链接”一节。
+- 门禁结果：`out.dip.hap1.p_ctg.gfa`（3,019,998 B）与
+  `out.dip.hap2.p_ctg.gfa`（2,310,344 B）与 C++ **逐字节一致**，其余
+  p_utg/r_utg 产物沿用既有门禁。
+
+### `--dual-scaf` 过渡链接（2026-11-08 续二，已完成）
+
+早期观察到的 `# try:8, # done:0` 曾被误读为“无过渡”：`direct_ctg_trans_chain`
+在 push 完过渡后无条件 `return 0`，其后的代码被注释掉了，所以 `# done:0`
+不代表空表。用 gdb 在 `inter.cpp:17362/17367/17372/17374` 打印 `ll->lo.n`
+后确认参考实际产出 **10 条过渡**（各查询条数 1,1,3,1,1,1,1,1），Rust
+`ctg_trans.rs` 的条数与逐条内容与之相同。
+
+本轮补齐的部件：
+
+| Rust | C++ |
+|---|---|
+| `order_contig_trans` / `rm_dup_aln` | inter.cpp 21955 / 17483 |
+| `scaf_tangle::is_noisy_ov` / `set_fsk` / `scaf_hit2arc` | Overlaps.cpp 21888 / 22648 / 21876 |
+| `scaf_tangle::get_ref_nid_flank` / `dedup_tang_flank` | 22040 / 22314 |
+| `scaf_tangle::cal_self_close_tang_flank{0,1}` / `trace_back_tangle_dis` | 22348 / 22441 / 22497 |
+| `scaf_tangle::is_small_tangle` | 22547 |
+| `gen_double_scaffold_gfa` 的每查询过渡循环 + 分支裁剪 + 路径枚举 | 22689 |
+
+要点（易错处）：
+
+- `get_ref_nid_flank` 里 `va/vd/wa/wd` 四个指针在 `dedup_tang_flank`
+  **之前**用原始 `vn0/wn0` 算好；dedup 只搬移 `va`/`vd` 内容并缩小
+  `vn`，`wa` 始终位于 `2*vn0`。因此切分必须是
+  `vd=flank[vn0..]`、`wa=flank[2*vn0..]`、`wd=flank[2*vn0+wn0..]`。
+- `dedup_tang_flank` 的循环条件 `k<vn && k<wn` 每轮重新求值，
+  不能用一次性的 `0..min(vn,wn)`。
+- `cal_self_close_tang_flank0` 的**反向半**（`v^=1` 之后）遇到
+  `fs[v^1]==ef` 只清标志、不 push；只有正向半会 push `v^1`。
+- `get_ref_nid_flank` 的第二次 `rev` 反转作用在 `res->n - rn` 指针上，
+  即最后 `rn` 个词（距离块），不是节点块；节点块在 push 距离前已反转一次。
+- `rm_dup_aln` 的 contained 过滤按 `(nw<<32)|k` 稳定排序，重复项中
+  `nw` 大者优先；`order_contig_trans` 的 mm=1 会**复活** del 状态不一致
+  的一对并标 `occ=-1`（不可靠），mm=2 再把不可靠区按 `qs` 合并成区间。
+- 本语料 10 条过渡在链接阶段没有一条通过 `el` 判据（输出中 0 个 N gap，
+  hap1/hap2 仍是 6/2 条 singleton scaffold），但代码路径已完整执行且与
+  参考逐字节一致；tangle 的数值正确性需更大语料才能被输出覆盖。
+
+### `--dual-scaf` 仍未移植
+
+1. `trans_base_infer`（inter.cpp 22574）：`init_ug_trans_t` +
+   `gen_trans_base_count_comp` + `worker_for_trans_ovlp_adv` +
+   `gen_trans_adaptive_aln` + `ug_map_lchain`/`minimizers_qgen_input`/
+   `lchain_qgen_mcopy_input`。当前只做 `ma_ug_seq` 快照，未产生 RC_3 过渡。
+   **注意**：`is_base_trans` 默认为 1（CommandLines.cpp:341），所以该步在
+   默认 `--dual-scaf` 下就会执行。实测（gdb 在 `ctg_trans_gp_chain` /
+   `filter_ctg_trans` / `push_ctg_trans_res` 入口 dump `ll->lo`）：
+   参考的深过渡表比 Rust 多一条 `qn=2→tn=6` 的 `RC_2` 过渡，且同批过渡的
+   `nw`（如 44144/161115/253461 vs Rust 132565/161513/254026）与端点
+   （如 `qs=1262502` vs `1262523`）不同。因这些过渡在链接阶段全部被
+   `pn<=1` 或可靠度判据滤掉，hap1/hap2 GFA 仍逐字节一致。
+
+UL contig 过渡链与 `gen_double_scaffold_gfa` 链接阶段均已完成
+（`ctg_trans.rs`、`scaf_tangle.rs`）；`--dual-scaf` 门禁的
+`out.dip.hap1.p_ctg.gfa`（3,019,998 B）与 `out.dip.hap2.p_ctg.gfa`
+（2,310,344 B）与 C++ **逐字节一致**。
+
+UL 基础与 `--dual-scaf` 已接入 `output_trio_graph_joint`
+（`options.self_scaffolding != 0`）；默认/trio-dual/-5 路径不受影响，
+`cargo test --release` 全绿。

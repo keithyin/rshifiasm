@@ -54,6 +54,39 @@ pub fn chain_link_score(
     query_length: i64,
     target_length: i64,
 ) -> i32 {
+    chain_link_score_impl(
+        earlier, later, band_width_rate, gap_penalty, skip_penalty, query_length, target_length,
+        true,
+    )
+}
+
+/// `comput_sc_ch`: the non-error-correction variant, which always keeps the
+/// smaller of the linear and adaptive gap penalties.
+pub fn chain_link_score_ch(
+    earlier: &KmerHit,
+    later: &KmerHit,
+    band_width_rate: f64,
+    gap_penalty: f64,
+    skip_penalty: f64,
+    query_length: i64,
+    target_length: i64,
+) -> i32 {
+    chain_link_score_impl(
+        earlier, later, band_width_rate, gap_penalty, skip_penalty, query_length, target_length,
+        false,
+    )
+}
+
+fn chain_link_score_impl(
+    earlier: &KmerHit,
+    later: &KmerHit,
+    band_width_rate: f64,
+    gap_penalty: f64,
+    skip_penalty: f64,
+    query_length: i64,
+    target_length: i64,
+    error_correction: bool,
+) -> i32 {
     let query_distance = later.self_offset as i64 - earlier.self_offset as i64;
     if query_distance <= 0 {
         return INVALID_SCORE;
@@ -90,8 +123,9 @@ pub fn chain_link_score(
             score as f64 * ((diagonal_gap as f64 / shared_as_double) / band_width_rate);
         // A short gap keeps the smaller of the two penalties, a long gap the
         // larger; this is inverted relative to the intuitive choice but is
-        // exactly what the reference does.
-        if diagonal_gap < 4 {
+        // exactly what the reference does. The non-ec variant always keeps
+        // the smaller one.
+        if !error_correction || diagonal_gap < 4 {
             // `lin_pen > a_pen ? a_pen : lin_pen` is the smaller value.
             linear_penalty = linear_penalty.min(adaptive_penalty);
         } else {

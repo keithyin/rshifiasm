@@ -31,6 +31,11 @@ pub mod trio_bin;
 pub mod break_contig;
 pub mod read_cache;
 pub mod unitig;
+pub mod ul;
+pub mod dual_scaf;
+pub mod ctg_trans;
+pub mod scaf_tangle;
+pub mod trans_base;
 
 use crate::command_line::options::{AssemblyOptions, FLAG_NO_KMER_FILTER};
 use crate::correction::ec_driver::run_error_correction;

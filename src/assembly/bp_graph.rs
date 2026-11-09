@@ -33,7 +33,7 @@ use crate::assembly::trio_clean::{
 use crate::assembly::trans_clean::{clean_u_trans_t_idx, set_trio_flag_by_cov};
 use crate::assembly::unitig::{
     adjust_utg_advance, copy_read_graph, copy_untig_graph, delete_useless_nodes,
-    discard_small_ctg, hic_clean, ma_ug_gen_phase, ma_ug_gen_primary, ma_ug_print,
+    discard_small_ctg, hic_clean, ma_ug_gen, ma_ug_gen_phase, ma_ug_gen_primary, ma_ug_print,
     ma_ug_print_bed, ma_ug_print_simple, ma_ug_seq, recover_utg_by_coverage, renew_utg,
     UnitigGraph, FATHER, MOTHER, PHASE_SEF, PHASE_SEP, PHASE_SEP_RATE,
 };
@@ -1676,10 +1676,32 @@ pub fn output_trio_graph_joint(
     );
 
     if options.self_scaffolding != 0 {
-        return Err(
-            "output_trio_graph_joint: the --dual-scaf scaffolding path is not ported yet"
-                .to_string(),
-        );
+        // `gen_self_scaf(opt, hu0, hu1, sg, ...)`; the reference merges the
+        // two haplotypes' extra read edges before scaffolding.
+        let merged_arcs: Vec<AsgArc> = arcs0.iter().chain(arcs1.iter()).copied().collect();
+        crate::assembly::dual_scaf::gen_self_scaf(
+            read_graph,
+            coverage_cut,
+            output_file_name,
+            &mut hu0,
+            &mut hu1,
+            sources,
+            reverse_sources,
+            tips_len,
+            tip_drop_ratio,
+            stops_threshold,
+            read_to_unitig,
+            chimeric_rate,
+            drop_ratio,
+            max_hang,
+            min_ovlp,
+            bubble_labels,
+            options,
+            trio_flags,
+            reads,
+            &merged_arcs,
+        )?;
+        return Ok(());
     }
 
     output_hap_graph(

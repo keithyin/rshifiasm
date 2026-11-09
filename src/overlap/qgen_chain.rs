@@ -10,7 +10,9 @@
 //! `overlap_region::non_homopolymer_errors`.
 
 use crate::container::ksort::{introsort_klib_by, radix_sort_by_key};
-use crate::overlap::chain_score::{chain_band_width, chain_link_score, INVALID_SCORE};
+use crate::overlap::chain_score::{
+    chain_band_width, chain_link_score, chain_link_score_ch, INVALID_SCORE,
+};
 use crate::overlap::engine::overlap_type;
 use crate::overlap::region::{chain_length, KmerHit, OverlapRegion};
 
@@ -248,7 +250,7 @@ fn quick_chain_check(
 /// The query interval is extended so that both reads start and end at the same
 /// relative position; the qgen variant keeps the query coordinates
 /// unmirrored (the chain anchors are already expressed on the query strand).
-fn push_chain_overlap(
+pub(crate) fn push_chain_overlap(
     overlaps: &mut Vec<OverlapRegion>,
     query_identifier: u32,
     query_length: i64,
@@ -755,6 +757,224 @@ fn chain_candidate_read(
     }
     if keep_anchor_count {
         region.alignment_length = chain_length_count as u32;
+    }
+    chain_length_count
+}
+
+/// `lchain_qdp_mcopy` (the non-fast variant): the dynamic programme of the
+/// unitig-graph transition mapping (`ug_map_lchain`).
+///
+/// Differences from [`chain_candidate_read`]: no quick check, the full anchor
+/// range is always processed, links are scored with `comput_sc_ch` (the
+/// non-error-correction penalty), and the `a[i] <-> a[max_ii]` retry does not
+/// require matching strands. Every caller on this path passes
+/// `enable_mcopy = 0`, so only the single best chain is emitted; `khit_n = 0`
+/// leaves `align_length` at zero.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chain_candidate_read_ch(
+    candidates: &mut Vec<KmerHit>,
+    anchor_index: usize,
+    anchor_count: usize,
+    destination_index: usize,
+    overlaps: &mut Vec<OverlapRegion>,
+    maximum_skip: i64,
+    maximum_iterations: i64,
+    maximum_distance: i64,
+    gap_penalty: f64,
+    skip_penalty: f64,
+    band_width_rate: f64,
+    query_identifier: u32,
+    query_length: i64,
+    target_length: i64,
+    append_both_ends: bool,
+    generate_cigar: bool,
+) -> usize {
+    if anchor_count == 0 {
+        return 0;
+    }
+
+    let anchors: Vec<KmerHit> =
+        candidates[anchor_index..anchor_index + anchor_count].to_vec();
+    let mut predecessor = vec![-1i64; anchor_count];
+    let mut scratch = vec![0i64; anchor_count];
+    let mut score = vec![0i32; anchor_count];
+
+    let mut maximum_chain_score: i64 = i64::from(i32::MIN);
+    let mut maximum_chain_index: i64 = i64::from(i32::MIN);
+    let mut minimum_overlap_length: i64 = i64::from(i32::MAX);
+    let mut start: i64 = 0;
+    let mut maximum_anchor_score_index: i64 = -1;
+
+    for index in 0..anchor_count {
+        let mut maximum_score = i64::from(anchors[index].count & 0xff);
+        let mut skip_count: i64 = 0;
+        let mut maximum_predecessor: i64 = -1;
+
+        if index as i64 - start > maximum_iterations {
+            start = index as i64 - maximum_iterations;
+        }
+        while anchors[index].reverse_strand != anchors[start as usize].reverse_strand {
+            start += 1;
+        }
+
+        let mut predecessor_index = index as i64 - 1;
+        while predecessor_index >= start {
+            let link = chain_link_score_ch(
+                &anchors[predecessor_index as usize],
+                &anchors[index],
+                band_width_rate,
+                gap_penalty,
+                skip_penalty,
+                query_length,
+                target_length,
+            );
+            if link == INVALID_SCORE {
+                predecessor_index -= 1;
+                continue;
+            }
+            let link_score = i64::from(link) + i64::from(score[predecessor_index as usize]);
+            if link_score > maximum_score {
+                maximum_score = link_score;
+                maximum_predecessor = predecessor_index;
+                if skip_count > 0 {
+                    skip_count -= 1;
+                }
+            } else if scratch[predecessor_index as usize] == index as i64 {
+                skip_count += 1;
+                if skip_count > maximum_skip {
+                    break;
+                }
+            }
+            if predecessor[predecessor_index as usize] >= 0 {
+                let target = predecessor[predecessor_index as usize] as usize;
+                scratch[target] = index as i64;
+            }
+            predecessor_index -= 1;
+        }
+        let end_predecessor = predecessor_index;
+
+        if maximum_anchor_score_index < 0
+            || i64::from(anchors[index].self_offset)
+                > i64::from(anchors[maximum_anchor_score_index as usize].self_offset)
+                    + maximum_distance
+            || anchors[index].reverse_strand
+                != anchors[maximum_anchor_score_index as usize].reverse_strand
+        {
+            let mut best = i64::from(i32::MIN);
+            maximum_anchor_score_index = -1;
+            let mut candidate = index as i64 - 1;
+            while candidate >= start
+                && i64::from(anchors[index].self_offset)
+                    <= maximum_distance + i64::from(anchors[candidate as usize].self_offset)
+                && anchors[index].reverse_strand == anchors[candidate as usize].reverse_strand
+            {
+                if best < i64::from(score[candidate as usize]) {
+                    best = i64::from(score[candidate as usize]);
+                    maximum_anchor_score_index = candidate;
+                }
+                candidate -= 1;
+            }
+        }
+
+        // The non-fast variant retries the best nearby anchor even across a
+        // strand change; `comput_sc_ch` itself only looks at the offsets.
+        if maximum_anchor_score_index >= 0 && maximum_anchor_score_index < end_predecessor {
+            let link = chain_link_score_ch(
+                &anchors[maximum_anchor_score_index as usize],
+                &anchors[index],
+                band_width_rate,
+                gap_penalty,
+                skip_penalty,
+                query_length,
+                target_length,
+            );
+            if link != INVALID_SCORE {
+                let candidate_score = i64::from(link)
+                    + i64::from(score[maximum_anchor_score_index as usize]);
+                if maximum_score < candidate_score {
+                    maximum_score = candidate_score;
+                    maximum_predecessor = maximum_anchor_score_index;
+                }
+            }
+        }
+
+        score[index] = maximum_score as i32;
+        predecessor[index] = maximum_predecessor;
+
+        if maximum_anchor_score_index < 0
+            || (i64::from(anchors[index].self_offset)
+                <= maximum_distance
+                    + i64::from(anchors[maximum_anchor_score_index as usize].self_offset)
+                && anchors[index].reverse_strand
+                    == anchors[maximum_anchor_score_index as usize].reverse_strand
+                && score[maximum_anchor_score_index as usize] < score[index])
+        {
+            maximum_anchor_score_index = index as i64;
+        }
+
+        if i64::from(score[index]) >= maximum_chain_score {
+            let overlap_length = chain_length(
+                i64::from(anchors[index].self_offset),
+                i64::from(anchors[index].self_offset),
+                query_length,
+                i64::from(anchors[index].offset),
+                i64::from(anchors[index].offset),
+                target_length,
+            );
+            if i64::from(score[index]) > maximum_chain_score
+                || overlap_length < minimum_overlap_length
+            {
+                maximum_chain_score = i64::from(score[index]);
+                maximum_chain_index = index as i64;
+                minimum_overlap_length = overlap_length;
+            }
+        }
+    }
+
+    // Trace the best chain backwards into `scratch`.
+    let mut chain_length_count = 0usize;
+    let mut trace = maximum_chain_index;
+    while trace >= 0 {
+        scratch[chain_length_count] = trace;
+        chain_length_count += 1;
+        trace = predecessor[trace as usize];
+    }
+
+    let overlap_index = overlaps.len();
+    let chain_start_anchor = anchors[scratch[chain_length_count - 1] as usize];
+    let chain_end_anchor = anchors[scratch[0] as usize];
+    push_chain_overlap(
+        overlaps,
+        query_identifier,
+        query_length,
+        target_length,
+        maximum_chain_score,
+        &chain_start_anchor,
+        &chain_end_anchor,
+    );
+    if candidates.len() < destination_index + chain_length_count {
+        candidates.resize(destination_index + chain_length_count, KmerHit::default());
+    }
+    for offset in 0..chain_length_count {
+        let source = scratch[chain_length_count - offset - 1] as usize;
+        let mut hit = anchors[source];
+        hit.read_identifier = overlap_index as u32;
+        candidates[destination_index + offset] = hit;
+    }
+    let region = &mut overlaps[overlap_index];
+    region.non_homopolymer_errors = destination_index as u32;
+    if generate_cigar {
+        let x_start = region.x_position_start;
+        let y_start = region.y_position_start;
+        let x_end = region.x_position_end;
+        generate_fake_cigar(
+            &mut region.fake_cigar,
+            x_start,
+            y_start,
+            x_end,
+            append_both_ends,
+            &candidates[destination_index..destination_index + chain_length_count],
+        );
     }
     chain_length_count
 }
