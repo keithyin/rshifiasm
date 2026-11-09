@@ -30,6 +30,8 @@ pub const RC_3: u8 = 3;
 /// `CHAIN_MATCH`: the per-base weight used when the score is the `-1024`
 /// sentinel.
 pub const CHAIN_MATCH: f64 = 1.0;
+/// `CHAIN_UNMATCH`: the per-base penalty of an unaligned base.
+pub const CHAIN_UNMATCH: f64 = 0.334;
 
 /// `N_HET`: the read carries no heterozygosity evidence.
 pub const N_HET: u8 = 0;

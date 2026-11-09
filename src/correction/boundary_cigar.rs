@@ -13,6 +13,7 @@ use crate::correction::cigar_generator::generate_window_cigar;
 use crate::correction::recalculate::double_error_threshold;
 use crate::correction::region::{adjust_threshold, determine_overlap_region, fill_subregion};
 use crate::overlap::region::OverlapRegion;
+use crate::correction::target::TargetSource;
 use crate::reads::read_store::ReadStore;
 
 /// `scanLen`: query bases inspected on each side of a boundary when deciding
@@ -123,7 +124,7 @@ pub fn calculate_boundary_cigars(
         }
 
         let target_sequence = fill_subregion(
-            reads,
+            &TargetSource::Reads(reads),
             y_identifier,
             mapped.start,
             mapped.length,

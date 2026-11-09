@@ -30,7 +30,7 @@ use crate::correction::window::{
     WindowCigar, WindowList, number_of_windows, window_id_by_end, window_id_by_start,
 };
 use crate::overlap::region::OverlapRegion;
-use crate::reads::read_store::ReadStore;
+use crate::correction::target::TargetSource;
 
 /// `bit_extz_t` as far as the post-chain alignment uses it: the result of the
 /// last alignment plus the packed traceback it produced.
@@ -123,7 +123,7 @@ pub struct HcAlignParameters {
 pub fn align_hc_ed_post_extz(
     region: &mut OverlapRegion,
     extz: &mut BitExtz,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     parameters: &HcAlignParameters,
 ) -> bool {
@@ -133,7 +133,7 @@ pub fn align_hc_ed_post_extz(
     let y_start = region.y_position_start as i64;
     let target_identifier = region.y_identifier as usize;
     let target_strand = region.y_strand as u8;
-    let target_total_length = reads.read_length(target_identifier) as i64;
+    let target_total_length = targets.length(target_identifier as usize);
 
     region.window_cigar.windows.clear();
     region.is_match = 0;
@@ -167,7 +167,7 @@ pub fn align_hc_ed_post_extz(
             target_total_length,
             alignment_length,
         ) {
-            let target_sequence = reads.read_sub_region(
+            let target_sequence = targets.sub_region(
                 target_identifier,
                 target.start,
                 target.length,
@@ -186,7 +186,7 @@ pub fn align_hc_ed_post_extz(
                 && !push_hc_wlst_exz(
                     region,
                     extz,
-                    reads,
+                    targets,
                     query,
                     THRESHOLD_MAXIMUM,
                     query_start,
@@ -228,7 +228,7 @@ pub fn align_hc_ed_post_extz(
 fn push_hc_wlst_exz(
     region: &mut OverlapRegion,
     extz: &mut BitExtz,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     maximum_errors: i64,
     query_start: i64,
@@ -276,7 +276,7 @@ fn push_hc_wlst_exz(
             if aln_wlst_adv_exz(
                 region,
                 extz,
-                reads,
+                targets,
                 query,
                 maximum_errors,
                 target_strand,
@@ -314,7 +314,7 @@ fn push_hc_wlst_exz(
         gen_backtrace_adv_exz(
             &mut window,
             region,
-            reads,
+            targets,
             query,
             extz,
             target_strand,
@@ -334,7 +334,7 @@ fn push_hc_wlst_exz(
                 && aln_wlst_adv_exz(
                     region,
                     extz,
-                    reads,
+                    targets,
                     query,
                     maximum_errors,
                     target_strand,
@@ -379,12 +379,302 @@ fn push_hc_wlst_exz(
     true
 }
 
+/// `push_wlst_exz` (`Correct.cpp` 12711): the ultra-long twin of
+/// [`push_hc_wlst_exz`], identical except for the final acceptance check —
+/// the pair of `simi_pass` calls instead of `pass_qovlp`.
+///
+/// `secondary_check` is `sec_check`: `1` on every `align_ul_ed_post_extz`
+/// call path (`uref` set, no HPC table).
+#[allow(clippy::too_many_arguments)]
+fn push_wlst_exz(
+    region: &mut OverlapRegion,
+    extz: &mut BitExtz,
+    targets: &TargetSource,
+    query: &[u8],
+    maximum_errors: i64,
+    query_start: i64,
+    query_end: i64,
+    target_start: i64,
+    target_end: i64,
+    target_total_length: i64,
+    extra_begin: i64,
+    extra_end: i64,
+    parameters: &HcAlignParameters,
+    secondary_check: bool,
+) -> bool {
+    let x_start = region.x_position_start as i64;
+    let x_end = region.x_position_end as i64;
+    let target_identifier = region.y_identifier;
+    let target_strand = region.y_strand as u8;
+
+    let mut window = WindowList {
+        x_start: query_start as i32,
+        x_end: query_end as i32,
+        y_start: target_start as i32,
+        y_end: target_end as i32,
+        extra_begin: extra_begin as i16,
+        extra_end: extra_end as i16,
+        error: extz.result.error as i16,
+        error_threshold: extz.result.threshold as i16,
+        cigar_start: 0,
+        cigar_length: 0,
+    };
+
+    // Fill the gap between the previous accepted window and this one by
+    // extending forwards from the previous window's end.
+    let mut covered_start = x_start;
+    if let Some(last) = region.window_cigar.windows.last().copied() {
+        let mut window_end = last.x_end as i64;
+        let mut target_position = last.y_end as i64 + 1;
+        while window_end < query_start - 1 && target_position < target_total_length {
+            let window_start = window_end + 1;
+            let (_, end) = window_id_by_start(
+                region.x_position_start as i32,
+                region.x_position_end as i32,
+                window_start,
+                parameters.window_length,
+            );
+            window_end = end;
+            if aln_wlst_adv_exz(
+                region,
+                extz,
+                targets,
+                query,
+                maximum_errors,
+                target_strand,
+                target_identifier,
+                window_start,
+                window_end,
+                target_position,
+                parameters,
+                false,
+            ) {
+                target_position = region
+                    .window_cigar
+                    .windows
+                    .last()
+                    .expect("a window was just appended")
+                    .y_end as i64
+                    + 1;
+            } else {
+                break;
+            }
+        }
+        covered_start = region
+            .window_cigar
+            .windows
+            .last()
+            .expect("the previous window is still there")
+            .x_end as i64
+            + 1;
+    }
+
+    // Fill the gap before this window by walking backwards from it.
+    let windows_before = region.window_cigar.windows.len();
+    let mut window_start = query_start;
+    if window_start > covered_start {
+        gen_backtrace_adv_exz(
+            &mut window,
+            region,
+            targets,
+            query,
+            extz,
+            target_strand,
+            target_identifier,
+        );
+        let mut target_position = window.y_start as i64 - 1;
+        while window_start > covered_start {
+            let window_end = window_start - 1;
+            let (_, start) = window_id_by_end(
+                region.x_position_start as i32,
+                window_end,
+                parameters.window_length,
+            );
+            window_start = start;
+            let y_start = target_position + 1 - (window_end + 1 - window_start);
+            if y_start >= 0
+                && aln_wlst_adv_exz(
+                    region,
+                    extz,
+                    targets,
+                    query,
+                    maximum_errors,
+                    target_strand,
+                    target_identifier,
+                    window_start,
+                    window_end,
+                    y_start,
+                    parameters,
+                    true,
+                )
+            {
+                target_position = region
+                    .window_cigar
+                    .windows
+                    .last()
+                    .expect("a window was just appended")
+                    .y_start as i64
+                    - 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    region.alignment_length += (query_end + 1 - query_start) as u32;
+    let overlap_length = x_end + 1 - x_start;
+    let unaligned = (query_end + 1 - x_start) - region.alignment_length as i64;
+    let aligned = overlap_length - unaligned;
+    if !parameters.force_alignment
+        && !similarity_pass(
+            overlap_length,
+            aligned,
+            false,
+            parameters.overlap_cutoff,
+            Some(parameters.error_rate),
+        )
+        && !similarity_pass(
+            overlap_length,
+            aligned,
+            secondary_check,
+            parameters.overlap_cutoff,
+            None,
+        )
+    {
+        region.window_cigar.windows.push(window);
+        return false;
+    }
+
+    // The blocks filled backwards were appended in reverse chronological
+    // order; the reference restores their order before appending this window.
+    if region.window_cigar.windows.len() > windows_before {
+        region.window_cigar.windows[windows_before..].reverse();
+    }
+    region.window_cigar.windows.push(window);
+    true
+}
+
+/// `align_ul_ed_post_extz` (`Correct.cpp` 12900): the ultra-long twin of
+/// [`align_hc_ed_post_extz`]. The target bases come from a unitig through
+/// [`TargetSource`], and the final acceptance check is the `simi_pass` pair
+/// with the secondary check enabled (`sec_check = (uref && !hpc_g) ? 1 : 0`).
+///
+/// Returns `false` when the overlap fails; the caller drops it.
+pub fn align_ul_ed_post_extz(
+    region: &mut OverlapRegion,
+    extz: &mut BitExtz,
+    targets: &TargetSource,
+    query: &[u8],
+    parameters: &HcAlignParameters,
+) -> bool {
+    let window_length = parameters.window_length;
+    let x_start = region.x_position_start as i64;
+    let x_end = region.x_position_end as i64;
+    let y_start = region.y_position_start as i64;
+    let target_identifier = region.y_identifier as usize;
+    let target_strand = region.y_strand as u8;
+    let target_total_length = targets.length(target_identifier);
+
+    region.window_cigar.windows.clear();
+    region.is_match = 0;
+    region.alignment_length = 0;
+
+    let window_count = number_of_windows(x_start, x_end + 1, window_length);
+    let origin = (x_start / window_length) * window_length;
+    let (mut query_start, mut query_end) =
+        window_se_by_normalized_start(region, origin, window_length);
+
+    for _ in 0..window_count {
+        let query_length = 1 + query_end - query_start;
+        let mut threshold =
+            adjust_threshold((query_length as f64 * parameters.error_rate) as i64, query_length);
+        if threshold > THRESHOLD_MAXIMUM {
+            threshold = THRESHOLD_MAXIMUM;
+        }
+
+        // The mapped target position, shifted by the gap the chain already
+        // knows about.
+        let mut target_start = (query_start - x_start) + y_start;
+        target_start += region
+            .fake_cigar
+            .y_start_offset(query_start)
+            .expect("the fake cigar must cover every query window start");
+
+        let alignment_length = query_length + (threshold << 1);
+        if let Some(target) = determine_overlap_region(
+            threshold,
+            target_start,
+            target_total_length,
+            alignment_length,
+        ) {
+            let target_sequence =
+                targets.sub_region(target_identifier, target.start, target.length, target_strand);
+            let query_sequence =
+                &query[query_start as usize..(query_start + query_length) as usize];
+
+            extz.semi_global_absent_diagonal(
+                &target_sequence,
+                query_sequence,
+                threshold,
+                target.extra_begin as i64,
+            );
+
+            if extz.is_aligned()
+                && !push_wlst_exz(
+                    region,
+                    extz,
+                    targets,
+                    query,
+                    THRESHOLD_MAXIMUM,
+                    query_start,
+                    query_end,
+                    target.start,
+                    target.start + extz.result.pattern_end as i64,
+                    target_total_length,
+                    target.extra_begin as i64,
+                    target.extra_end as i64,
+                    parameters,
+                    true,
+                )
+            {
+                return false;
+            }
+        }
+
+        query_start = query_end + 1;
+        query_end = query_start + window_length - 1;
+        if query_end >= x_end {
+            query_end = x_end;
+        }
+    }
+
+    if !parameters.force_alignment
+        && !similarity_pass(
+            x_end + 1 - x_start,
+            region.alignment_length as i64,
+            false,
+            parameters.overlap_cutoff,
+            Some(parameters.error_rate),
+        )
+        && !similarity_pass(
+            x_end + 1 - x_start,
+            region.alignment_length as i64,
+            true,
+            parameters.overlap_cutoff,
+            None,
+        )
+    {
+        return false;
+    }
+    true
+}
+
 /// `aln_wlst_adv_exz`: aligns one skipped block, optionally with its CIGAR.
 #[allow(clippy::too_many_arguments)]
 fn aln_wlst_adv_exz(
     region: &mut OverlapRegion,
     extz: &mut BitExtz,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     maximum_errors: i64,
     reverse_strand: u8,
@@ -406,7 +696,7 @@ fn aln_wlst_adv_exz(
         query_length,
     );
     let alignment_length = query_length + (threshold << 1);
-    let target_total_length = reads.read_length(target_identifier as usize) as i64;
+    let target_total_length = targets.length(target_identifier as usize);
 
     let Some(target) =
         determine_overlap_region(threshold, target_start, target_total_length, alignment_length)
@@ -418,7 +708,7 @@ fn aln_wlst_adv_exz(
     }
 
     let target_sequence =
-        reads.read_sub_region(target_identifier as usize, target.start, target.length, reverse_strand);
+        targets.sub_region(target_identifier as usize, target.start, target.length, reverse_strand);
     let query_sequence = &query[query_start as usize..(query_start + query_length) as usize];
 
     if is_cigar {
@@ -466,7 +756,7 @@ fn aln_wlst_adv_exz(
         if at_boundary {
             if let Some((new_start, new_begin, new_end)) = recal_boundary_exz(
                 query_sequence,
-                reads,
+                targets,
                 query_length,
                 target.length,
                 threshold,
@@ -507,7 +797,7 @@ fn aln_wlst_adv_exz(
 fn gen_backtrace_adv_exz(
     window: &mut WindowList,
     region: &mut OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     extz: &mut BitExtz,
     reverse_strand: u8,
@@ -530,7 +820,7 @@ fn gen_backtrace_adv_exz(
     let target_length = if extra_end >= 0 {
         alignment_length - extra_begin - extra_end
     } else {
-        let target_total_length = reads.read_length(target_identifier as usize) as i64;
+        let target_total_length = targets.length(target_identifier as usize);
         let mut length = target_start + alignment_length - extra_begin;
         if length > target_total_length {
             length = target_total_length;
@@ -539,7 +829,7 @@ fn gen_backtrace_adv_exz(
     };
 
     let target_sequence =
-        reads.read_sub_region(target_identifier as usize, target_start, target_length, reverse_strand);
+        targets.sub_region(target_identifier as usize, target_start, target_length, reverse_strand);
     let query_sequence = &query[query_start as usize..(query_start + query_length) as usize];
 
     // `gen_backtrace_adv_exz` seeds the result and does not call `clear_align`.
@@ -575,7 +865,7 @@ fn gen_backtrace_adv_exz(
     if at_boundary {
         if let Some((new_start, new_begin, new_end)) = recal_boundary_exz(
             query_sequence,
-            reads,
+            targets,
             query_length,
             target_length,
             threshold,
@@ -610,7 +900,7 @@ fn gen_backtrace_adv_exz(
 #[allow(clippy::too_many_arguments)]
 fn recal_boundary_exz(
     query_sequence: &[u8],
-    reads: &ReadStore,
+    targets: &TargetSource,
     query_length: i64,
     pattern_length: i64,
     threshold: i64,
@@ -631,14 +921,14 @@ fn recal_boundary_exz(
     };
 
     let alignment_length = query_length + (threshold << 1);
-    let target_total_length = reads.read_length(target_identifier as usize) as i64;
+    let target_total_length = targets.length(target_identifier as usize);
     let target =
         determine_overlap_region(threshold, position, target_total_length, alignment_length)?;
     if target.start == target_offset && pattern_length == target.length {
         return None;
     }
 
-    let target_sequence = reads.read_sub_region(
+    let target_sequence = targets.sub_region(
         target_identifier as usize,
         target.start,
         target.length,
@@ -744,7 +1034,7 @@ struct CutAlignment {
 /// reports how much of it was consumed.
 #[allow(clippy::too_many_arguments)]
 fn ed_cut(
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     target_identifier: usize,
     reverse_strand: u8,
@@ -770,7 +1060,7 @@ fn ed_cut(
         alignment_length,
     )?;
     let target_sequence = fill_subregion(
-        reads,
+        targets,
         target_identifier,
         target.start,
         target.length,
@@ -821,7 +1111,7 @@ fn ed_cut(
 pub(crate) fn backtrace_window_in_place(
     region: &mut OverlapRegion,
     index: i64,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     extz: &mut BitExtz,
     reverse_strand: u8,
@@ -831,7 +1121,7 @@ pub(crate) fn backtrace_window_in_place(
     gen_backtrace_adv_exz(
         &mut window,
         region,
-        reads,
+        targets,
         query,
         extz,
         reverse_strand,
@@ -848,7 +1138,7 @@ pub(crate) fn backtrace_window_in_place(
 #[allow(clippy::too_many_arguments)]
 pub fn gen_extend_err_0_exz(
     region: &mut OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     extz: &mut BitExtz,
     block_length: i64,
@@ -861,7 +1151,7 @@ pub fn gen_extend_err_0_exz(
     let query_length = query_end + 1 - query_start;
     let target_identifier = region.y_identifier as usize;
     let reverse_strand = region.y_strand as u8;
-    let target_total_length = reads.read_length(target_identifier) as i64;
+    let target_total_length = targets.length(target_identifier as usize);
     let mut estimated_target =
         (query_start - region.x_position_start as i64) + region.y_position_start as i64;
     estimated_target += region
@@ -880,7 +1170,7 @@ pub fn gen_extend_err_0_exz(
                 backtrace_window_in_place(
                     region,
                     previous_window,
-                    reads,
+                    targets,
                     query,
                     extz,
                     reverse_strand,
@@ -895,7 +1185,7 @@ pub fn gen_extend_err_0_exz(
         let window = region.window_cigar.windows[next_window as usize];
         if query_end + 1 == window.x_start as i64 {
             if window.cigar_length == 0 {
-                backtrace_window_in_place(region, next_window, reads, query, extz, reverse_strand);
+                backtrace_window_in_place(region, next_window, targets, query, extz, reverse_strand);
             }
             boundary[1] = region.window_cigar.windows[next_window as usize].y_start as i64
                 - query_length;
@@ -913,7 +1203,7 @@ pub fn gen_extend_err_0_exz(
 
     if boundary[0] != -1 {
         if let Some(cut) = ed_cut(
-            reads,
+            targets,
             query,
             target_identifier,
             reverse_strand,
@@ -936,7 +1226,7 @@ pub fn gen_extend_err_0_exz(
 
     if boundary[1] != -1 {
         if let Some(cut) = ed_cut(
-            reads,
+            targets,
             query,
             target_identifier,
             reverse_strand,
@@ -990,7 +1280,7 @@ pub struct ExtensionError {
 #[allow(clippy::too_many_arguments)]
 pub fn gen_extend_err_exz(
     region: &mut OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     extz: &mut BitExtz,
     block_length: i64,
@@ -1040,7 +1330,7 @@ pub fn gen_extend_err_exz(
             total_length += length;
             total_error += gen_extend_err_0_exz(
                 region,
-                reads,
+                targets,
                 query,
                 extz,
                 block_length,
@@ -1081,7 +1371,7 @@ pub fn gen_extend_err_exz(
             total_length += length;
             total_error += gen_extend_err_0_exz(
                 region,
-                reads,
+                targets,
                 query,
                 extz,
                 block_length,
@@ -1112,6 +1402,7 @@ pub type WindowRegion = TargetRegion;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reads::read_store::ReadStore;
     use crate::overlap::region::FakeCigar;
 
     /// The linear congruential generator the golden probe uses, so the
@@ -1283,7 +1574,7 @@ mod tests {
             force_alignment,
         };
         let accepted =
-            align_hc_ed_post_extz(&mut region, &mut extz, &store, &reads[query_identifier as usize], &parameters);
+            align_hc_ed_post_extz(&mut region, &mut extz, &TargetSource::Reads(&store), &reads[query_identifier as usize], &parameters);
 
         let windows = snapshot_windows(&region);
 
@@ -1294,7 +1585,7 @@ mod tests {
             let maximum_error_rate = error_rate * 1.5 + 0.000001;
             let early = gen_extend_err_exz(
                 &mut region,
-                &store,
+                &TargetSource::Reads(&store),
                 &reads[query_identifier as usize],
                 &mut extz,
                 window_length,
@@ -1306,7 +1597,7 @@ mod tests {
             );
             let full = gen_extend_err_exz(
                 &mut region,
-                &store,
+                &TargetSource::Reads(&store),
                 &reads[query_identifier as usize],
                 &mut extz,
                 window_length,

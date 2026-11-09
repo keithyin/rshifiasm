@@ -9,6 +9,7 @@
 use crate::alignment::banded_bpm::NO_ALIGNMENT_ERROR;
 use crate::alignment::banded_path::{BandedPath, reserve_banded_bpm_path};
 use crate::correction::region::{TargetRegion, determine_overlap_region, fill_subregion};
+use crate::correction::target::TargetSource;
 use crate::reads::read_store::ReadStore;
 
 /// Inputs that do not change while fixing one window's boundary.
@@ -98,7 +99,7 @@ pub fn fix_boundary(context: &BoundaryContext<'_>) -> Option<BoundaryFix> {
     }
 
     let target_sequence = fill_subregion(
-        context.reads,
+        &TargetSource::Reads(context.reads),
         context.target_identifier,
         start,
         length,

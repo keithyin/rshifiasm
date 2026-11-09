@@ -20,6 +20,7 @@ use crate::correction::region::{
     THRESHOLD_MAXIMUM, WINDOW_LENGTH, adjust_threshold, determine_overlap_region, fill_subregion,
 };
 use crate::overlap::region::OverlapRegion;
+use crate::correction::target::TargetSource;
 use crate::reads::read_store::ReadStore;
 use crate::sequence::encoding::SEQUENCE_NT6_TABLE;
 
@@ -261,7 +262,7 @@ fn align_boundary_overlap(
         target_window_length,
     )?;
     let target_sequence = fill_subregion(
-        reads,
+        &TargetSource::Reads(reads),
         region.y_identifier as usize,
         mapped.start,
         mapped.length,

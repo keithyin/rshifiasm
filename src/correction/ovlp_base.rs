@@ -27,7 +27,7 @@ use crate::correction::cal_exz::{
 use crate::correction::hc_align::BitExtz;
 use crate::correction::window::WindowCigar;
 use crate::overlap::region::{KmerHit, OverlapRegion};
-use crate::reads::read_store::ReadStore;
+use crate::correction::target::TargetSource;
 
 /// `hc_ovlp_base_direct`: aligns every block of a chain, appending one window
 /// per block to `output`.
@@ -45,7 +45,7 @@ pub fn hc_ovlp_base_direct(
     hits: &[KmerHit],
     hit_count: i64,
     window_length: i64,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     extz: &mut BitExtz,
     output: &mut WindowCigar,
@@ -179,7 +179,7 @@ pub fn hc_ovlp_base_direct(
 
         let aligned = hc_aln_exz_adv_hc(
             region,
-            reads,
+            targets,
             extz,
             query,
             query_start,
@@ -228,8 +228,9 @@ pub fn hc_ovlp_base_direct(
 #[cfg(test)]
 mod probe_goldens {
     use super::*;
-    use crate::overlap::region::{FakeCigar, KmerHit, OverlapRegion};
     use crate::reads::read_store::ReadStore;
+    use crate::overlap::region::{FakeCigar, KmerHit, OverlapRegion};
+    use crate::correction::target::TargetSource;
 
     #[derive(Clone)]
     struct WindowSpec {
@@ -420,7 +421,7 @@ mod probe_goldens {
                 &hits,
                 hits.len() as i64,
                 400,
-                &reads,
+                &TargetSource::Reads(&reads),
                 query,
                 extz,
                 &mut output,

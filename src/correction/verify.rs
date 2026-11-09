@@ -15,6 +15,7 @@ use crate::correction::region::{
     fill_subregion,
 };
 use crate::overlap::region::OverlapRegion;
+use crate::correction::target::TargetSource;
 use crate::reads::read_store::ReadStore;
 
 /// Inputs that stay the same for all windows of one read.
@@ -161,7 +162,7 @@ fn verify_one_window(
     )?;
 
     let target_sequence = fill_subregion(
-        context.reads,
+        &TargetSource::Reads(context.reads),
         region.y_identifier as usize,
         target.start,
         target.length,

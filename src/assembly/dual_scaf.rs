@@ -10,17 +10,11 @@
 //!
 //! Implemented: the reference cleaning (`gen_clean_ug`,
 //! `gen_shallow_clean_ug`), the two transition passes built on
-//! [`adjust_utg_by_primary`], the merge/`gen_scaf_res_via` bridge, the
+//! [`adjust_utg_by_primary`], the base-level inference `trans_base_infer`
+//! ([`crate::assembly::trans_base`]), the merge/`gen_scaf_res_via` bridge, the
 //! contig-transition ordering (`order_contig_trans`/`rm_dup_aln`), the
 //! scaffold graph with its tangle search (`gen_double_scaffold_gfa`,
 //! [`crate::assembly::scaf_tangle`]) and the output (`ma_scg_print`).
-//!
-//! Not ported yet: `trans_base_infer` (minimizer binning). It runs by default
-//! (`is_base_trans == 1`) and is the remaining value-level difference of the
-//! deep transition table: on the current corpus it adds one `RC_2` transition
-//! and changes some `nw`/coordinates, although the emitted scaffolds stay
-//! byte-identical because none of those transitions survives the linking
-//! filters.
 
 use std::io::Write;
 use std::path::Path;
@@ -318,9 +312,9 @@ pub fn gen_deep_ref_trans(
             reads,
             options.maximum_hang_rate,
         );
-        // `trans_base_infer` (`inter.cpp` 22574) runs by default
-        // (`is_base_trans == 1`); the overlap half is not ported yet, so only
-        // the global minimizer index is built for now.
+        // `trans_base_infer(ccref, sg, opt, &(cov->t_ch->k_trans), NULL)`.
+        // The reference passes no bubble chain here, so the inference builds
+        // its own from the read graph and the polished unitig graph.
         let bubble = crate::assembly::trio_dual::gen_bubble_chain(
             read_graph,
             &mut polished,
@@ -339,9 +333,13 @@ pub fn gen_deep_ref_trans(
             options,
             trio_flags,
         )?;
-        let _index = crate::assembly::trans_base::build_trans_base_index(
+        crate::assembly::trans_base::trans_base_infer(
             &polished,
+            read_graph,
             &bubble,
+            &mut chain.k_trans,
+            &mut chain.k_trans_idx,
+            reads,
             options,
         );
     }

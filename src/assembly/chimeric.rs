@@ -12,6 +12,7 @@ use crate::alignment::banded_bpm::{reserve_banded_bpm, NO_ALIGNMENT_ERROR};
 use crate::assembly::hit::{delete_all_edges, CoverageCut, PRIMARY_LABEL};
 use crate::command_line::options::AssemblyOptions;
 use crate::correction::region::{adjust_threshold, determine_overlap_region, fill_subregion};
+use crate::correction::target::TargetSource;
 use crate::overlap::paf::PafHit;
 use crate::reads::ReadStore;
 
@@ -240,7 +241,7 @@ fn verify_single_window(
     };
 
     let y_string = fill_subregion(
-        reads,
+        &TargetSource::Reads(reads),
         y_identifier,
         region.start,
         region.length,

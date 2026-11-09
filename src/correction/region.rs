@@ -2,7 +2,7 @@
 //! the constants at the top of `Correct.h`, `determine_overlap_region` and
 //! `fill_subregion` in `Correct.cpp`.
 
-use crate::reads::read_store::ReadStore;
+use crate::correction::target::TargetSource;
 
 /// Correction window length, `WINDOW`.
 pub const WINDOW_LENGTH: i64 = 375;
@@ -89,12 +89,15 @@ pub fn determine_overlap_region(
     })
 }
 
-/// `fill_subregion`: extracts a slice of a read and pads it with `N`.
+/// `fill_subregion`: extracts a slice of the target and pads it with `N`.
 ///
 /// `strand` selects the reverse complement, and `extra_begin`/`extra_end` are
-/// the padding lengths `determine_overlap_region` asked for.
+/// the padding lengths `determine_overlap_region` asked for. This is the
+/// non-HPC half of `fill_subregion`/`return_str_seq` in the reference: the
+/// core bases come from the read store or, through
+/// [`TargetSource::sub_region`], from `retrieve_u_seq`.
 pub fn fill_subregion(
-    reads: &ReadStore,
+    targets: &TargetSource,
     read_identifier: usize,
     start: i64,
     length: i64,
@@ -102,7 +105,7 @@ pub fn fill_subregion(
     extra_begin: i32,
     extra_end: i32,
 ) -> Vec<u8> {
-    let core = reads.read_sub_region(read_identifier, start, length, strand);
+    let core = targets.sub_region(read_identifier, start, length, strand);
     let mut filled = vec![b'N'; extra_begin as usize];
     filled.extend_from_slice(&core);
     filled.resize(filled.len() + extra_end as usize, b'N');

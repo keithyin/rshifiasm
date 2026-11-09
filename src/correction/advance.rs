@@ -20,6 +20,7 @@ use crate::correction::recalculate::{
 use crate::correction::region::{THRESHOLD, determine_overlap_region, fill_subregion};
 use crate::correction::window::{number_of_windows, window_id_by_end, window_id_by_start};
 use crate::overlap::region::OverlapRegion;
+use crate::correction::target::TargetSource;
 use crate::reads::read_store::ReadStore;
 
 /// Everything the retry passes need to know about one overlap.
@@ -225,7 +226,7 @@ fn extend_forwards(
             }
 
             let target = fill_subregion(
-                reads,
+                &TargetSource::Reads(reads),
                 view.y_identifier,
                 mapped.start,
                 mapped.length,
@@ -318,7 +319,7 @@ fn extend_backwards(
                 };
 
                 let target = fill_subregion(
-                    reads,
+                    &TargetSource::Reads(reads),
                     view.y_identifier,
                     mapped.start,
                     mapped.length,
@@ -433,7 +434,7 @@ fn extend_backwards(
                 }
 
                 let target = fill_subregion(
-                    reads,
+                    &TargetSource::Reads(reads),
                     view.y_identifier,
                     mapped.start,
                     mapped.length,
@@ -572,7 +573,7 @@ fn build_missing_cigars(
         }
 
         let target = fill_subregion(
-            reads,
+            &TargetSource::Reads(reads),
             view.y_identifier,
             y_start,
             o_len,

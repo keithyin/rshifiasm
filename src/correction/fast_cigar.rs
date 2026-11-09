@@ -18,7 +18,7 @@ use crate::correction::ovlp_base::hc_ovlp_base_direct;
 use crate::correction::window::WindowList;
 use crate::correction::window_chain::{is_unaligned_window, rechain_alignment_hc};
 use crate::overlap::region::{CandidatesList, OverlapRegion};
-use crate::reads::read_store::ReadStore;
+use crate::correction::target::TargetSource;
 
 /// `gen_hc_fast_cigar0`: aligns one overlap and retries its failed windows.
 ///
@@ -32,7 +32,7 @@ pub fn generate_fast_cigar_direct(
     region: &mut OverlapRegion,
     candidates: &mut CandidatesList,
     window_length: i64,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     extz: &mut BitExtz,
     auxiliary: &mut OverlapRegion,
@@ -57,7 +57,7 @@ pub fn generate_fast_cigar_direct(
         return None;
     }
 
-    let target_total_length = reads.read_length(region.y_identifier as usize) as i64;
+    let target_total_length = targets.length(region.y_identifier as usize);
 
     auxiliary.window_cigar.clear();
     auxiliary.y_identifier = region.y_identifier;
@@ -72,7 +72,7 @@ pub fn generate_fast_cigar_direct(
         &candidates.list[chain_start..chain_start + chain_count as usize],
         chain_count,
         window_length,
-        reads,
+        targets,
         query,
         extz,
         &mut auxiliary.window_cigar,
@@ -95,7 +95,7 @@ pub fn generate_fast_cigar_direct(
             &mut auxiliary.window_cigar,
             index,
             window_length,
-            reads,
+            targets,
             query,
             extz,
             error_rate,
@@ -196,7 +196,7 @@ pub fn generate_fast_cigar(
     region: &mut OverlapRegion,
     candidates: &mut CandidatesList,
     window_length: i64,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     extz: &mut BitExtz,
     auxiliary: &mut OverlapRegion,
@@ -209,7 +209,7 @@ pub fn generate_fast_cigar(
         region,
         candidates,
         window_length,
-        reads,
+        targets,
         query,
         extz,
         auxiliary,
@@ -223,6 +223,7 @@ pub fn generate_fast_cigar(
 #[cfg(test)]
 mod probe_goldens {
     use super::*;
+    use crate::reads::read_store::ReadStore;
     use crate::correction::window::WindowCigar;
     use crate::overlap::region::KmerHit;
 
@@ -403,7 +404,7 @@ mod probe_goldens {
             &mut base,
             &mut candidates,
             scenario.window_length,
-            &reads,
+            &TargetSource::Reads(&reads),
             query,
             &mut extz,
             &mut auxiliary,
@@ -566,7 +567,7 @@ mod probe_goldens {
             &mut base,
             &mut candidates,
             spec.window_length,
-            &reads,
+            &TargetSource::Reads(&reads),
             query,
             &mut extz,
             &mut auxiliary,

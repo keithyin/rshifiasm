@@ -21,6 +21,7 @@
 use crate::correction::window::{WindowCigar, CELL_LENGTH_MASK};
 use crate::correction::window_chain::is_unaligned_window;
 use crate::overlap::region::OverlapRegion;
+use crate::correction::target::TargetSource as AlignmentTargets;
 use crate::reads::read_store::ReadStore;
 
 /// Cigar operation for a matching base, `EAC_M`.
@@ -682,7 +683,7 @@ mod probe_goldens {
             &mut region,
             &mut candidates,
             spec.window_length,
-            &reads,
+            &AlignmentTargets::Reads(&reads),
             query,
             &mut extz,
             &mut auxiliary,

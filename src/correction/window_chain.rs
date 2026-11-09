@@ -23,7 +23,7 @@ use crate::correction::window::{window_id_by_start, WindowCigar, WindowList};
 use crate::overlap::chaining::{chain_dp_fixed_ends, chain_simple};
 use crate::overlap::lchain_parameters::set_lchain_parameters;
 use crate::overlap::region::{CandidatesList, KmerHit, OverlapRegion};
-use crate::reads::read_store::ReadStore;
+use crate::correction::target::TargetSource;
 
 /// `is_ualn_win`: an unaligned window has no CIGAR and no target end.
 pub fn is_unaligned_window(window: &WindowList) -> bool {
@@ -414,7 +414,7 @@ pub fn generate_window_chain(
     target_start: i64,
     target_end: i64,
     window_length: i64,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     extz: &mut BitExtz,
     query_total_length: i64,
@@ -427,6 +427,13 @@ pub fn generate_window_chain(
     assert!(mode < MODE_SEMI_GLOBAL_LIMIT);
     let initial_length = candidates.length;
     let window_count = region.window_cigar.windows.len() as i64;
+
+    // The ultra-long caller re-chains a window before the overlap's own list
+    // has been rebuilt (`clear_overlap_region_alloc` empties every slot), so
+    // `gen_win_chain` sees `wn == 0`, extracts no anchor and returns 0.
+    if window_count == 0 {
+        return 0;
+    }
 
     let mut window_start = query_start;
     if window_start < i64::from(region.x_position_start) {
@@ -492,7 +499,7 @@ pub fn generate_window_chain(
                     backtrace_window_in_place(
                         region,
                         index,
-                        reads,
+                        targets,
                         query,
                         extz,
                         reverse_strand,
@@ -607,7 +614,7 @@ pub fn rechain_alignment_hc(
     output: &mut WindowCigar,
     auxiliary_index: usize,
     window_length: i64,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query: &[u8],
     extz: &mut BitExtz,
     error_rate: f64,
@@ -636,7 +643,7 @@ pub fn rechain_alignment_hc(
         target_start,
         target_end,
         window_length,
-        reads,
+        targets,
         query,
         extz,
         query_total_length,
@@ -685,7 +692,7 @@ pub fn rechain_alignment_hc(
                 &candidates.list[base..base + chain_count as usize],
                 chain_count,
                 window_length,
-                reads,
+                targets,
                 query,
                 extz,
                 output,
@@ -732,11 +739,12 @@ pub fn rechain_alignment_hc(
 #[cfg(test)]
 mod probe_goldens {
     use super::*;
+    use crate::reads::read_store::ReadStore;
     use crate::correction::hc_align::BitExtz;
     use crate::correction::ovlp_base::hc_ovlp_base_direct;
     use crate::correction::window::WindowCigar;
     use crate::overlap::region::{CandidatesList, ChainData, KmerHit, OverlapRegion};
-    use crate::reads::read_store::ReadStore;
+    use crate::correction::target::TargetSource;
 
     struct Lcg(u64);
 
@@ -1172,7 +1180,7 @@ mod probe_goldens {
             &hits,
             hits.len() as i64,
             scenario.window_length,
-            reads,
+            &TargetSource::Reads(&reads),
             query,
             extz,
             &mut output.window_cigar,
@@ -1207,7 +1215,7 @@ mod probe_goldens {
                 target_start,
                 target_end,
                 scenario.window_length,
-                &reads,
+                &TargetSource::Reads(&reads),
                 query,
                 &mut extz,
                 query_total_length,
@@ -1299,7 +1307,7 @@ mod probe_goldens {
             &mut aux.window_cigar,
             auxiliary_index,
             scenario.window_length,
-            &reads,
+            &TargetSource::Reads(&reads),
             query,
             &mut extz,
             0.04,

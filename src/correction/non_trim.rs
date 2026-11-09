@@ -13,6 +13,7 @@ use crate::correction::recalculate::{double_error_threshold, initial_error_thres
 use crate::correction::region::{THRESHOLD, determine_overlap_region, fill_subregion};
 use crate::correction::window::{number_of_windows, window_id_by_end, window_id_by_start};
 use crate::overlap::region::OverlapRegion;
+use crate::correction::target::TargetSource;
 use crate::reads::read_store::ReadStore;
 
 /// Outcome of `verify_sub_window`.
@@ -65,7 +66,7 @@ pub fn verify_sub_window(
     };
 
     let target = fill_subregion(
-        reads,
+        &TargetSource::Reads(reads),
         y_identifier,
         region.start,
         region.length,

@@ -94,8 +94,8 @@
 | P4 已存 overlap 辅助 | `dedup_chains` / `push_nec_re` / `extract_max_exact` / `push_ne_ovlp` / `check_well_cal` | ✅ 完成（22 组场景、149 行黄金回放逐字节一致） |
 | P4 纠错 | `--write-ec` 纠错读段逐字节一致 | ✅ 完成（三轮全部一致，见下文实测） |
 | P5 组装图 | `p_utg.gfa`、`p_ctg.gfa` 逐字节一致 | ✅ 完成（r_utg/p_utg 全链路一致；p_ctg 探针级 + e2e 一致，见下文实测） |
-| P6 单倍型 | `hap1/hap2.p_ctg.gfa`、`a_ctg.gfa` 一致 | ✅ 完成（`hap1/hap2.p_ctg.*` 探针级 + e2e 逐字节一致，见下文实测；`a_ctg.gfa` 属 `--dual-scaf` 路径，暂缓） |
-| P7 Hi-C/trio | 需额外测试数据 | ⏳ 待实现 |
+| P6 单倍型 | `hap1/hap2.p_ctg.gfa`、`a_ctg.gfa` 一致 | ✅ 完成（`hap1/hap2.p_ctg.*` 探针级 + e2e 逐字节一致，见下文实测；`--dual-scaf` 的完整路径见下文 `trans_base_infer` 一节） |
+| P7 Hi-C/trio | trio 全部分支逐字节；Hi-C 需额外测试数据 | ✅ trio（名单模式/`--trio-dual`/`-5`/`--dual-scaf`）；⏳ Hi-C |
 | P8 ONT/UL | 需额外测试数据 | ⏳ 待实现 |
 
 ## 已验证的翻译细节
@@ -2175,25 +2175,64 @@ ultra-long 索引/链化引擎，规模远大于此前各分支。本轮先落�
   hap1/hap2 仍是 6/2 条 singleton scaffold），但代码路径已完整执行且与
   参考逐字节一致；tangle 的数值正确性需更大语料才能被输出覆盖。
 
-### `--dual-scaf` 仍未移植
+### `--dual-scaf` 的 `trans_base_infer`（2026-11-09，已完成）
 
-1. `trans_base_infer`（inter.cpp 22574）：`init_ug_trans_t` +
-   `gen_trans_base_count_comp` + `worker_for_trans_ovlp_adv` +
-   `gen_trans_adaptive_aln` + `ug_map_lchain`/`minimizers_qgen_input`/
-   `lchain_qgen_mcopy_input`。当前只做 `ma_ug_seq` 快照，未产生 RC_3 过渡。
-   **注意**：`is_base_trans` 默认为 1（CommandLines.cpp:341），所以该步在
-   默认 `--dual-scaf` 下就会执行。实测（gdb 在 `ctg_trans_gp_chain` /
-   `filter_ctg_trans` / `push_ctg_trans_res` 入口 dump `ll->lo`）：
-   参考的深过渡表比 Rust 多一条 `qn=2→tn=6` 的 `RC_2` 过渡，且同批过渡的
-   `nw`（如 44144/161115/253461 vs Rust 132565/161513/254026）与端点
-   （如 `qs=1262502` vs `1262523`）不同。因这些过渡在链接阶段全部被
-   `pn<=1` 或可靠度判据滤掉，hap1/hap2 GFA 仍逐字节一致。
+`trans_base_infer`（inter.cpp 22574）是最后一个未移植的 `--dual-scaf`
+部件。本轮补齐并接线：
 
-UL contig 过渡链与 `gen_double_scaffold_gfa` 链接阶段均已完成
-（`ctg_trans.rs`、`scaf_tangle.rs`）；`--dual-scaf` 门禁的
-`out.dip.hap1.p_ctg.gfa`（3,019,998 B）与 `out.dip.hap2.p_ctg.gfa`
-（2,310,344 B）与 C++ **逐字节一致**。
+| Rust | C++ |
+|---|---|
+| `trans_base::trans_base_infer` | inter.cpp 22574（`init_ug_trans_t` + `gen_trans_base_count_comp`） |
+| `trans_base::gen_trans_adaptive_aln` | inter.cpp 10297 |
+| `trans_base::push_rc_3_transitions` | inter.cpp 22234-22301（tail 合并） |
+| `trans_base::build_trans_base_index` | `gen_trans_base_count_comp` 的 count/sort/remap 半 |
+| `qgen_input::minimizers_qgen_input` / `lchain_qgen_mcopy_input` | `ug_map_lchain` 的种子与链化半 |
+| `ug_lalign::split_ug_lalign` / `ovlp_base_direct` / `ul_raw_aln` / `rechain_alignment_ul` | inter.cpp 9967 / 17367 / 24913 / 17145 |
+| `target::TargetSource` | `uref`/`rref` 的统一读取 |
+| `trans_clean::clean_u_trans_t_idx_adv` | Overlaps.cpp 15384（入口先重建过渡表） |
+
+要点：
+
+- 参数：`k=trans_mer_length`（31）、`w=trans_win`（31）、
+  `bw_thres=diff_ec_ul=1-trans_base_rate`（0.07）、
+  `bw_thres_sec=diff_ec_ul_double=1-trans_base_rate_sec`（0.5）、
+  `sec_cutoff=0.85`、`mini_cut=512`、`chain_cut=3`、`high_occ=polyploidy+1`、
+  `mcopy_rate=0.2`/`mcopy_khit_cut=3`（`enable_mcopy=0`，不生效）。
+  注意 `init_ug_trans_t` 的调用顺序在 `ha_opt_update_cov` 之后，所以
+  `max_n_chain` 取更新后的值。
+- `worker_for_trans_ovlp_adv` 单线程顺序执行即 `kt_for(n_thread=1)`；
+  `ll[tid].tk` 的合并退化为按查询升序遍历 track 的连续 `qn` 段。
+- 两轮 `gen_trans_adaptive_aln`：首轮 `fi=filter`、`err_high=0.5`/
+  `err_low=0.07`，返回 `test_het_aln`；失败时第二轮 `fi=NULL`、
+  两个误差率均为 0.5，并追加 `remove_trans_ovlp_connect` 弧过滤。
+- `RC_3` 的 `occ` 字段在参考里未赋值，随后 `clean_u_trans_t_idx_filter_adv`
+  会先把它重置为 0，因此填 0 不影响可观测结果。
+- **`rechain_aln` 在 UL 路径上是空操作**：`clear_overlap_region_alloc`
+  会清空所有槽位的 `w_list`，`gen_win_chain` 看到的 `wn` 恒为 0 并返回 0。
+  Rust 移植版此前会因 `window_count - 1` 下溢 panic，本轮在
+  `generate_window_chain` 增加空列表短路，与参考的可观测行为一致。
+
+门禁（`-t1`，语料 chr11-2M + `-3/-4` 名单）：
+
+| 运行 | `hap1.p_ctg.gfa` | `hap2.p_ctg.gfa` |
+|---|---|---|
+| C++ `hifiasm --dual-scaf` | 3,019,998 B | 2,310,344 B |
+| Rust 同命令 | 3,019,998 B | 2,310,344 B |
+
+`scripts/compare_outputs.sh`：`dip.hap1/hap2` 的 p_ctg/p_utg/r_utg
+gfa/noseq/lowQ.bed 共 9 项全部 identical，`.ovlp.source.bin`/
+`.ovlp.reverse.bin` 亦 identical；仅 `.ec.bin` 以既有的 padding 豁免
+（同尺寸 21,361,791 B，差异为散落的 padding 字节）。
+
+数值层验证（`RSHIFIASM_PIPELINE_DUMP_DIR` 打开探针）：
+
+- `trans_base_trans.txt`：58 条过渡（38 `RC_3` / 14 `RC_2` / 2 `RC_1` /
+  4 `RC_0`），track 共 64 条。
+- `dual_trans.txt`（`gen_contig_self` 之后）与旧记录中的 C++ 参考值逐条吻合：
+  `nw=44144/161115/253461`、`qs=1262502`（此前 Rust 为
+  `132565/161513/254026`、`qs=1262523`）。文档原先记录的“深过渡表数值差异”
+  已关闭。
 
 UL 基础与 `--dual-scaf` 已接入 `output_trio_graph_joint`
 （`options.self_scaffolding != 0`）；默认/trio-dual/-5 路径不受影响，
-`cargo test --release` 全绿。
+`cargo test --release` 全绿（333 passed）。

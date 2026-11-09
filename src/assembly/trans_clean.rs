@@ -27,7 +27,7 @@ fn u_trans_key(transition: &UTrans) -> u64 {
 }
 
 /// `u_trans_a` and `u_trans_n`: the `<start, count>` span of query `qn`.
-fn u_trans_span(index: &[u64], qn: u32) -> (usize, usize) {
+pub(crate) fn u_trans_span(index: &[u64], qn: u32) -> (usize, usize) {
     let packed = index[qn as usize];
     ((packed >> 32) as usize, packed as u32 as usize)
 }
@@ -1497,4 +1497,155 @@ pub fn clean_u_trans_t_idx_filter_adv(
         }
     }
     logical_n
+}
+
+/// `worker_for_trans_clean` (`Overlaps.cpp` 14841): keeps one representative
+/// transition per unitig pair. This is the plain variant used by
+/// [`clean_u_trans_t_idx_adv`] — unlike [`worker_for_trans_clean_re`] it has
+/// no `RC_3` representative selection.
+fn worker_for_trans_clean(
+    transitions: &[UTrans],
+    index: &[u64],
+    id: u32,
+    res: &mut Vec<UTrans>,
+    unitig_graph: &UnitigGraph,
+    read_graph: &Asg,
+) {
+    let (off, n) = u_trans_span(index, id);
+    let a = &transitions[off..off + n];
+    let mut l = 0usize;
+    for k in 1..=n {
+        if k == n || a[l].target_identifier != a[k].target_identifier {
+            if k > l {
+                // `get_u_trans_spec(ta, a[l].tn, a[l].qn, &r_a, &r_n)`: the
+                // partner's entries that point back at `id`.
+                let spec = get_u_trans_spec(
+                    transitions,
+                    index,
+                    a[l].target_identifier,
+                    a[l].query_identifier,
+                );
+                if let Some((r_beg, r_n)) = spec {
+                    if r_n > 0 && id > a[l].target_identifier {
+                        l = k;
+                        continue;
+                    }
+                }
+
+                let mut consider = |cz: &UTrans,
+                                    reverse_side: bool,
+                                    mz: &mut Option<UTrans>| {
+                    if let Some(best) = *mz {
+                        if best.flag == RC_0 && cz.flag != RC_0 {
+                            return;
+                        }
+                        if best.flag == RC_1 && (cz.flag == RC_2 || cz.flag == RC_3) {
+                            return;
+                        }
+                    }
+                    let better = mz.is_none()
+                        || (cz.flag < mz.unwrap().flag
+                            && (cz.flag == RC_0 || cz.flag == RC_1))
+                        || mz.unwrap().network_weight < cz.network_weight
+                        || (mz.unwrap().network_weight == cz.network_weight
+                            && if reverse_side {
+                                (mz.unwrap().query_end - mz.unwrap().query_start)
+                                    < (cz.target_end - cz.target_start)
+                            } else {
+                                (mz.unwrap().query_end - mz.unwrap().query_start)
+                                    < (cz.query_end - cz.query_start)
+                            });
+                    if better {
+                        *mz = Some(*cz);
+                    }
+                };
+                let mut mz: Option<UTrans> = None;
+                for cz in &a[l..k] {
+                    consider(cz, false, &mut mz);
+                }
+                if let Some((r_beg, r_n)) = spec {
+                    for cz in &transitions[r_beg..r_beg + r_n] {
+                        consider(cz, true, &mut mz);
+                    }
+                }
+
+                if let Some(mut mz) = mz {
+                    if mz.query_identifier != mz.target_identifier {
+                        if mz.query_identifier != id {
+                            let qn = mz.query_identifier;
+                            let tn = mz.target_identifier;
+                            let qs = mz.query_start;
+                            let qe = mz.query_end;
+                            let ts = mz.target_start;
+                            let te = mz.target_end;
+                            mz.query_identifier = tn;
+                            mz.query_start = ts;
+                            mz.query_end = te;
+                            mz.target_identifier = qn;
+                            mz.target_start = qs;
+                            mz.target_end = qe;
+                        }
+
+                        res.push(mz);
+                        // `small_ov_rate = 0.8`, `ov_cutoff = 3` of
+                        // `clean_u_trans_t_idx_adv`.
+                        if mz.network_weight >= 0.0
+                            && (trans_ovlp_connect1(&mz, unitig_graph) == 0
+                                || ovlp_rocc(&mz, unitig_graph, read_graph, 0.8, 3) == 0)
+                        {
+                            res.pop();
+                        }
+                    }
+                }
+            }
+            l = k;
+        }
+    }
+}
+
+/// `clean_u_trans_t_idx_adv` (`Overlaps.cpp` 15384): rebuilds the transition
+/// table from one representative per pair, downgrading every `RC_3` entry to
+/// `RC_2` on both directions.
+pub fn clean_u_trans_t_idx_adv(
+    transitions: &mut Vec<UTrans>,
+    index: &mut Vec<u64>,
+    unitig_graph: &UnitigGraph,
+    read_graph: &Asg,
+) {
+    let n_seq = unitig_graph.graph.sequences.len() as u32;
+    kt_u_trans_t_idx(transitions, index, n_seq);
+
+    let mut res: Vec<UTrans> = Vec::new();
+    for i in 0..n_seq {
+        worker_for_trans_clean(transitions, index, i, &mut res, unitig_graph, read_graph);
+    }
+
+    transitions.clear();
+    transitions.reserve(res.len() * 2);
+    for entry in &res {
+        if entry.query_identifier == entry.target_identifier {
+            continue;
+        }
+        let mut forward = *entry;
+        if forward.flag == RC_3 {
+            forward.flag = RC_2;
+        }
+        transitions.push(forward);
+
+        let mut reverse = *entry;
+        let qn = reverse.query_identifier;
+        let qs = reverse.query_start;
+        let qe = reverse.query_end;
+        reverse.query_identifier = reverse.target_identifier;
+        reverse.query_start = reverse.target_start;
+        reverse.query_end = reverse.target_end;
+        reverse.target_identifier = qn;
+        reverse.target_start = qs;
+        reverse.target_end = qe;
+        if reverse.flag == RC_3 {
+            reverse.flag = RC_2;
+        }
+        transitions.push(reverse);
+    }
+    kt_u_trans_t_idx(transitions, index, n_seq);
 }

@@ -31,6 +31,8 @@ pub mod read_writeback;
 pub mod region;
 pub mod rphase;
 pub mod second_round;
+pub mod target;
+pub mod ug_lalign;
 pub mod verify;
 pub mod window;
 pub mod window_chain;

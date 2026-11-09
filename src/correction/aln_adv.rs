@@ -14,9 +14,9 @@ use crate::correction::cal_exz::{
     scale_ed_thre, set_exact_exz, ExzAdvState, MODE_SEMI_GLOBAL,
 };
 use crate::correction::hc_align::BitExtz;
+use crate::correction::target::TargetSource;
 use crate::correction::window::WindowCigar;
 use crate::overlap::region::OverlapRegion;
-use crate::reads::read_store::ReadStore;
 
 /// `hc_aln_exz_adv`: aligns one block, estimating the error from the windows
 /// only when the block spans a whole window or more.
@@ -27,7 +27,7 @@ use crate::reads::read_store::ReadStore;
 #[allow(clippy::too_many_arguments)]
 pub fn hc_aln_exz_adv(
     region: &OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     extz: &mut BitExtz,
     query: &[u8],
     query_start: i64,
@@ -72,7 +72,7 @@ pub fn hc_aln_exz_adv(
     if query_length <= 16
         && cal_exact_exz(
             region,
-            reads,
+            targets,
             extz,
             query,
             query_start,
@@ -89,7 +89,7 @@ pub fn hc_aln_exz_adv(
 
     attempt_thresholds(
         region,
-        reads,
+        targets,
         extz,
         query,
         query_start,
@@ -116,7 +116,7 @@ pub fn hc_aln_exz_adv(
 #[allow(clippy::too_many_arguments)]
 pub fn hc_aln_exz_adv_hc(
     region: &OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     extz: &mut BitExtz,
     query: &[u8],
     query_start: i64,
@@ -173,7 +173,7 @@ pub fn hc_aln_exz_adv_hc(
         }
         if cal_exact_exz(
             region,
-            reads,
+            targets,
             extz,
             query,
             query_start,
@@ -190,7 +190,7 @@ pub fn hc_aln_exz_adv_hc(
 
     attempt_thresholds(
         region,
-        reads,
+        targets,
         extz,
         query,
         query_start,
@@ -217,7 +217,7 @@ pub fn hc_aln_exz_adv_hc(
 #[allow(clippy::too_many_arguments)]
 fn attempt_thresholds(
     region: &OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     extz: &mut BitExtz,
     query: &[u8],
     query_start: i64,
@@ -242,7 +242,7 @@ fn attempt_thresholds(
     let mut threshold = scale_ed_thre(estimate_error as u32, maximum_error as u32) as i64;
     if attempt(
         region,
-        reads,
+        targets,
         extz,
         query,
         query_start,
@@ -264,7 +264,7 @@ fn attempt_thresholds(
     if threshold > previous
         && attempt(
             region,
-            reads,
+            targets,
             extz,
             query,
             query_start,
@@ -287,7 +287,7 @@ fn attempt_thresholds(
     if threshold > previous
         && attempt(
             region,
-            reads,
+            targets,
             extz,
             query,
             query_start,
@@ -310,7 +310,7 @@ fn attempt_thresholds(
     if threshold > previous
         && attempt(
             region,
-            reads,
+            targets,
             extz,
             query,
             query_start,
@@ -331,7 +331,7 @@ fn attempt_thresholds(
         threshold = maximum_error;
         if attempt(
             region,
-            reads,
+            targets,
             extz,
             query,
             query_start,
@@ -355,7 +355,7 @@ fn attempt_thresholds(
 #[allow(clippy::too_many_arguments)]
 fn attempt(
     region: &OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     extz: &mut BitExtz,
     query: &[u8],
     query_start: i64,
@@ -370,7 +370,7 @@ fn attempt(
 ) -> bool {
     let aligned = cal_exz_infi_adv(
         region,
-        reads,
+        targets,
         extz,
         query,
         query_start,
@@ -570,7 +570,7 @@ mod probe_goldens {
             let aligned = if spec.use_hc {
                 hc_aln_exz_adv_hc(
                     &region,
-                    &reads,
+                    &TargetSource::Reads(&reads),
                     &mut extz,
                     query,
                     spec.query_start,
@@ -590,7 +590,7 @@ mod probe_goldens {
             } else {
                 hc_aln_exz_adv(
                     &region,
-                    &reads,
+                    &TargetSource::Reads(&reads),
                     &mut extz,
                     query,
                     spec.query_start,

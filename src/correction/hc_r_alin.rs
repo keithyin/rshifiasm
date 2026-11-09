@@ -27,6 +27,7 @@ use crate::correction::window::{CELL_LENGTH_MASK, WindowCigar};
 use crate::correction::window_chain::is_unaligned_window;
 use crate::overlap::paf::PafHit;
 use crate::overlap::region::{CandidatesList, OverlapRegion};
+use crate::correction::target::TargetSource as AlignmentTargets;
 use crate::reads::read_store::ReadStore;
 
 /// Fraction of the overlap that must align, `OVERLAP_THRESHOLD_HIFI_FILTER`.
@@ -183,13 +184,13 @@ fn refine_overlaps(
             // it. It is overwritten by the measured error count below.
             overlaps[index].shared_seed = overlaps[index].non_homopolymer_errors as i32;
 
-            if !align_hc_ed_post_extz(&mut overlaps[index], extz, reads, query, &parameters) {
+            if !align_hc_ed_post_extz(&mut overlaps[index], extz, &AlignmentTargets::Reads(reads), query, &parameters) {
                 continue;
             }
 
             let extension = gen_extend_err_exz(
                 &mut overlaps[index],
-                reads,
+                &AlignmentTargets::Reads(reads),
                 query,
                 extz,
                 window_length,
@@ -212,7 +213,7 @@ fn refine_overlaps(
                 &mut overlaps[index],
                 candidates,
                 window_length,
-                reads,
+                &AlignmentTargets::Reads(reads),
                 query,
                 extz,
                 auxiliary,

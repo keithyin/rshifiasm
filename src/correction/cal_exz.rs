@@ -21,9 +21,9 @@ use crate::alignment::edit_distance::{
 };
 use crate::correction::hc_align::BitExtz;
 use crate::correction::region::THRESHOLD_MAXIMUM;
+use crate::correction::target::TargetSource;
 use crate::correction::window::{window_id_by_start, WindowCigar};
 use crate::overlap::region::OverlapRegion;
-use crate::reads::read_store::ReadStore;
 
 /// Largest single-pass error the new correction path allows, `MAX_SIN_E`.
 pub const MAXIMUM_SINGLE_ERROR: i64 = 2047;
@@ -207,7 +207,7 @@ pub fn initialise_window_alignment(
 /// semi-global alignment is impossible.
 pub fn update_semi_coord(
     region: &OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     query_start: i64,
     query_end: i64,
     threshold: i64,
@@ -220,7 +220,7 @@ pub fn update_semi_coord(
         .y_start_offset(query_start)
         .expect("the fake cigar must cover the query start");
     let alignment_length = query_length + (threshold << 1);
-    let target_total_length = reads.read_length(region.y_identifier as usize) as i64;
+    let target_total_length = targets.length(region.y_identifier as usize);
 
     match initialise_window_alignment(threshold, start, target_total_length, alignment_length) {
         Some(window) => (
@@ -288,7 +288,7 @@ pub fn adjust_ext_offset(
 #[allow(clippy::too_many_arguments)]
 pub fn cal_exact_exz(
     region: &OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     extz: &mut BitExtz,
     query: &[u8],
     query_start: i64,
@@ -303,7 +303,7 @@ pub fn cal_exact_exz(
     extz.cigar.packed.clear();
 
     let query_length = query_end - query_start;
-    let target_total_length = reads.read_length(region.y_identifier as usize) as i64;
+    let target_total_length = targets.length(region.y_identifier as usize);
     let mut target_start = target_start;
     let mut target_end = target_end;
 
@@ -336,7 +336,7 @@ pub fn cal_exact_exz(
     }
 
     let query_sequence = &query[query_start as usize..query_end as usize];
-    let target_sequence = reads.read_sub_region(
+    let target_sequence = targets.sub_region(
         region.y_identifier as usize,
         target_start,
         target_length,
@@ -376,7 +376,7 @@ pub fn cal_exact_exz(
 #[allow(clippy::too_many_arguments)]
 pub fn cal_exz_infi_adv(
     region: &OverlapRegion,
-    reads: &ReadStore,
+    targets: &TargetSource,
     extz: &mut BitExtz,
     query: &[u8],
     query_start: i64,
@@ -397,7 +397,7 @@ pub fn cal_exz_infi_adv(
     let mut threshold = threshold;
     let mut auxiliary_begin = 0i64;
 
-    let target_total_length = reads.read_length(region.y_identifier as usize) as i64;
+    let target_total_length = targets.length(region.y_identifier as usize);
     let mut query_length = query_end - query_start;
     let mut target_length = target_end - target_start;
     let mut diagonal_distance = query_length.max(target_length);
@@ -407,7 +407,7 @@ pub fn cal_exz_infi_adv(
     let mapping_threshold = threshold.min(diagonal_distance);
     if mode == MODE_SEMI_GLOBAL {
         let (start, end, auxiliary) =
-            update_semi_coord(region, reads, query_start, query_end, mapping_threshold);
+            update_semi_coord(region, targets, query_start, query_end, mapping_threshold);
         target_start = start;
         target_end = end;
         auxiliary_begin = auxiliary;
@@ -444,7 +444,7 @@ pub fn cal_exz_infi_adv(
     state.threshold = threshold;
 
     let query_sequence = &query[query_start as usize..query_end as usize];
-    let target_sequence = reads.read_sub_region(
+    let target_sequence = targets.sub_region(
         region.y_identifier as usize,
         target_start,
         target_length,
@@ -1076,7 +1076,7 @@ mod tests {
         region.fake_cigar.push(1999, 0);
 
         // qs == x_pos_s maps to y_pos_s.
-        let (start, end, auxiliary) = update_semi_coord(&region, &reads, 100, 900, 15);
+        let (start, end, auxiliary) = update_semi_coord(&region, &TargetSource::Reads(&reads), 100, 900, 15);
         assert_eq!((start, end, auxiliary), (2985, 3815, 0));
 
         // A query position shifted by the fake cigar moves the target too.
@@ -1084,9 +1084,9 @@ mod tests {
         region.fake_cigar.push(100, 0);
         region.fake_cigar.push(1100, 40);
         region.fake_cigar.push(1999, 40);
-        let (start, _, _) = update_semi_coord(&region, &reads, 1000, 1500, 15);
+        let (start, _, _) = update_semi_coord(&region, &TargetSource::Reads(&reads), 1000, 1500, 15);
         assert_eq!(start, 3885);
-        let (start, _, _) = update_semi_coord(&region, &reads, 1200, 1500, 15);
+        let (start, _, _) = update_semi_coord(&region, &TargetSource::Reads(&reads), 1200, 1500, 15);
         assert_eq!(start, 4140 - 15);
     }
 
@@ -1437,7 +1437,7 @@ mod probe_goldens {
         for spec in &scenario.semis {
             let (start, end, auxiliary) = update_semi_coord(
                 &region,
-                &reads,
+                &TargetSource::Reads(&reads),
                 spec.query_start,
                 spec.query_end,
                 spec.threshold,
@@ -1494,7 +1494,7 @@ mod probe_goldens {
             };
             let aligned = cal_exact_exz(
                 &region,
-                &reads,
+                &TargetSource::Reads(&reads),
                 &mut extz,
                 query,
                 spec.query_start,
@@ -1526,7 +1526,7 @@ mod probe_goldens {
             }
             let aligned = cal_exz_infi_adv(
                 &region,
-                &reads,
+                &TargetSource::Reads(&reads),
                 &mut extz,
                 query,
                 spec.query_start,
