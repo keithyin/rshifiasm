@@ -318,17 +318,74 @@ pub fn build_string_graph_without_clean(
     // Output dispatch of `clean_graph` (`Overlaps.cpp` 39605-39651), in the
     // reference's order: polyploid, trio+Hi-C benchmark, trio, Hi-C, default.
     if options.trio_polyploid_file_name.is_some() {
-        return Err("output_poly_trio (-5) is not implemented yet".to_string());
+        // `if(asm_opt.flag & HA_F_PARTITION) asm_opt.flag -= HA_F_PARTITION;`
+        options.flags &= !FLAG_PARTITION;
+        let poly_status = crate::assembly::bp_graph::output_poly_trio(
+            &mut graph,
+            &mut coverage_cut,
+            &output_file_name,
+            &sources,
+            &reverse_sources,
+            i64::from(options.maximum_short_tip_read_count) * 2,
+            0.15,
+            3,
+            &mut read_to_unitig,
+            0.05,
+            0.9,
+            maximum_hang,
+            minimum_overlap,
+            options.gap_fuzz,
+            &mut bubble_labels,
+            options,
+            &mut trio_flags,
+            reads,
+            options.polyploidy.max(0) as usize,
+        );
+        eprintln!(
+            "Inconsistency threshold for low-quality regions in BED files: {}%",
+            options.bed_inconsistency_rate
+        );
+        return poly_status;
     }
     if options.trio_binning_requested() && options.hic_partition_requested() {
         return Err("benchmark_hic_graph is not implemented yet".to_string());
     }
     if options.trio_binning_requested() {
-        if options.trio_heterozygous_overlap_coverage > 0 {
-            return Err("output_bp_trio_graph (--trio-dual) is not implemented yet".to_string());
-        }
         // `if(asm_opt.flag & HA_F_PARTITION) asm_opt.flag -= HA_F_PARTITION;`
         options.flags &= !FLAG_PARTITION;
+        if options.trio_heterozygous_overlap_coverage > 0 {
+            // `output_bp_trio_graph(sg, coverage_cut, o_file, sources,
+            // reverse_sources, (asm_opt.max_short_tip*2), 0.15, 3, ruIndex,
+            // 0.05, 0.9, max_hang_length, mini_overlap_length, &b_mask_t,
+            // gap_fuzz, &uopt)`.
+            let dual_status = crate::assembly::trio_dual::output_bp_trio_graph(
+                &mut graph,
+                &mut coverage_cut,
+                &output_file_name,
+                &sources,
+                &reverse_sources,
+                i64::from(options.maximum_short_tip_read_count) * 2,
+                0.15,
+                3,
+                &mut read_to_unitig,
+                0.05,
+                0.9,
+                maximum_hang,
+                minimum_overlap,
+                options.gap_fuzz,
+                &mut bubble_labels,
+                options,
+                &mut trio_flags,
+                reads,
+            );
+            // The reference prints the BED threshold at the end of
+            // `clean_graph`, after every dispatch branch.
+            eprintln!(
+                "Inconsistency threshold for low-quality regions in BED files: {}%",
+                options.bed_inconsistency_rate
+            );
+            return dual_status;
+        }
         // `output_trio_graph_joint(sg, coverage_cut, o_file, sources,
         // reverse_sources, (asm_opt.max_short_tip*2), 0.15, 3, ruIndex,
         // 0.05, 0.9, max_hang_length, mini_overlap_length, gap_fuzz,

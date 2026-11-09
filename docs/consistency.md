@@ -1932,3 +1932,129 @@ C++ 的日志 5626 行全为 0；移植按同一行为写出全零，并在 `ec_
 （`/tmp/hetcheck/cxx|rs`）`.het_cnt.log` 逐字节一致（5626 行全 0），
 且同一次运行的全部 GFA/bed 产物也逐字节一致；`cargo test` 326 项；
 默认/trio 门禁无回归。
+
+## maxcut 的 hap-overlap 路径、purge_dups 深链与 `--trio-dual`（2026-11-08）
+
+本节收尾 `--trio-dual`，同时补齐 `--trio-dual` 所依赖的 purge_dups 深链。此前
+`purge_dups` 只移植到「归一化之前」；`adjust_utg_by_primary(collect_p_trans=1,
+collect_p_trans_f=0)` 需要的后半段（purge maxcut、含 hap-overlap 的 maxcut 求解、
+contained haplotig 删除、purge 图构弧、泡弹出、弱弧剪切、unitig 合并与重连）
+全部缺失。
+
+### maxcut 的 hap-overlap 分支（`src/assembly/maxcut.rs`）
+
+C++ 的 `mc_solve(NULL, NULL, &in, ug, sg, 0.8, NULL, 0, s->s, 1, bub, ref,
+0, 0)`（hic.cpp:17741 `trio_phasing_refine`）走的是「ovlp 建边」而不是
+`mc_match_t` 建边，且 `bub`/`ref` 均为非空，因此 `mb_solve_core` 与
+`mc_solve_core_adv` 的带泡、带 ref 分支都会真实执行。移植内容：
+
+- `update_mc_edges_ovlp`（maxcut.rs:469）：按 `hap_cov` 的 `HapOverlap`
+  列表给 `mc_g_t` 建边。过滤条件与 C++ 一致：两端 `u_id`、`hs` 相位、
+  `mc_interval_filter` 的 het/hom 长度比例 `f_rate=0.8`；反向相位的边标
+  `FLIP`。
+- `filter_ovlp_by_mc` / `clean_ovlp_by_mc`（maxcut.rs:533,559）：求解结束后
+  按 spin 一致性镜像保留、再 `retain(status == FLIP)`，只留下应删除的弱边。
+- `set_p_flag` / `p_nodes`（maxcut.rs:591,610）：仅当
+  `(flags & FLAG_PARTITION) && t_ch` 时标记读段：`SET_TRIO(8)`，再按 spin
+  置 `FATHER(1)`/`MOTHER(2)`；`spin == 0 && P_HET` 也归 `FATHER`。这是
+  trio 门禁里 `trio_flags` 被改写的唯一来源。
+- `mc_solve_purge`（maxcut.rs:3042）：purge 专用入口，序列数取
+  `unitig_graph.graph.sequences.len()`，`is_sys=1`、`renew_s=1`，调用
+  `mc_solve_core_adv` 时不传 `unitig_graph`/`bub`（与 C++ 传 `NULL` 的
+  `ug`/`bub` 对齐，`ref` 仍非空以触发 `mb_solve_core`）。
+- 修掉一处移植期引入的截断：`mc.cc`/`mb.cc` 的元素是
+  `(group << 32) | vertex`，Rust 里所有下标必须 `as u32 as usize`
+  （C++ 侧是 `uint32_t k`）；否则 `b.s[k]` 会在多组时越界。
+
+### purge_dups 深链（`src/assembly/purge_dups.rs`）
+
+按 C++ 顺序补齐，函数与 Purge_Dups.cpp 的对应关系：
+
+| Rust | C++ |
+|---|---|
+| `normalize_hap_overlaps_advance_by_p_g_t`（:903） | 3190-3260 两端口过滤 + DELETE 压缩 + 顺序镜像 |
+| `PurgeAlignContext` / `chain_origin_trans_uid_by_purge`（:960） | `chain_origin_trans_uid_by_distance` 的 purge 专用包装 |
+| `collect_purge_trans_cov`（:1121） | 3354-3500 收集 RC_2 转换 |
+| `remove_contained_haplotig`（:1208） | 4040-4460 删除被包含的 haplotig |
+| `get_hap_arch`（:1243） | 4590-4680 由 `ma_hit_to_arc` 生成 `pg_h_lev` 弧，score 编入 `overlap`/`ul` |
+| `clean_purge_graph`（:1599） | 4870-4990 弱弧剪切 |
+| `fill_unitig` / `get_node_boundary_advance` / `purge_merge`（:1613/:1664/:1855） | 4990-5730 链式合并 |
+| `link_unitigs`（:2046） | 合并后重连 |
+
+关键移植细节：
+
+- `new_rtg_edges` 在 `adjust_utg_by_primary` 中由 purge 追加连接弧，随后被
+  `fill_unitig` 与 `renew_utg` 消费，因此参数从 `&[AsgArc]` 改为
+  `&mut Vec<AsgArc>`（`bp_graph.rs`、`trio_dual.rs`、`bubble_chain.rs` 与
+  `tests/bp_graph_golden.rs` 同步）。
+- score 编码沿用 C++：`encode_score` 把符号放最高位，`decode_score` 还原；
+  `purge_g_arc_del_short_diploid_by_score` 用 `f32` 比较
+  `(ovlp as f32) > (ovlp_max as f32) * drop_ratio`，与 C++ 的浮点语义一致。
+- `purge_g->seq[v > 1]` 这类 C++ 边界行为按原样复刻（v 为 0/1 时不取）。
+- 唯一的剩余回退是 `if_ploid_sample`（既无 coverage 峰也无 k-mer 峰时按
+  样本定倍性），在 0.25.0-r726 活路径中不会被触发。
+
+### `worker_for_trans_clean_re` 的 `get_u_trans_spec` 修复
+
+`clean_u_trans_t_idx_filter_adv` 第二遍按「query 侧配对」选代表。原实现直接
+拿 `target` 的完整 transition 区间，C++ 实际走
+`get_u_trans_spec(ta, a[l].tn, a[l].qn, &r_a, &r_n)`（Overlaps.cpp:17000），
+只取该 target 中**恰好指向本 query** 的子区间。差异表现为：Rust 的 purge
+maxcut 边数 62，C++ 64；gdb 抓到的 C++ `in` 列表里多出
+`(qn=7, qs=1215651, qe=1469660, tn=10, ts=0, te=254028, nw=127, f=2, rev=1)`
+及镜像对。`trans_clean.rs:1084` 已按 `get_u_trans_spec` 的子区间扫描并
+复现该行为。
+
+### 门禁结果（全部 `-t1`，逐字节）
+
+| 门禁 | 结果 |
+|---|---|
+| `--trio-dual`（12 个产物：r_utg/p_utg vs `reference_trio.dip.*`；hap1/hap2 vs `reference_trio_dual.dip.*`） | 12/12 identical |
+| triobin（6 个产物 vs `reference_trio.dip.*`） | 6/6 identical |
+| default 配置（17 个 gfa/bed vs `reference.bp.*`） | 17/17 identical；仅 `.ec.bin` 因 padding 不同（既有豁免） |
+| `--primary`（vs `reference_primary.*`） | 全部 gfa/bed identical；仅 `.ec.bin` 例外 |
+| write_paf_ec（vs `reference/write_paf_ec.*`） | gfa/bed/ec.fa/ovlp.paf/ovlp bin 全部 identical；仅 `.ec.bin` 例外 |
+| `cargo test --release` | 全绿（含 3 项 `bp_graph_golden`） |
+
+至此 `--trio-dual` 在功能与门禁上完成；trio 仅剩 `-5`（`output_poly_trio`
++ `mc_solve_general`）与 `--dual-scaf`（`gen_self_scaf` 簇）。
+
+## `-5` 多倍体 trio 输出（2026-11-08，`output_poly_trio`）
+
+`-5 <file>` 是 `clean_graph` 输出分派的第一支（Overlaps.cpp:39613）：
+`flag` 去掉 `HA_F_PARTITION` 后调用
+`output_poly_trio(..., hapN = asm_opt.polyploidy)`。它从外部名单构造每条读段的
+单倍型位图，然后对每个单倍型重写读段标签并输出一整套 `hapN.p_ctg.*`。
+
+移植内容：
+
+- `ha_polybin_list`（`src/assembly/trio_bin.rs`）：先按第一次出现建立读名到
+  下标表（与 `ha_triobin_list` 相同），再逐行解析名单。`phrase_hstatus`
+  （Trio.cpp:373）的格式语义完整复刻：第一字段截到首个空白，`hid` 取自
+  第一字段最后一个 `_` 之后（`atoi` 语义），第二字段是读名；缺空白、缺
+  `_` 或 `hid == (uint32_t)-1` 的行打印 `ERROR: wrong hap status` 后跳过。
+  文件按 gzip magic 透明解压（`gzopen` 行为）；打开失败打印
+  `ERROR: failed to open file '<path>'`。位图用
+  `1u32.wrapping_shl(hid-1 & 31)`，对越界 `hid` 复现 x86 的移位数掩码。
+- `update_poly_trio`（Overlaps.cpp:14646）：`DROP(5)` 保持不变；其余先置
+  `AMBIGU(0)`，位图为 0 的读段留 `AMBIGU`，否则按当前掩码位选
+  `FATHER(1)`/`MOTHER(2)`。即不在任何 bin 里的读段是 `AMBIGU`，而在其他
+  bin、不在当前 bin 的读段是 `MOTHER`。
+- `output_trio_unitig_graph` 的 `is_bench=0` 分支（`src/assembly/bp_graph.rs`）：
+  `ma_ug_gen_phase` → `adjust_utg_by_trio` → 可选的两个 `break_ug_contig` →
+  `ma_ug_seq` → `ma_ug_print`/`ma_ug_print_simple`/`ma_ug_print_bed`，文件名
+  前缀为 `hap1..hapN`，GFA 标签固定 `h1tg`（C++ 传 `FATHER`）。原实现只在
+  `is_bench` 路径下返回图，现在两条路径都可用；joint 路径仍传 `None` 前缀。
+- `output_poly_trio`（bp_graph.rs）按 C++ 顺序逐单倍型调用
+  `update_poly_trio(1<<i, ...)` 与上面的输出，`bubble_labels` 在循环间共享；
+  全部分支结束后统一打印 BED 不一致阈值。
+
+门禁（`-t1`，C++ 16.5 GB / Rust 7.5 GB 峰值，故参考运行须单独执行）：
+
+| 名单 | 产物 | 结果 |
+|---|---|---|
+| 2 bin，`--n-hap 2`（默认） | hap1/hap2 的 p_ctg gfa/noseq/bed + p_utg/r_utg 等 15 项 | 全部 identical；仅 `.ec.bin` 例外（既有 padding 豁免） |
+| 3 bin，`--n-hap 3` | hap1/hap2/hap3 同上共 18 项 | 全部 identical；仅 `.ec.bin` 例外 |
+
+名单由读名哈希确定性生成（`x_<1+hash%hapN>\t<read_name>`），C++ 与 Rust 使用
+同一文件。trio 剩余分支只剩 `--dual-scaf`。

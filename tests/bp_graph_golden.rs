@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rshifiasm::assembly::asg::Asg;
+use rshifiasm::assembly::asg::{Asg, AsgArc};
 use rshifiasm::assembly::bp_graph::{adjust_utg_by_primary, output_bp_graph};
 use rshifiasm::assembly::bubble::BubbleLabel;
 use rshifiasm::assembly::hap_cov::UTrans;
@@ -281,6 +281,7 @@ fn the_trio_stage_reproduces_the_reference_flags() {
     let mut copy_unitig_graph = copy_untig_graph(&unitig_graph);
     let mut bubble_labels = BubbleLabel::new(1, read_graph.sequences.len() as u32);
     let mut trio_flags = trio_labels.clone();
+    let mut new_rtg_edges: Vec<AsgArc> = Vec::new();
 
     let mut cov = adjust_utg_by_primary(
         &mut copy_unitig_graph,
@@ -296,7 +297,7 @@ fn the_trio_stage_reproduces_the_reference_flags() {
         0.9,
         options.maximum_hang_length,
         options.minimum_overlap_length,
-        &[],
+        &mut new_rtg_edges,
         Some(&mut bubble_labels),
         &mut options,
         &mut trio_flags,

@@ -3895,7 +3895,7 @@ pub fn rescue_bubble_by_chain(
         drop_ratio,
         max_hang,
         min_ovlp,
-        &new_rtg_edges,
+        &mut new_rtg_edges,
         Some(&mut *bubble_labels),
         options,
         trio_labels,

@@ -75,7 +75,7 @@ pub fn output_bp_graph(
 
     // The reference allocates `new_rtg_edges` empty here; only the polish
     // passes can append to it, and both output drivers pass `E = NULL`.
-    let new_rtg_edges: Vec<AsgArc> = Vec::new();
+    let mut new_rtg_edges: Vec<AsgArc> = Vec::new();
 
     let mut cov = adjust_utg_by_primary(
         &mut copy_unitig_graph,
@@ -91,7 +91,7 @@ pub fn output_bp_graph(
         0.9,
         options.maximum_hang_length,
         options.minimum_overlap_length,
-        &new_rtg_edges,
+        &mut new_rtg_edges,
         Some(bubble_labels),
         options,
         trio_flags,
@@ -181,7 +181,7 @@ pub fn adjust_utg_by_primary(
     drop_ratio: f32,
     max_hang: i32,
     min_ovlp: i32,
-    new_rtg_edges: &[AsgArc],
+    new_rtg_edges: &mut Vec<AsgArc>,
     mut bubble_labels: Option<&mut BubbleLabel>,
     options: &mut AssemblyOptions,
     trio_flags: &mut [u8],
@@ -263,6 +263,7 @@ pub fn adjust_utg_by_primary(
             sources,
             reverse_sources,
             read_to_unitig,
+            new_rtg_edges,
             options.purge_similarity_threshold,
             options.purge_overlap_length as u32,
             max_hang,
@@ -833,6 +834,7 @@ pub fn adjust_utg_by_trio(
             sources,
             reverse_sources,
             read_to_unitig,
+            new_rtg_edges,
             options.purge_similarity_threshold,
             options.purge_overlap_length as u32,
             max_hang,
@@ -881,10 +883,10 @@ pub fn adjust_utg_by_trio(
 /// `output_trio_unitig_graph`: builds and cleans one haplotype's phase unitig
 /// graph (`Overlaps.cpp` 21159).
 ///
-/// Only the benchmark path (`is_bench`) is ported: the graph is returned to
-/// the caller together with the re-linked edges collected during cleaning,
-/// and the GFA writing happens in [`output_hap_graph`]. The `break_ug_contig`
-/// and `update_dump_trio` branches are off in the default configuration.
+/// With `is_bench` the graph is returned to the caller together with the
+/// re-linked edges collected during cleaning, and the GFA writing happens in
+/// [`output_hap_graph`]. Otherwise the `p_ctg` GFA/BED triple is written
+/// under `file_prefix` (the polyploid `-5` path).
 #[allow(clippy::too_many_arguments)]
 pub fn output_trio_unitig_graph(
     read_graph: &mut Asg,
@@ -907,16 +909,9 @@ pub fn output_trio_unitig_graph(
     r_edges: &mut Vec<AsgArc>,
     options: &mut AssemblyOptions,
     trio_flags: &mut [u8],
-    _reads: &ReadStore,
+    reads: &ReadStore,
+    file_prefix: Option<&str>,
 ) -> Result<UnitigGraph, String> {
-    let _ = output_file_name;
-    if !is_bench {
-        return Err(
-            "output_trio_unitig_graph is only ported for the benchmark path (is_bench)"
-                .to_string(),
-        );
-    }
-
     let phase_threshold = phase_cut_threshold(options);
     let mut unitig_graph = ma_ug_gen_phase(read_graph, phase_threshold as u32, PHASE_SEP_RATE, trio_flags);
 
@@ -948,7 +943,7 @@ pub fn output_trio_unitig_graph(
         crate::assembly::break_contig::break_ug_contig(
             &mut unitig_graph,
             read_graph,
-            _reads,
+            reads,
             sources,
             read_to_unitig,
             &new_rtg_edges,
@@ -961,7 +956,7 @@ pub fn output_trio_unitig_graph(
         crate::assembly::break_contig::break_ug_contig(
             &mut unitig_graph,
             read_graph,
-            _reads,
+            reads,
             sources,
             read_to_unitig,
             &new_rtg_edges,
@@ -971,8 +966,104 @@ pub fn output_trio_unitig_graph(
         );
     }
 
-    // `is_bench`: hand the re-linked edges to the caller and return the graph.
-    r_edges.extend_from_slice(&new_rtg_edges);
+    if is_bench {
+        // Hand the re-linked edges to the caller and return the graph.
+        r_edges.extend_from_slice(&new_rtg_edges);
+        return Ok(unitig_graph);
+    }
+
+    let file_tag = file_prefix.unwrap_or(if flag == u32::from(FATHER) {
+        "hap1"
+    } else {
+        "hap2"
+    });
+    let gfa_tag = if flag == u32::from(FATHER) {
+        "h1tg"
+    } else {
+        "h2tg"
+    };
+
+    let gfa_name = format!("{}.{}.p_ctg.gfa", output_file_name, file_tag);
+    eprintln!("Writing {} to disk... ", gfa_name);
+    ma_ug_seq(
+        &mut unitig_graph,
+        read_graph,
+        coverage_cut,
+        sources,
+        &new_rtg_edges,
+        None,
+        max_hang,
+        min_ovlp,
+        true,
+        reads,
+        options.maximum_hang_rate,
+    );
+    let mut output = BufWriter::new(
+        File::create(&gfa_name).map_err(|error| format!("failed to create {}: {}", gfa_name, error))?,
+    );
+    ma_ug_print(
+        &unitig_graph,
+        read_graph,
+        Some(coverage_cut),
+        Some(sources),
+        Some(read_to_unitig),
+        gfa_tag,
+        &mut output,
+        reads,
+        trio_flags,
+    )
+    .map_err(|error| format!("failed to write {}: {}", gfa_name, error))?;
+    output
+        .flush()
+        .map_err(|error| format!("failed to write {}: {}", gfa_name, error))?;
+
+    let noseq_name = format!("{}.{}.p_ctg.noseq.gfa", output_file_name, file_tag);
+    let mut output = BufWriter::new(
+        File::create(&noseq_name)
+            .map_err(|error| format!("failed to create {}: {}", noseq_name, error))?,
+    );
+    ma_ug_print_simple(
+        &unitig_graph,
+        read_graph,
+        Some(coverage_cut),
+        Some(sources),
+        Some(read_to_unitig),
+        gfa_tag,
+        &mut output,
+        reads,
+        trio_flags,
+    )
+    .map_err(|error| format!("failed to write {}: {}", noseq_name, error))?;
+    output
+        .flush()
+        .map_err(|error| format!("failed to write {}: {}", noseq_name, error))?;
+
+    if options.bed_inconsistency_rate != 0 {
+        let bed_name = format!("{}.{}.p_ctg.lowQ.bed", output_file_name, file_tag);
+        let mut output = BufWriter::new(
+            File::create(&bed_name)
+                .map_err(|error| format!("failed to create {}: {}", bed_name, error))?,
+        );
+        ma_ug_print_bed(
+            &unitig_graph,
+            read_graph,
+            coverage_cut,
+            sources,
+            &new_rtg_edges,
+            options.maximum_hang_length,
+            options.minimum_overlap_length,
+            options.bed_inconsistency_rate as u32,
+            gfa_tag,
+            &mut output,
+            reads,
+            options.maximum_hang_rate,
+        )
+        .map_err(|error| format!("failed to write {}: {}", bed_name, error))?;
+        output
+            .flush()
+            .map_err(|error| format!("failed to write {}: {}", bed_name, error))?;
+    }
+
     Ok(unitig_graph)
 }
 
@@ -1503,6 +1594,7 @@ pub fn output_trio_graph_joint(
         options,
         trio_flags,
         reads,
+        None,
     )?;
     let mut hu1 = output_trio_unitig_graph(
         read_graph,
@@ -1526,6 +1618,7 @@ pub fn output_trio_graph_joint(
         options,
         trio_flags,
         reads,
+        None,
     )?;
 
     let mut ff = vec![0u8; read_graph.sequences.len()];
@@ -1620,6 +1713,74 @@ pub fn output_trio_graph_joint(
         options,
     )?;
 
+    Ok(())
+}
+
+/// `output_poly_trio` (`Overlaps.cpp` 14682): the `-5` polyploid driver.
+///
+/// Reads the external haplotype list once and, for every haplotype, rewrites
+/// the read labels from its bitmask and emits a full `hapN.p_ctg` triple.
+#[allow(clippy::too_many_arguments)]
+pub fn output_poly_trio(
+    read_graph: &mut Asg,
+    coverage_cut: &mut [CoverageCut],
+    output_file_name: &str,
+    sources: &[PafList],
+    reverse_sources: &[PafList],
+    tips_len: i64,
+    tip_drop_ratio: f32,
+    stops_threshold: u32,
+    read_to_unitig: &mut ReadToUnitig,
+    chimeric_rate: f32,
+    drop_ratio: f32,
+    max_hang: i32,
+    min_ovlp: i32,
+    gap_fuzz: i32,
+    bubble_labels: &mut BubbleLabel,
+    options: &mut AssemblyOptions,
+    trio_flags: &mut [u8],
+    reads: &ReadStore,
+    hap_n: usize,
+) -> Result<(), String> {
+    let path = options
+        .trio_polyploid_file_name
+        .as_deref()
+        .ok_or_else(|| "output_poly_trio requires -5".to_string())?;
+    let hap_s = crate::assembly::trio_bin::ha_polybin_list(path, reads)?;
+
+    for hap in 0..hap_n {
+        crate::assembly::trio_bin::update_poly_trio(
+            1u32.wrapping_shl(hap as u32),
+            &hap_s,
+            trio_flags,
+        );
+        let prefix = format!("hap{}", hap + 1);
+        let mut discarded = Vec::new();
+        output_trio_unitig_graph(
+            read_graph,
+            coverage_cut,
+            output_file_name,
+            u32::from(FATHER),
+            sources,
+            reverse_sources,
+            tips_len,
+            tip_drop_ratio,
+            stops_threshold,
+            read_to_unitig,
+            chimeric_rate,
+            drop_ratio,
+            max_hang,
+            min_ovlp,
+            gap_fuzz,
+            false,
+            bubble_labels,
+            &mut discarded,
+            options,
+            trio_flags,
+            reads,
+            Some(&prefix),
+        )?;
+    }
     Ok(())
 }
 
@@ -1756,7 +1917,7 @@ pub fn output_contig_graph_primary(
     trio_flags: &mut [u8],
 ) -> Result<(), String> {
     let mut unitig_graph = ma_ug_gen_primary(read_graph, PRIMARY_LABEL);
-    let new_rtg_edges: Vec<AsgArc> = Vec::new();
+    let mut new_rtg_edges: Vec<AsgArc> = Vec::new();
 
     adjust_utg_by_primary(
         &mut unitig_graph,
@@ -1772,7 +1933,7 @@ pub fn output_contig_graph_primary(
         0.9,
         options.maximum_hang_length,
         options.minimum_overlap_length,
-        &new_rtg_edges,
+        &mut new_rtg_edges,
         Some(bubble_labels),
         options,
         trio_flags,

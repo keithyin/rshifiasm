@@ -1441,7 +1441,7 @@ fn get_chain_score(
 /// weight, `index_beg`, `index_end` and `score` fields; the four position
 /// outputs carry the base-coordinate interval from `classify_hap_overlap`.
 #[allow(clippy::too_many_arguments)]
-fn determine_hap_overlap_type_advance(
+pub(crate) fn determine_hap_overlap_type_advance(
     hap_can: &mut HapCandidate,
     x_reads: &MaUtg,
     y_reads: &MaUtg,

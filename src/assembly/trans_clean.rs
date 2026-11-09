@@ -14,9 +14,9 @@
 //! `FATHER`/`MOTHER` trio flags from the coverage of the partner unitigs.
 
 use crate::assembly::asg::{Asg, MaUtg};
-use crate::assembly::hap_cov::{get_offset_adjust, N_HET, UTrans};
+use crate::assembly::hap_cov::{get_offset_adjust, N_HET, UTrans, RC_0, RC_1, RC_2, RC_3};
 use crate::assembly::purge_dups::SET_TRIO;
-use crate::assembly::unitig::{AMBIGU, FATHER, MOTHER};
+use crate::assembly::unitig::{UnitigGraph, AMBIGU, FATHER, MOTHER};
 use crate::container::ksort::{radix_sort_by_key, radix_sort_by_key_32};
 
 /// `u_trans_key`: the sort key `(qn << 32) | (tn << 1) | rev`.
@@ -740,4 +740,761 @@ pub fn set_trio_flag_by_cov(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `clean_u_trans_t_idx_filter_adv` (`Overlaps.cpp` 15499)
+// ---------------------------------------------------------------------------
+
+/// `trans_ovlp_connect1`: whether the transition agrees with a direct unitig
+/// arc within the reference's six-percent tolerance.
+fn trans_ovlp_connect1(p: &UTrans, unitig_graph: &UnitigGraph) -> u32 {
+    let mut v = p.query_identifier << 1;
+    let mut w = (p.target_identifier << 1) | u32::from(p.reverse);
+
+    let mut found = false;
+    let mut dg = u32::MAX;
+    for _pass in 0..2 {
+        let (off, count) = unitig_graph.graph.arc_range(v);
+        found = false;
+        for i in 0..count {
+            let arc = unitig_graph.graph.arcs[off + i];
+            if arc.deleted || arc.v != w {
+                continue;
+            }
+            dg = arc.overlap;
+            found = true;
+            break;
+        }
+        if found {
+            let mut da = p.query_end - p.query_start;
+            let mut dif = if dg > da { dg - da } else { da - dg };
+            let mut mm = dg.max(da);
+            mm = (f64::from(mm) * 0.06) as u32;
+            if mm < 8 {
+                mm = 8;
+            }
+            if dif <= mm {
+                return 0;
+            }
+
+            da = p.target_end - p.target_start;
+            dif = if dg > da { dg - da } else { da - dg };
+            mm = dg.max(da);
+            mm = (f64::from(mm) * 0.06) as u32;
+            if mm < 8 {
+                mm = 8;
+            }
+            if dif <= mm {
+                return 0;
+            }
+        }
+        v ^= 1;
+        w ^= 1;
+    }
+
+    1
+}
+
+/// `ovlp_rocc`: whether the transition interval is covered by enough whole
+/// reads on both unitigs.
+fn ovlp_rocc(
+    p: &UTrans,
+    unitig_graph: &UnitigGraph,
+    read_graph: &Asg,
+    cov_rate: f64,
+    cov_cutoff: u32,
+) -> u32 {
+    for (unitig_id, start, end) in [
+        (p.query_identifier, p.query_start, p.query_end),
+        (p.target_identifier, p.target_start, p.target_end),
+    ] {
+        let unitig = &unitig_graph.unitigs[unitig_id as usize];
+        if f64::from(end - start) >= f64::from(unitig.length) * cov_rate {
+            return 1;
+        }
+        let mut occ = 0u32;
+        let mut offset = 0u32;
+        for &packed in &unitig.reads {
+            if occ >= cov_cutoff {
+                break;
+            }
+            let read_start = offset;
+            let read_end =
+                offset + read_graph.sequences[(packed >> 33) as usize].length;
+            if read_start >= end {
+                break;
+            }
+            if start <= read_start && end >= read_end {
+                occ += 1;
+            }
+            offset += packed as u32;
+        }
+        if occ >= cov_cutoff {
+            return 1;
+        }
+    }
+    0
+}
+
+/// `infer_utrans_ovlp_len`.
+fn infer_utrans_ovlp_len(li: &UTrans, lj: &UTrans, unitig_graph: &UnitigGraph) -> i64 {
+    let i_n = i64::from(unitig_graph.unitigs[li.target_identifier as usize].length);
+    let mut i_s = i64::from(li.target_start);
+    let mut i_e = i64::from(li.target_end);
+    let i_rev = li.reverse;
+    let i_qs = i64::from(li.query_start);
+    let i_qe = i64::from(li.query_end);
+
+    let j_n = i64::from(unitig_graph.unitigs[lj.target_identifier as usize].length);
+    let mut j_s = i64::from(lj.target_start);
+    let mut j_e = i64::from(lj.target_end);
+    let j_rev = lj.reverse;
+    let j_qs = i64::from(lj.query_start);
+    let j_qe = i64::from(lj.query_end);
+
+    let max_s = i_qs.max(j_qs);
+    let min_e = i_qe.min(j_qe);
+    if min_e <= max_s {
+        return 0;
+    }
+    let mut s_shift = i64::from(get_offset_adjust(
+        (max_s - i_qs) as u32,
+        (i_qe - i_qs) as u32,
+        (i_e - i_s) as u32,
+    ));
+    let mut e_shift = i64::from(get_offset_adjust(
+        (i_qe - min_e) as u32,
+        (i_qe - i_qs) as u32,
+        (i_e - i_s) as u32,
+    ));
+    if i_rev {
+        std::mem::swap(&mut s_shift, &mut e_shift);
+    }
+    i_s += s_shift;
+    i_e -= e_shift;
+
+    s_shift = i64::from(get_offset_adjust(
+        (max_s - j_qs) as u32,
+        (j_qe - j_qs) as u32,
+        (j_e - j_s) as u32,
+    ));
+    e_shift = i64::from(get_offset_adjust(
+        (j_qe - min_e) as u32,
+        (j_qe - j_qs) as u32,
+        (j_e - j_s) as u32,
+    ));
+    if j_rev {
+        std::mem::swap(&mut s_shift, &mut e_shift);
+    }
+    j_s += s_shift;
+    j_e -= e_shift;
+
+    if i_rev {
+        let ts = i_n - i_e;
+        let te = i_n - i_s;
+        i_s = ts;
+        i_e = te;
+    }
+    if j_rev {
+        let ts = j_n - j_e;
+        let te = j_n - j_s;
+        j_s = ts;
+        j_e = te;
+    }
+
+    if i_s <= j_s {
+        j_s -= i_s;
+        i_s = 0;
+    } else {
+        i_s -= j_s;
+        j_s = 0;
+    }
+
+    let i_r = i_n - i_e;
+    let j_r = j_n - j_e;
+    if i_r <= j_r {
+        i_e = i_n;
+        j_e += i_r;
+    } else {
+        j_e = j_n;
+        i_e += j_r;
+    }
+    (i_e - i_s).max(j_e - j_s)
+}
+
+/// `is_connect_arc`: whether `li` (the suffix) is explained by the direct
+/// unitig arc to `lj`.
+fn is_connect_arc(li: &UTrans, lj: &UTrans, unitig_graph: &UnitigGraph, diff_ec_ul: f64) -> u32 {
+    if li.query_start >= lj.query_start && li.query_end >= lj.query_end {
+        let dq = infer_utrans_ovlp_len(li, lj, unitig_graph);
+        let v = (li.target_identifier << 1) | u32::from(li.reverse);
+        let w = (lj.target_identifier << 1) | u32::from(lj.reverse);
+        let mut dt = -1i64;
+        let (off, count) = unitig_graph.graph.arc_range(v);
+        for i in 0..count {
+            let arc = unitig_graph.graph.arcs[off + i];
+            if arc.deleted || arc.v != w {
+                continue;
+            }
+            dt = i64::from(arc.overlap);
+            break;
+        }
+        if dt < 0 {
+            return 0;
+        }
+        let dif = (dq - dt).abs();
+        let mm = dq.max(dt);
+        let mut mm = (mm as f64 * diff_ec_ul) as i64;
+        if mm < 8 {
+            mm = 8;
+        }
+        if dif <= mm {
+            return 1;
+        }
+    }
+    0
+}
+
+/// `test_arc_rm`: whether the transition `a[a_k]` can be dropped because the
+/// remaining transitions of the same query already cover it.
+fn test_arc_rm(
+    a: &[UTrans],
+    a_k: usize,
+    length: u32,
+    srt: &mut Vec<u64>,
+    len_cut: u32,
+    rate_cut: f64,
+) -> bool {
+    srt.clear();
+    for (z, entry) in a.iter().enumerate() {
+        if z == a_k {
+            continue;
+        }
+        if entry.occurrence == u32::MAX {
+            continue;
+        }
+        srt.push(((u64::from(entry.query_start)) << 32) | u64::from(entry.query_end));
+    }
+    radix_sort_by_key(srt, &|value: &u64| *value);
+    let mut z = 0usize;
+    for i in 0..srt.len() {
+        let os = (srt[i] >> 32) as u32;
+        let oe = srt[i] as u32;
+        if z > 0 && os <= srt[z - 1] as u32 {
+            if oe > srt[z - 1] as u32 {
+                let hi = srt[z - 1] >> 32;
+                srt[z - 1] = (hi << 32) | u64::from(oe);
+            }
+        } else {
+            srt[z] = srt[i];
+            z += 1;
+        }
+    }
+    srt.truncate(z);
+
+    let mut l = a[a_k].query_end - a[a_k].query_start;
+    for &interval in srt.iter() {
+        if l == 0 {
+            break;
+        }
+        let os = a[a_k].query_start.max((interval >> 32) as u32);
+        let oe = a[a_k].query_end.min(interval as u32);
+        let ovq = if oe > os { oe - os } else { 0 };
+        debug_assert!(l >= ovq);
+        l -= ovq;
+    }
+    if f64::from(l) > f64::from(len_cut) && f64::from(l) > f64::from(length) * rate_cut {
+        return false;
+    }
+    true
+}
+
+/// `deep_clean_u_trans`: retracts exactly one direction of an already-cut
+/// pair when the rest of its query still covers the target.
+fn deep_clean_u_trans(
+    transitions: &mut [UTrans],
+    index: &[u64],
+    mz_idx: usize,
+    unitig_graph: &UnitigGraph,
+    srt: &mut Vec<u64>,
+) {
+    let mz = transitions[mz_idx];
+    if mz.query_identifier > mz.target_identifier {
+        return;
+    }
+    let (ro, rn) = u_trans_span(index, mz.target_identifier);
+    let mut r_k = None;
+    for i in 0..rn {
+        if transitions[ro + i].target_identifier == mz.query_identifier {
+            r_k = Some(i);
+            break;
+        }
+    }
+    let Some(r_k) = r_k else {
+        return;
+    };
+    let cz = transitions[ro + r_k];
+    if mz.occurrence == u32::MAX && cz.occurrence == u32::MAX {
+        return;
+    }
+    if mz.occurrence != u32::MAX && cz.occurrence != u32::MAX {
+        return;
+    }
+
+    let target_len = unitig_graph.unitigs[mz.target_identifier as usize].length;
+    let can_drop_target = test_arc_rm(
+        &transitions[ro..ro + rn],
+        r_k,
+        target_len,
+        srt,
+        3_000_000,
+        0.5,
+    );
+    if !can_drop_target {
+        transitions[mz_idx].occurrence = 0;
+        transitions[ro + r_k].occurrence = 0;
+        return;
+    }
+    let (qo, qn) = u_trans_span(index, mz.query_identifier);
+    let mut k = None;
+    for i in 0..qn {
+        if transitions[qo + i].target_identifier == mz.target_identifier {
+            k = Some(i);
+            break;
+        }
+    }
+    let Some(k) = k else {
+        return;
+    };
+    let query_len = unitig_graph.unitigs[mz.query_identifier as usize].length;
+    let can_drop_query =
+        test_arc_rm(&transitions[qo..qo + qn], k, query_len, srt, 3_000_000, 0.5);
+    if !can_drop_query {
+        transitions[mz_idx].occurrence = 0;
+        transitions[ro + r_k].occurrence = 0;
+        return;
+    }
+    transitions[mz_idx].occurrence = u32::MAX;
+    transitions[ro + r_k].occurrence = u32::MAX;
+}
+
+/// `worker_for_trans_clean_re`: one representative transition per unitig
+/// pair, validated against the graph.
+fn worker_for_trans_clean_re(
+    transitions: &[UTrans],
+    index: &[u64],
+    id: u32,
+    res: &mut Vec<UTrans>,
+    unitig_graph: &UnitigGraph,
+    read_graph: &Asg,
+) {
+    let (off, n) = u_trans_span(index, id);
+    let a = &transitions[off..off + n];
+    let mut l = 0usize;
+    for k in 1..=n {
+        if k == n || a[l].target_identifier != a[k].target_identifier {
+            if k > l {
+                // `get_u_trans_spec(ta, a[l].tn, a[l].qn, &r_a, &r_n)`: only
+                // the partner's entries that point back at `id`.
+                let (ro, rn) = u_trans_span(index, a[l].target_identifier);
+                let mut r_beg = ro;
+                let mut r_n = 0usize;
+                let mut st = 0usize;
+                for i in 1..=rn {
+                    if i == rn
+                        || transitions[ro + i].target_identifier
+                            != transitions[ro + st].target_identifier
+                    {
+                        if transitions[ro + st].target_identifier == a[l].query_identifier {
+                            r_beg = ro + st;
+                            r_n = i - st;
+                            break;
+                        }
+                        st = i;
+                    }
+                }
+                let r_a = &transitions[r_beg..r_beg + r_n];
+                if r_n > 0 && id > a[l].target_identifier {
+                    l = k;
+                    continue;
+                }
+
+                let mut mz: Option<UTrans> = None;
+                let mut sz: Option<UTrans> = None;
+                let mut consider = |cz: &UTrans, reverse_side: bool, mz: &mut Option<UTrans>| {
+                    if cz.flag == RC_3 && sz.map_or(true, |s| s.network_weight < cz.network_weight) {
+                        sz = Some(*cz);
+                    }
+                    if let Some(best) = *mz {
+                        if best.flag == RC_0 && cz.flag != RC_0 {
+                            return;
+                        }
+                        if best.flag == RC_1 && (cz.flag == RC_2 || cz.flag == RC_3) {
+                            return;
+                        }
+                    }
+                    let better = mz.is_none()
+                        || (cz.flag < mz.unwrap().flag
+                            && (cz.flag == RC_0 || cz.flag == RC_1))
+                        || mz.unwrap().network_weight < cz.network_weight
+                        || (mz.unwrap().network_weight == cz.network_weight
+                            && if reverse_side {
+                                (mz.unwrap().query_end - mz.unwrap().query_start)
+                                    < (cz.target_end - cz.target_start)
+                            } else {
+                                (mz.unwrap().query_end - mz.unwrap().query_start)
+                                    < (cz.query_end - cz.query_start)
+                            });
+                    if better {
+                        *mz = Some(*cz);
+                    }
+                };
+                for cz in &a[l..k] {
+                    consider(cz, false, &mut mz);
+                }
+                for cz in r_a {
+                    consider(cz, true, &mut mz);
+                }
+
+                if let Some(mut mz) = mz {
+                    if mz.query_identifier != mz.target_identifier {
+                        if let Some(sz) = sz {
+                            if sz.reverse == mz.reverse {
+                                if mz.query_identifier != sz.query_identifier
+                                    || mz.target_identifier != sz.target_identifier
+                                {
+                                    // Re-orient the copy of `mz` to the other
+                                    // direction before comparing with `sz`.
+                                    let qn = mz.query_identifier;
+                                    let qs = mz.query_start;
+                                    let qe = mz.query_end;
+                                    mz.query_identifier = mz.target_identifier;
+                                    mz.query_start = mz.target_start;
+                                    mz.query_end = mz.target_end;
+                                    mz.target_identifier = qn;
+                                    mz.target_start = qs;
+                                    mz.target_end = qe;
+                                }
+                                if mz.query_identifier == sz.query_identifier
+                                    && mz.target_identifier == sz.target_identifier
+                                {
+                                    let os = mz.query_start.max(sz.query_start);
+                                    let oe = mz.query_end.min(sz.query_end);
+                                    let ovq = if oe > os { oe - os } else { 0 };
+                                    let os = mz.target_start.max(sz.target_start);
+                                    let oe = mz.target_end.min(sz.target_end);
+                                    let ovt = if oe > os { oe - os } else { 0 };
+                                    if ovq > 0
+                                        && f64::from(ovq)
+                                            > f64::from(mz.query_end - mz.query_start) * 0.8
+                                        && f64::from(ovq)
+                                            > f64::from(sz.query_end - sz.query_start) * 0.8
+                                        && ovt > 0
+                                        && f64::from(ovt)
+                                            > f64::from(mz.target_end - mz.target_start) * 0.8
+                                        && f64::from(ovt)
+                                            > f64::from(sz.target_end - sz.target_start) * 0.8
+                                    {
+                                        let flag = mz.flag;
+                                        mz = sz;
+                                        mz.flag = flag;
+                                    }
+                                }
+                            }
+                        }
+                        if mz.query_identifier != id {
+                            let qn = mz.query_identifier;
+                            let tn = mz.target_identifier;
+                            let qs = mz.query_start;
+                            let qe = mz.query_end;
+                            let ts = mz.target_start;
+                            let te = mz.target_end;
+                            mz.query_identifier = tn;
+                            mz.query_start = ts;
+                            mz.query_end = te;
+                            mz.target_identifier = qn;
+                            mz.target_start = qs;
+                            mz.target_end = qe;
+                        }
+
+                        res.push(mz);
+                        if mz.network_weight >= 0.0
+                            && (trans_ovlp_connect1(&mz, unitig_graph) == 0
+                                || ovlp_rocc(&mz, unitig_graph, read_graph, 0.8, 3) == 0)
+                        {
+                            res.pop();
+                        }
+                    }
+                }
+            }
+            l = k;
+        }
+    }
+}
+
+/// `worker_for_trans_sec_cut`, first phase: removes the transitions whose
+/// query interval is already covered by stronger ones.
+fn trans_sec_cut_pass(
+    transitions: &mut [UTrans],
+    index: &[u64],
+    id: u32,
+    unitig_graph: &UnitigGraph,
+    sec_rate: f64,
+    sc_sec_rate: f64,
+    srt: &mut Vec<u64>,
+) {
+    let (off, n) = u_trans_span(index, id);
+    if n == 0 {
+        return;
+    }
+    let mut a: Vec<UTrans> = transitions[off..off + n].to_vec();
+    let mut r_n = 0usize;
+    for k in 0..n {
+        if a[k].flag == RC_0 || a[k].flag == RC_1 {
+            a.swap(k, r_n);
+            r_n += 1;
+        }
+    }
+    if r_n >= n {
+        transitions[off..off + n].copy_from_slice(&a);
+        return;
+    }
+    if n - r_n > 1 {
+        a[r_n..].sort_by(|x, y| {
+            y.network_weight
+                .partial_cmp(&x.network_weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    srt.clear();
+    for k in 0..n {
+        srt.push(((u64::from(a[k].query_start)) << 32) | k as u64);
+    }
+    radix_sort_by_key(srt, &|value: &u64| *value);
+    let mut ss = vec![0usize; n];
+    let mut hs = vec![0usize; n];
+    for k in 0..n {
+        ss[k] = srt[k] as u32 as usize;
+        hs[ss[k]] = k;
+    }
+
+    let mut bu = vec![0u64; n];
+    let mut wu = vec![0u64; n];
+    for k in r_n..n {
+        let cz = a[k];
+        let len = (f64::from(cz.query_end - cz.query_start) * sec_rate) as u32;
+        let mut m = 0usize;
+        let mut wm = 0usize;
+        let mut l = 0u32;
+        let mut wl = 0u32;
+        for z in 0..n {
+            if z == hs[k] {
+                continue;
+            }
+            if ss[z] > k {
+                continue;
+            }
+            let mz = a[ss[z]];
+            if mz.query_start >= cz.query_end {
+                break;
+            }
+            if mz.occurrence == u32::MAX {
+                continue;
+            }
+            if mz.flag != RC_0
+                && mz.flag != RC_1
+                && cz.network_weight > mz.network_weight * sc_sec_rate
+            {
+                continue;
+            }
+            let os = cz.query_start.max(mz.query_start);
+            let oe = cz.query_end.min(mz.query_end);
+            let ovq = if oe > os { oe - os } else { 0 };
+            if ovq == 0 {
+                continue;
+            }
+            if is_connect_arc(&cz, &mz, unitig_graph, 0.04) != 0
+                || is_connect_arc(&mz, &cz, unitig_graph, 0.04) != 0
+            {
+                continue;
+            }
+
+            if m > 0 && (bu[m - 1] as u32) >= os {
+                if oe > bu[m - 1] as u32 {
+                    l += oe - (bu[m - 1] as u32);
+                    bu[m - 1] += u64::from(oe - (bu[m - 1] as u32));
+                }
+            } else {
+                l += oe - os;
+                bu[m] = (u64::from(os) << 32) | u64::from(oe);
+                m += 1;
+            }
+
+            if wm > 0 && (wu[wm - 1] as u32) >= mz.query_start {
+                if mz.query_end > wu[wm - 1] as u32 {
+                    wl += mz.query_end - (wu[wm - 1] as u32);
+                    wu[wm - 1] += u64::from(mz.query_end - (wu[wm - 1] as u32));
+                }
+            } else {
+                wl += mz.query_end - mz.query_start;
+                wu[wm] = (u64::from(mz.query_start) << 32) | u64::from(mz.query_end);
+                wm += 1;
+            }
+
+            if l > 0 && (l >= len || f64::from(l) >= f64::from(wl) * sec_rate) {
+                a[k].occurrence = u32::MAX;
+                break;
+            }
+        }
+    }
+    transitions[off..off + n].copy_from_slice(&a);
+}
+
+/// `gen_u_trans_cluster`: the connected components of the transition graph
+/// and their spans.
+fn gen_u_trans_cluster(transitions: &[UTrans], index: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    let n = index.len();
+    let mut z = vec![u64::MAX; n];
+    let mut stack: Vec<u32> = Vec::new();
+    let mut cn = 0usize;
+    for i in 0..n as u32 {
+        if z[i as usize] != u64::MAX {
+            continue;
+        }
+        stack.clear();
+        stack.push(i);
+        let mut m = 0usize;
+        while let Some(v) = stack.pop() {
+            if z[v as usize] != u64::MAX {
+                continue;
+            }
+            z[v as usize] = ((i as u64) << 32) | u64::from(v);
+            m += 1;
+            let (off, count) = u_trans_span(index, v);
+            for k in 0..count {
+                let t = transitions[off + k].target_identifier;
+                if z[t as usize] == u64::MAX {
+                    stack.push(t);
+                }
+            }
+        }
+        if m > 1 {
+            cn += 1;
+        }
+    }
+    radix_sort_by_key(&mut z, &|value: &u64| *value);
+    let mut idx = Vec::new();
+    let mut l = 0usize;
+    for k in 1..=n {
+        if k == n || (z[k] >> 32) != (z[l] >> 32) {
+            if k - l > 1 {
+                idx.push(((l as u64) << 32) | k as u64);
+            }
+            l = k;
+        }
+    }
+    debug_assert_eq!(idx.len(), cn);
+    (z, idx)
+}
+
+/// `clean_u_trans_t_idx_filter_adv`: the transition filter used by the
+/// trio-dual stage.
+///
+/// The reference leaves the table buffer longer than the logical length (the
+/// compaction only moves the survivors forward) and keeps the stale index
+/// entries of the queries that lost every transition; later span lookups read
+/// those leftovers. The port returns the full buffer and the logical length
+/// so the same reads are reproduced.
+pub fn clean_u_trans_t_idx_filter_adv(
+    transitions: &mut Vec<UTrans>,
+    index: &mut Vec<u64>,
+    unitig_graph: &UnitigGraph,
+    read_graph: &Asg,
+    sc_sec_rate: f64,
+    uniform_only: bool,
+) -> usize {
+    let n_seq = unitig_graph.graph.sequences.len() as u32;
+    kt_u_trans_t_idx(transitions, index, n_seq);
+
+    let mut res: Vec<UTrans> = Vec::new();
+    for i in 0..n_seq {
+        worker_for_trans_clean_re(transitions, index, i, &mut res, unitig_graph, read_graph);
+    }
+
+    let mut rebuilt: Vec<UTrans> = Vec::with_capacity(res.len() * 2);
+    for entry in &res {
+        if entry.query_identifier == entry.target_identifier {
+            continue;
+        }
+        let mut forward = *entry;
+        forward.occurrence = 0;
+        if forward.flag == RC_3 {
+            forward.flag = RC_2;
+        }
+        rebuilt.push(forward);
+        let mut reverse = forward;
+        reverse.query_identifier = forward.target_identifier;
+        reverse.query_start = forward.target_start;
+        reverse.query_end = forward.target_end;
+        reverse.target_identifier = forward.query_identifier;
+        reverse.target_start = forward.query_start;
+        reverse.target_end = forward.query_end;
+        rebuilt.push(reverse);
+    }
+    *transitions = rebuilt;
+    kt_u_trans_t_idx(transitions, index, n_seq);
+    if uniform_only {
+        return transitions.len();
+    }
+
+    let mut srt: Vec<u64> = Vec::new();
+    for i in 0..n_seq {
+        trans_sec_cut_pass(
+            transitions,
+            index,
+            i,
+            unitig_graph,
+            0.5,
+            sc_sec_rate,
+            &mut srt,
+        );
+    }
+
+    let (cluster_z, cluster_idx) = gen_u_trans_cluster(transitions, index);
+    for id in 0..cluster_idx.len() as u32 {
+        let span = cluster_idx[id as usize];
+        let start = (span >> 32) as usize;
+        let end = span as u32 as usize;
+        for z in start..end {
+            let node = cluster_z[z] as u32;
+            let (off, count) = u_trans_span(index, node);
+            for k in 0..count {
+                deep_clean_u_trans(transitions, index, off + k, unitig_graph, &mut srt);
+            }
+        }
+    }
+
+    let mut st = 0usize;
+    for k in 0..transitions.len() {
+        if transitions[k].occurrence == u32::MAX {
+            continue;
+        }
+        transitions[st] = transitions[k];
+        st += 1;
+    }
+    let logical_n = st;
+
+    let mut st = 0usize;
+    for i in 1..=logical_n {
+        if i == logical_n
+            || transitions[i].query_identifier != transitions[st].query_identifier
+        {
+            index[transitions[st].query_identifier as usize] =
+                ((st as u64) << 32) | ((i - st) as u64);
+            st = i;
+        }
+    }
+    logical_n
 }

@@ -23,6 +23,10 @@ use crate::correction::ec_driver::PafList;
 pub const RC_0: u8 = 0;
 /// `RC_1`: a transition collected by `collect_trans_cov`.
 pub const RC_1: u8 = 1;
+/// `RC_2`: a read-level transition (`clean_u_trans_t_idx_filter_adv`).
+pub const RC_2: u8 = 2;
+/// `RC_3`: a base-level transition (`trans_base_infer`).
+pub const RC_3: u8 = 3;
 /// `CHAIN_MATCH`: the per-base weight used when the score is the `-1024`
 /// sentinel.
 pub const CHAIN_MATCH: f64 = 1.0;
