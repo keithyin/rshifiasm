@@ -241,10 +241,51 @@ fn final_overlap_for_read(
         &mut extz,
     );
 
+    // `if(is_ont && is_uncorrected_read(..., 1600)) olist.length = 0`: ONT
+    // reads with an uncovered stretch of at least 1600 bp keep no overlaps.
+    if options.ont_mode != 0
+        && is_uncorrected_read(&overlaps, query_length as i64, 1600)
+    {
+        overlaps.clear();
+    }
+
     let (forward_hits, reverse_hits, counters) = push_final_overlaps(&overlaps, reads);
     state.forward[read_identifier].hits = forward_hits;
     state.reverse[read_identifier].hits = reverse_hits;
     counters
+}
+
+/// `is_uncorrected_read`: whether the chain runs leave an uncovered stretch
+/// of at least `minimum_length` inside the read.
+fn is_uncorrected_read(overlaps: &[OverlapRegion], read_length: i64, minimum_length: i64) -> bool {
+    let mut events: Vec<u64> = Vec::with_capacity(overlaps.len() * 2);
+    for overlap in overlaps {
+        events.push(u64::from(overlap.x_position_start) << 1);
+        events.push((u64::from(overlap.x_position_end) + 1) << 1 | 1);
+    }
+    radix_sort_u64(&mut events);
+
+    let mut depth = 0i64;
+    let mut start = 0i64;
+    let mut end = 0i64;
+    for &event in &events {
+        let previous = depth;
+        if event & 1 != 0 {
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+        end = (event >> 1) as i64;
+        if end > start && previous == 0 && end - start >= minimum_length {
+            return true;
+        }
+        start = end;
+    }
+    end = read_length;
+    if end > start && depth == 0 && (end - start >= minimum_length || end - start >= read_length) {
+        return true;
+    }
+    false
 }
 
 /// `h_ec_lchain_fast_new`: reconciles the chains against the overlaps the last
@@ -371,6 +412,7 @@ fn refine_chained_overlaps(
                 // as a standalone exact region.
                 if is_match == 1 && stored.exact_region {
                     stored_forward[stored_index].exact_region = false;
+                    stored_forward[stored_index].exact_region_byte = 0;
                 }
 
                 // `exact_ec_check` against the target substring the chain
@@ -540,7 +582,7 @@ fn choose_best_region(overlaps: &[OverlapRegion], group_start: usize, group_end:
 /// `push_ff_ovlp`: copies the surviving regions into the two stored overlap
 /// lists, mirroring the target coordinates of reverse hits and updating the
 /// per-thread counters.
-fn push_final_overlaps(
+pub(crate) fn push_final_overlaps(
     overlaps: &[OverlapRegion],
     reads: &ReadStore,
 ) -> (Vec<PafHit>, Vec<PafHit>, FinalOverlapCounters) {
@@ -616,9 +658,9 @@ fn final_hit(region: &OverlapRegion, reads: &ReadStore) -> PafHit {
         block_length,
         reverse,
         without_large_indel: region.without_large_indel != 0,
-        // `el` is a byte in the reference; the surviving regions only ever
-        // carry 0 or 1.
-        exact_region: region.shared_seed as u8 == 1,
+        // `el` is the region's `shared_seed` byte.
+        exact_region: region.shared_seed != 0,
+        exact_region_byte: region.shared_seed as u8,
         deleted: false,
     }
 }

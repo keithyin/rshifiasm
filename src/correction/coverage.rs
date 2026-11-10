@@ -28,7 +28,7 @@ pub struct CoverageSummary {
 /// reference so that each window only rescans the overlaps that can still
 /// reach it. The returned flag is `1` when some overlap touched the window,
 /// `0` when none did and `-2` when the cursor ran past the last overlap.
-fn available_fully_covered_interval(
+pub fn available_fully_covered_interval(
     window_start: i64,
     window_end: i64,
     overlaps: &[OverlapRegion],

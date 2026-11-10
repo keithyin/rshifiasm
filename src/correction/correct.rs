@@ -62,6 +62,9 @@ pub fn correct_overlap(
     query_sequence: &[u8],
     maximum_overlap_divergence: f64,
     final_error_rate: f64,
+    is_consensus: bool,
+    informative_coverage: i64,
+    single_haplotype_coverage: i64,
 ) -> CorrectionOutcome {
     // `ha_get_new_candidates` rebuilds the overlap list from scratch, so each
     // overlap starts without windows.
@@ -88,17 +91,37 @@ pub fn correct_overlap(
         final_error_rate,
     );
 
-    // `generate_consensus` is only called for the correction rounds that
-    // produce a sequence; the reference guards it with `is_consensus`.
-    let consensus = generate_consensus(
-        query_sequence,
+    // `partition_overlaps_advance`: the legacy window-level phasing that
+    // labels the overlaps before the consensus pass.
+    let mut haplotype = crate::correction::haplotype_evidence::HaplotypeEvidenceAlloc::new();
+    crate::correction::partition::partition_overlaps_advance(
         overlaps,
         reads,
+        query_sequence,
+        &mut haplotype,
         maximum_overlap_divergence,
-        &mut crate::correction::poa::PoaGraph::new(),
-        &mut crate::correction::dag_con::DagCon::default(),
-        None,
+        informative_coverage,
+        single_haplotype_coverage,
     );
+    // `generate_consensus` is only called for the correction rounds that
+    // produce a sequence; the reference guards it with `is_consensus`.
+    let consensus = if is_consensus {
+        generate_consensus(
+            query_sequence,
+            overlaps,
+            reads,
+            maximum_overlap_divergence,
+            &mut crate::correction::poa::PoaGraph::new(),
+            &mut crate::correction::dag_con::DagCon::default(),
+            None,
+        )
+    } else {
+        crate::correction::window_consensus::ConsensusResult {
+            sequence: Vec::new(),
+            corrected_base: 0,
+            total_available_overlaps: 0,
+        }
+    };
 
     let coverage: CoverageSummary =
         check_if_fully_covered(query_sequence.len() as i64, overlaps, WINDOW_LENGTH, maximum_overlap_divergence);
@@ -181,7 +204,7 @@ mod tests {
     fn a_read_without_overlaps_is_copied_verbatim() {
         let reads = reads();
         let query = b"ACGTACGTACGT".to_vec();
-        let outcome = correct_overlap(&mut [], &reads, &query, 0.04, 0.05);
+        let outcome = correct_overlap(&mut [], &reads, &query, 0.04, 0.05, true, 0, 0);
 
         assert_eq!(outcome.sequence, query);
         assert_eq!(outcome.corrected_base, 0);
@@ -195,7 +218,7 @@ mod tests {
         let query = vec![b'A'; 1000];
         let mut overlaps = vec![full_overlap()];
 
-        let outcome = correct_overlap(&mut overlaps, &reads, &query, 0.04, 0.05);
+        let outcome = correct_overlap(&mut overlaps, &reads, &query, 0.04, 0.05, true, 0, 0);
 
         assert_eq!(outcome.sequence, query);
         assert_eq!(outcome.corrected_base, 0);
@@ -216,7 +239,7 @@ mod tests {
         let query = vec![b'A'; 1000];
         let mut overlaps: Vec<OverlapRegion> = (0..6).map(|_| full_overlap()).collect();
 
-        let outcome = correct_overlap(&mut overlaps, &reads, &query, 0.04, 0.05);
+        let outcome = correct_overlap(&mut overlaps, &reads, &query, 0.04, 0.05, true, 0, 0);
 
         assert_eq!(outcome.sequence, query);
         assert_eq!(outcome.corrected_base, 0);
@@ -234,7 +257,7 @@ mod tests {
         let query = vec![b'A'; 1000];
         let mut overlaps = vec![full_overlap(), full_overlap()];
 
-        let outcome = correct_overlap(&mut overlaps, &reads, &query, 0.04, 0.05);
+        let outcome = correct_overlap(&mut overlaps, &reads, &query, 0.04, 0.05, true, 0, 0);
 
         // Two overlaps are below the six the reference requires per window.
         assert!(!outcome.fully_covered);

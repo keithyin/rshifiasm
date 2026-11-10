@@ -116,6 +116,282 @@ pub struct MinimizerSketch {
     pub markers: Vec<u64>,
 }
 
+/// `sf_refine_select`: the longest compatible chain of minimizers under a
+/// count threshold, used by the `--fast` index selection.
+///
+/// The DP table stores, for every `(selected index, minimizer index)` pair,
+/// the best score in the low 32 bits and the predecessor position in the
+/// high 32 bits. The returned pair is the first and last minimizer index of
+/// the selected chain.
+fn refine_select(
+    minimizers: &[Minimizer],
+    start: isize,
+    end: isize,
+    selected_count: i32,
+    minimum_frequency: i32,
+    markers: &mut [u64],
+) -> (isize, isize) {
+    let n = selected_count as isize;
+    let m = end - start + 1;
+    if n <= 0 || m <= 0 {
+        return (0, 0);
+    }
+    let mut table = vec![0u64; (n * m) as usize];
+    let mut previous = -1isize;
+
+    for i in 0..n {
+        previous = -1;
+        for k in 0..m {
+            let item = &minimizers[(start + k) as usize];
+            if (item.read_identifier as i32) < minimum_frequency {
+                continue;
+            }
+            let window_start = item.position as i64 + 1 - i64::from(item.span);
+            let mut t = -1isize;
+            if i > 0 {
+                t = k - 1;
+                while t >= 0 {
+                    let before = &minimizers[(start + t) as usize];
+                    if !(before.position as i64 >= window_start
+                        || (before.read_identifier as i32) < minimum_frequency)
+                    {
+                        break;
+                    }
+                    t -= 1;
+                }
+            }
+            let mut left = if i <= 0 {
+                0u64
+            } else if t < 0 {
+                0xffff_ffff
+            } else {
+                table[((i - 1) * m + t) as usize] & 0xffff_ffff
+            };
+            if left < 0xffff_ffff {
+                left += u64::from(item.read_identifier);
+            }
+            let right = if previous < 0 {
+                0xffff_ffff
+            } else {
+                table[(i * m + previous) as usize] & 0xffff_ffff
+            };
+            let mut score = left.min(right);
+            if score & 0xffff_ffff == 0xffff_ffff {
+                score |= 0xffff_ffffu64 << 32;
+            } else if score == left {
+                let predecessor = if i > 0 {
+                    ((i - 1) * m + t) as u64
+                } else {
+                    0xffff_ffff
+                };
+                score |= predecessor << 32;
+            } else if score == right {
+                let predecessor = if previous >= 0 {
+                    (i * m + previous) as u64
+                } else {
+                    0xffff_ffff
+                };
+                score |= predecessor << 32;
+            }
+            table[(i * m + k) as usize] = score;
+            previous = k;
+        }
+    }
+
+    let mut position = ((n - 1) * m + previous) as u64;
+    let mut first = u64::MAX;
+    let mut last = 0u64;
+    while position != 0xffff_ffff {
+        if position as usize >= table.len() {
+            break;
+        }
+        let i = (position / m as u64) as isize;
+        let k = (position % m as u64) as isize;
+        position = table[position as usize] >> 32;
+        if position == 0xffff_ffff || (position / m as u64) as isize == i - 1 {
+            markers[(start + k) as usize] = 1;
+            first = first.min(k as u64);
+            last = last.max(k as u64);
+        }
+    }
+
+    (first as isize + start, last as isize + start)
+}
+
+/// `sf_refine_sketch`: keeps only the minimizers selected by
+/// [`refine_select`] on both ends and in the middle of a read.
+///
+/// The minimizers must already carry their k-mer counts in
+/// `read_identifier`, exactly like the reference's temporary `rid` reuse.
+pub fn refine_sketch(
+    minimizers: &mut Vec<Minimizer>,
+    length: i32,
+    dp_min_len: i32,
+    error_rate: f32,
+    minimum_frequency: i32,
+) {
+    let n = minimizers.len() as isize;
+    if n == 0 {
+        return;
+    }
+    let window = length.min(dp_min_len);
+    let mut selected_count = (window as f32 * error_rate + 1.0) as i32;
+    let mut markers = vec![0u64; minimizers.len()];
+
+    // Prefix.
+    let mut i = 0isize;
+    let mut count = 0i32;
+    let mut boundary = -1i32;
+    let mut end_index: isize = -1;
+    while i < n {
+        let item = &minimizers[i as usize];
+        if (item.read_identifier as i32) < minimum_frequency {
+            i += 1;
+            continue;
+        }
+        let sub_length = item.position as i32 + 1;
+        if sub_length > window {
+            break;
+        }
+        end_index = i;
+        if item.position as i32 + 1 - item.span as i32 > boundary {
+            boundary = item.position as i32;
+            count += 1;
+        }
+        i += 1;
+    }
+    let mut left_index: isize;
+    if count >= selected_count {
+        // `refine_select(..., NULL, &li)`: the prefix keeps the last selected
+        // minimizer (`kx + sidx`, the second output).
+        left_index = refine_select(
+            minimizers,
+            0,
+            end_index,
+            selected_count,
+            minimum_frequency,
+            &mut markers,
+        )
+        .1;
+    } else {
+        left_index = i - 1;
+        let mut index = 0isize;
+        while index <= left_index {
+            markers[index as usize] = 1;
+            index += 1;
+        }
+    }
+
+    let mut right_index: isize = n;
+    if window < length {
+        // Suffix.
+        let mut i = n - 1;
+        let mut count = 0i32;
+        let mut boundary = length + 1;
+        let mut end_index: isize = -1;
+        while i >= 0 {
+            let item = &minimizers[i as usize];
+            if (item.read_identifier as i32) < minimum_frequency {
+                i -= 1;
+                continue;
+            }
+            let sub_length = length - (item.position as i32 + 1 - item.span as i32);
+            if sub_length > window {
+                break;
+            }
+            end_index = i;
+            if (item.position as i32) < boundary {
+                boundary = item.position as i32 + 1 - item.span as i32;
+                count += 1;
+            }
+            i -= 1;
+        }
+        if count >= selected_count {
+            // `refine_select(..., &ri, NULL)`: the suffix keeps the first
+            // selected minimizer (`ix + sidx`, the first output).
+            right_index = refine_select(
+                minimizers,
+                end_index,
+                n - 1,
+                selected_count,
+                minimum_frequency,
+                &mut markers,
+            )
+            .0;
+        } else {
+            right_index = i + 1;
+            let mut index = right_index;
+            while index <= n - 1 {
+                markers[index as usize] = 1;
+                index += 1;
+            }
+        }
+
+        if right_index - left_index >= 2 {
+            left_index += 1;
+            right_index -= 1;
+            let span = minimizers[right_index as usize].position as i32
+                - minimizers[left_index as usize].position as i32
+                + minimizers[left_index as usize].span as i32;
+            selected_count = (span as f32 * error_rate + 1.0) as i32;
+            let mut i = left_index;
+            let mut count = 0i32;
+            let mut boundary = -1i32;
+            while i <= right_index {
+                let item = &minimizers[i as usize];
+                if (item.read_identifier as i32) < minimum_frequency {
+                    i += 1;
+                    continue;
+                }
+                if item.position as i32 + 1 - item.span as i32 > boundary {
+                    boundary = item.position as i32;
+                    count += 1;
+                    if count >= selected_count {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            if count >= selected_count {
+                refine_select(
+                    minimizers,
+                    left_index,
+                    right_index,
+                    selected_count,
+                    minimum_frequency,
+                    &mut markers,
+                );
+            } else {
+                let mut index = left_index;
+                while index <= right_index {
+                    markers[index as usize] = 1;
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    let mut output = 0usize;
+    for index in 0..minimizers.len() {
+        if markers[index] != 0 {
+            minimizers[output] = minimizers[index];
+            output += 1;
+        }
+    }
+    minimizers.truncate(output);
+}
+
+/// `mz_low_b`: the minimum k-mer count the `--fast` selection accepts.
+pub fn low_count_threshold(peak_hom: i32, peak_het: i32) -> i32 {
+    let mut low_frequency = 2;
+    if peak_het > 0 {
+        low_frequency = peak_het / 2;
+    } else if peak_hom > 0 {
+        low_frequency = peak_hom / 4;
+    }
+    low_frequency.max(2)
+}
+
 /// `mz1_ha_sketch`
 ///
 /// `window` is the minimizer window `w`, `kmer_length` is `k`,

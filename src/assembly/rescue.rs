@@ -696,6 +696,187 @@ fn get_contained_reads_chain<'a>(
     }
 }
 
+/// `get_best_cmk_read`: like [`get_best_contained_read`], but for chimeric
+/// reads whose edges are not deleted: it keeps the longest surviving edge
+/// from `query` to a read that is not part of a unitig.
+#[allow(clippy::too_many_arguments)]
+pub fn get_best_cmk_read<'a>(
+    read_graph: &Asg,
+    sources: &'a [PafList],
+    coverage_cut: &[CoverageCut],
+    read_to_unitig: &ReadToUnitig,
+    trio_labels: &[u8],
+    parameters: RescueParameters,
+    query: u32,
+    ignore_trio_flag: u32,
+) -> Option<&'a PafHit> {
+    let query_read = (query >> 1) as usize;
+    let opposite = non_trio_flag(trio_labels[query_read], ignore_trio_flag);
+    let mut best: Option<&PafHit> = None;
+    let mut best_overlap = 0u32;
+
+    for h in &sources[query_read].hits {
+        let query_cut = &coverage_cut[h.query_identifier as usize];
+        let target_cut = &coverage_cut[h.target_identifier as usize];
+        // Chimeric chains follow surviving edges of surviving reads.
+        if !target_cut.deleted || !h.deleted || !read_graph.sequences[h.target_identifier as usize].deleted
+        {
+            continue;
+        }
+        if u32::from(trio_labels[h.target_identifier as usize]) == opposite {
+            continue;
+        }
+        let (_, is_unitig) = read_to_unitig.get(h.target_identifier);
+        if is_unitig == 1 {
+            continue;
+        }
+
+        let query_length = query_cut.end.wrapping_sub(query_cut.start) as i32;
+        let target_length = target_cut.end.wrapping_sub(target_cut.start) as i32;
+        let (result, arc) = ma_hit_to_arc(
+            h,
+            query_length,
+            target_length,
+            parameters.maximum_hang,
+            parameters.maximum_hang_rate,
+            parameters.minimum_overlap,
+        );
+        if result < 0 {
+            continue;
+        }
+        if arc.query_vertex() != query {
+            continue;
+        }
+
+        if arc.overlap > best_overlap {
+            best_overlap = arc.overlap;
+            best = Some(h);
+        }
+    }
+
+    best
+}
+
+/// `get_chimeric_reads_chain`: follows surviving overlaps of chimeric reads
+/// until one of them reaches an existing unitig.
+#[allow(clippy::too_many_arguments)]
+fn get_chimeric_reads_chain<'a>(
+    mut h: Option<&'a PafHit>,
+    sources: &'a [PafList],
+    coverage_cut: &[CoverageCut],
+    read_to_unitig: &ReadToUnitig,
+    unitigs: &[MaUtg],
+    unitig_graph: &Asg,
+    read_graph: &Asg,
+    trio_labels: &[u8],
+    parameters: RescueParameters,
+    mut end_read: u32,
+    unitig_vertex: u32,
+    chain_buffer: &mut Vec<u32>,
+    mut chain_edges: Option<&mut Vec<AsgArc>>,
+    threshold_length: u32,
+    ignore_trio_flag: u32,
+) -> ChainOutcome {
+    chain_buffer.clear();
+    chain_buffer.push(unitig_vertex);
+    if let Some(edges) = chain_edges.as_deref_mut() {
+        edges.clear();
+    }
+
+    let mut chain_length = 0u32;
+    while let Some(hit) = h {
+        let query_cut = &coverage_cut[hit.query_identifier as usize];
+        let target_cut = &coverage_cut[hit.target_identifier as usize];
+
+        if ignore_trio_flag == 0 {
+            let opposite = non_trio_flag(trio_labels[hit.query_identifier as usize], ignore_trio_flag);
+            if u32::from(trio_labels[hit.target_identifier as usize]) == opposite {
+                break;
+            }
+        }
+
+        // Only surviving edges of surviving reads extend a chimeric chain.
+        if !target_cut.deleted
+            || !hit.deleted
+            || !read_graph.sequences[hit.target_identifier as usize].deleted
+        {
+            break;
+        }
+
+        let (_, is_unitig) = read_to_unitig.get(hit.target_identifier);
+        if is_unitig == 1 {
+            break;
+        }
+
+        let query_length = query_cut.end.wrapping_sub(query_cut.start) as i32;
+        let target_length = target_cut.end.wrapping_sub(target_cut.start) as i32;
+        let (result, t) = ma_hit_to_arc(
+            hit,
+            query_length,
+            target_length,
+            parameters.maximum_hang,
+            parameters.maximum_hang_rate,
+            parameters.minimum_overlap,
+        );
+        if result < 0 {
+            break;
+        }
+        if t.query_vertex() != end_read {
+            break;
+        }
+
+        if let Some(edges) = chain_edges.as_deref_mut() {
+            edges.push(t);
+        }
+        chain_length += 1;
+
+        let (available, overlap) = get_num_edges2existing_nodes_advance(
+            unitigs,
+            unitig_graph,
+            read_graph,
+            sources,
+            coverage_cut,
+            read_to_unitig,
+            trio_labels,
+            parameters,
+            t.v,
+            chain_buffer,
+            ignore_trio_flag,
+        );
+        if available > 0 {
+            return ChainOutcome {
+                found: true,
+                available_count: available,
+                available_overlap: overlap,
+                chain_length,
+            };
+        }
+
+        if chain_length >= threshold_length {
+            break;
+        }
+
+        end_read = t.v;
+        h = get_best_cmk_read(
+            read_graph,
+            sources,
+            coverage_cut,
+            read_to_unitig,
+            trio_labels,
+            parameters,
+            end_read,
+            ignore_trio_flag,
+        );
+    }
+
+    ChainOutcome {
+        found: false,
+        available_count: u32::MAX,
+        available_overlap: u32::MAX,
+        chain_length: u32::MAX,
+    }
+}
+
 /// `append_rId_to_Unitig`: appends read vertex `read_vertex` to one end of a
 /// unitig.
 ///
@@ -1537,6 +1718,416 @@ pub fn rescue_missing_overlaps_aggressive(
             read_graph.index.clear();
             read_graph.is_sorted = false;
             read_graph.cleanup();
+        }
+    }
+
+    read_to_unitig.clear_unitig_entries();
+}
+
+/// `rescue_chimeric_reads_aggressive`: recovers chimeric reads whose chain
+/// reaches a unitig, the ONT counterpart of the missing-overlap rescue.
+///
+/// The reference only calls this pass when the chemical mask is present; the
+/// mask itself is unused inside the pass.
+#[allow(clippy::too_many_arguments)]
+pub fn rescue_chimeric_reads_aggressive(
+    input_unitigs: Option<&mut UnitigGraph>,
+    read_graph: &mut Asg,
+    sources: &[PafList],
+    coverage_cut: &mut [CoverageCut],
+    read_to_unitig: &mut ReadToUnitig,
+    trio_labels: &[u8],
+    parameters: RescueParameters,
+    chain_len_thres: u32,
+    is_bubble_check: bool,
+    is_primary_check: bool,
+    mut new_rtg_edges: Option<&mut Vec<AsgArc>>,
+    mut new_rtg_nodes: Option<&mut Vec<u32>>,
+    bubble_labels: &mut BubbleLabel,
+) {
+    let mut new_edges: Vec<AsgArc> = Vec::new();
+    let mut rbub_edges: Vec<AsgArc> = Vec::new();
+    let mut tracked_nodes: Vec<u64> = Vec::new();
+
+    let mut owned_unitigs;
+    let ug: &mut UnitigGraph = match input_unitigs {
+        Some(unitigs) => unitigs,
+        None => {
+            owned_unitigs = ma_ug_gen(read_graph);
+            for sequence in &mut owned_unitigs.graph.sequences {
+                sequence.coverage_class = PRIMARY_LABEL;
+            }
+            &mut owned_unitigs
+        }
+    };
+
+    for v in 0..ug.graph.sequences.len() as u32 {
+        let unitig = &ug.unitigs[v as usize];
+        if unitig.reads.is_empty() {
+            continue;
+        }
+        if ug.graph.sequences[v as usize].deleted {
+            continue;
+        }
+        if is_primary_check && ug.graph.sequences[v as usize].coverage_class == ALTER_LABEL {
+            continue;
+        }
+        for k in 0..unitig.reads.len() {
+            let read = (unitig.reads[k] >> 33) as u32;
+            read_to_unitig.set(
+                read,
+                v,
+                true,
+                Some(read_graph.sequences[read as usize].coverage_class),
+            );
+        }
+    }
+
+    let vertex_count = ug.graph.sequences.len() as u32 * 2;
+    let mut chain_buffer: Vec<u32> = Vec::new();
+    let mut chain_edges: Vec<AsgArc> = Vec::new();
+
+    for v in 0..vertex_count {
+        let u_id = v >> 1;
+        if ug.graph.sequences[u_id as usize].deleted {
+            continue;
+        }
+        if is_primary_check && ug.graph.sequences[u_id as usize].coverage_class == ALTER_LABEL {
+            continue;
+        }
+        {
+            let unitig = &ug.unitigs[u_id as usize];
+            if unitig.reads.is_empty() {
+                continue;
+            }
+            if unitig.circular || unitig.start == u32::MAX || unitig.end == u32::MAX {
+                continue;
+            }
+        }
+        if get_real_length(&ug.graph, v) != 0 {
+            continue;
+        }
+
+        let end_read = if v & 1 != 0 {
+            ug.unitigs[u_id as usize].start ^ 1
+        } else {
+            ug.unitigs[u_id as usize].end ^ 1
+        };
+
+        // Scan every overlap of the tip's end read, keeping the best chain.
+        let mut best_hit: Option<&PafHit> = None;
+        let mut available_max = 0u32;
+        let mut overlap_max = 0u32;
+        let mut minimum_chain = u32::MAX;
+        for hit in &sources[(end_read >> 1) as usize].hits {
+            let outcome = get_chimeric_reads_chain(
+                Some(hit),
+                sources,
+                coverage_cut,
+                read_to_unitig,
+                &ug.unitigs,
+                &ug.graph,
+                read_graph,
+                trio_labels,
+                parameters,
+                end_read,
+                u_id,
+                &mut chain_buffer,
+                None,
+                chain_len_thres,
+                1,
+            );
+            if !outcome.found {
+                continue;
+            }
+            let update = if outcome.chain_length < minimum_chain {
+                true
+            } else if outcome.chain_length == minimum_chain {
+                if outcome.available_count > available_max {
+                    true
+                } else {
+                    outcome.available_count == available_max
+                        && outcome.available_overlap > overlap_max
+                }
+            } else {
+                false
+            };
+            if update {
+                minimum_chain = outcome.chain_length;
+                available_max = outcome.available_count;
+                overlap_max = outcome.available_overlap;
+                best_hit = Some(hit);
+            }
+        }
+
+        if available_max == 0 {
+            continue;
+        }
+        let Some(best_hit) = best_hit else {
+            continue;
+        };
+        get_chimeric_reads_chain(
+            Some(best_hit),
+            sources,
+            coverage_cut,
+            read_to_unitig,
+            &ug.unitigs,
+            &ug.graph,
+            read_graph,
+            trio_labels,
+            parameters,
+            end_read,
+            u_id,
+            &mut chain_buffer,
+            Some(&mut chain_edges),
+            chain_len_thres,
+            1,
+        );
+        if chain_edges.is_empty() {
+            continue;
+        }
+        let last = *chain_edges.last().unwrap();
+
+        rbub_edges.clear();
+        let mut scan = 0usize;
+        let mut r_edge = AsgArc::default();
+        while get_edge2existing_node_advance(
+            &ug.unitigs,
+            &ug.graph,
+            read_graph,
+            sources,
+            coverage_cut,
+            read_to_unitig,
+            trio_labels,
+            parameters,
+            last.v,
+            &chain_buffer,
+            &mut scan,
+            &mut r_edge,
+            1,
+        ) {
+            rbub_edges.push(r_edge);
+        }
+
+        minor_transitive_reduction(&ug.unitigs, &ug.graph, read_to_unitig, &mut rbub_edges);
+
+        if is_primary_check {
+            let mut maximum_overlap = 0u32;
+            let mut maximum_index = u32::MAX;
+            for (index, edge) in rbub_edges.iter().enumerate() {
+                if edge.deleted {
+                    continue;
+                }
+                if edge.overlap > maximum_overlap {
+                    maximum_overlap = edge.overlap;
+                    maximum_index = index as u32;
+                }
+            }
+            if maximum_index == u32::MAX {
+                continue;
+            }
+            let edge = rbub_edges[maximum_index as usize];
+            let w = get_corresponding_u_id(&ug.unitigs, &ug.graph, read_to_unitig, edge.v);
+            if w == u32::MAX {
+                continue;
+            }
+            if get_real_length(&ug.graph, w ^ 1) != 0 {
+                continue;
+            }
+            new_edges.push(edge);
+            ug.graph.append_edge_to_sorted(
+                v,
+                unitig_length(&ug.unitigs, v),
+                w,
+                edge.overlap,
+                edge.strong,
+                edge.exact_region,
+                edge.without_large_indel,
+            );
+            let mut reverse = AsgArc::default();
+            get_edge_from_source_into(
+                sources,
+                coverage_cut,
+                parameters,
+                edge.v ^ 1,
+                ((edge.ul >> 32) as u32) ^ 1,
+                &mut reverse,
+            );
+            new_edges.push(reverse);
+            ug.graph.append_edge_to_sorted(
+                w ^ 1,
+                unitig_length(&ug.unitigs, w),
+                v ^ 1,
+                reverse.overlap,
+                reverse.strong,
+                reverse.exact_region,
+                reverse.without_large_indel,
+            );
+        } else {
+            for edge in &rbub_edges {
+                let edge = *edge;
+                if edge.deleted {
+                    continue;
+                }
+                let w = get_corresponding_u_id(&ug.unitigs, &ug.graph, read_to_unitig, edge.v);
+                if w == u32::MAX {
+                    continue;
+                }
+                new_edges.push(edge);
+                ug.graph.append_edge_to_sorted(
+                    v,
+                    unitig_length(&ug.unitigs, v),
+                    w,
+                    edge.overlap,
+                    edge.strong,
+                    edge.exact_region,
+                    edge.without_large_indel,
+                );
+                let mut reverse = AsgArc::default();
+                get_edge_from_source_into(
+                    sources,
+                    coverage_cut,
+                    parameters,
+                    edge.v ^ 1,
+                    ((edge.ul >> 32) as u32) ^ 1,
+                    &mut reverse,
+                );
+                new_edges.push(reverse);
+                ug.graph.append_edge_to_sorted(
+                    w ^ 1,
+                    unitig_length(&ug.unitigs, w),
+                    v ^ 1,
+                    reverse.overlap,
+                    reverse.strong,
+                    reverse.exact_region,
+                    reverse.without_large_indel,
+                );
+            }
+        }
+
+        // Recover every read of the chain and register the step edges.
+        for edge in &chain_edges {
+            let edge = *edge;
+            let (contained_read, is_unitig) = read_to_unitig.get(edge.v >> 1);
+            let contained_read = if is_unitig == 1 || is_unitig == u32::MAX {
+                u32::MAX
+            } else {
+                contained_read
+            };
+            tracked_nodes.push((u64::from(contained_read) << 32) | u64::from(edge.v >> 1));
+
+            read_graph.sequences[(edge.v >> 1) as usize].deleted = false;
+            coverage_cut[(edge.v >> 1) as usize].deleted = false;
+            coverage_cut[(edge.v >> 1) as usize].class = PRIMARY_LABEL;
+            append_read_id_to_unitig(
+                read_graph,
+                &mut ug.unitigs,
+                v,
+                edge.v,
+                sources,
+                coverage_cut,
+                read_to_unitig,
+                parameters,
+            );
+
+            let mut step = AsgArc::default();
+            get_edge_from_source_into(
+                sources,
+                coverage_cut,
+                parameters,
+                edge.query_vertex(),
+                edge.v,
+                &mut step,
+            );
+            new_edges.push(step);
+
+            let mut reverse = AsgArc::default();
+            get_edge_from_source_into(
+                sources,
+                coverage_cut,
+                parameters,
+                edge.v ^ 1,
+                edge.query_vertex() ^ 1,
+                &mut reverse,
+            );
+            new_edges.push(reverse);
+        }
+    }
+
+    if is_bubble_check {
+        for edge in &new_edges {
+            read_graph.push_arc(*edge);
+        }
+        if !new_edges.is_empty() {
+            read_graph.index.clear();
+            read_graph.is_sorted = false;
+            read_graph.cleanup();
+        }
+
+        pre_clean(read_graph);
+
+        lable_all_bubbles(read_graph, bubble_labels, parameters.minimum_length_threshold);
+
+        for edge in &new_edges {
+            let v = (edge.ul >> 32) as u32;
+            let w = edge.v;
+            if read_graph.sequences[(v >> 1) as usize].deleted {
+                continue;
+            }
+            if read_graph.sequences[(w >> 1) as usize].deleted {
+                continue;
+            }
+            if read_graph.sequence_visited[v as usize] != 0
+                && read_graph.sequence_visited[(w ^ 1) as usize] != 0
+            {
+                continue;
+            }
+            read_graph.delete_arc(v, w, true);
+            read_graph.delete_arc(w ^ 1, v ^ 1, true);
+        }
+        read_graph.cleanup();
+
+        // Undo the recovery for the reads that sit inside a bubble.
+        for tracked in tracked_nodes.iter().copied() {
+            let mut w = tracked as u32;
+            w <<= 1;
+            if !read_graph.sequences[(w >> 1) as usize].deleted && get_real_length(read_graph, w) != 0
+            {
+                continue;
+            }
+            if !read_graph.sequences[(w >> 1) as usize].deleted
+                && get_real_length(read_graph, w ^ 1) != 0
+            {
+                continue;
+            }
+            w >>= 1;
+            read_graph.sequences[w as usize].deleted = true;
+            coverage_cut[w as usize].deleted = true;
+            let contained = (tracked >> 32) as u32;
+            if contained == u32::MAX {
+                read_to_unitig.set_raw(tracked as u32, u32::MAX);
+            } else {
+                read_to_unitig.set(tracked as u32, contained, false, None);
+            }
+        }
+    }
+
+    if is_primary_check {
+        for edge in &new_edges {
+            read_graph.push_arc(*edge);
+            if let Some(rtg_edges) = new_rtg_edges.as_deref_mut() {
+                rtg_edges.push(*edge);
+            }
+        }
+        if !new_edges.is_empty() {
+            read_graph.index.clear();
+            read_graph.is_sorted = false;
+            read_graph.cleanup();
+        }
+        if let Some(nodes) = new_rtg_nodes.as_deref_mut() {
+            for tracked in tracked_nodes.iter().copied() {
+                nodes.push(tracked as u32);
+            }
         }
     }
 

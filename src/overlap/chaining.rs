@@ -266,7 +266,6 @@ pub fn chain_dp(
     result.y_position_end = hits[index as usize].offset;
     result.shared_seed = best_score as i32;
     result.overlap_length = shortest_length as u32;
-
     let mut distance_self_position =
         result.x_position_end as i64 - hits[index as usize].self_offset as i64;
     let mut distance_position = result.y_position_end as i64 - hits[index as usize].offset as i64;
@@ -339,6 +338,7 @@ pub fn chain_candidate_groups(
     add_begin_and_end: bool,
     data: &mut ChainData,
     overlap_list: &mut Vec<OverlapRegion>,
+    mut slot_memory: Option<&mut Vec<OverlapRegion>>,
 ) {
     /// The reference passes a maximum skip of 25 in this call site.
     const MAXIMUM_SKIP: i32 = 25;
@@ -385,12 +385,13 @@ pub fn chain_candidate_groups(
             k_mer_length,
         );
 
-        crate::overlap::append::append_inexact_overlap(
+        crate::overlap::append::append_inexact_overlap_with_template(
             overlap_list,
             &region,
             read_length as i64,
             read_lengths[current_identifier as usize] as i64,
             add_begin_and_end,
+            slot_memory.as_deref_mut(),
         );
     }
 }
@@ -1337,7 +1338,8 @@ mod tests {
             false,
             &mut data,
             &mut overlap_list,
-        );
+                None,
+    );
 
         // The two read-5 chains share one target identifier, so the append
         // step keeps only the better one, exactly like the reference.

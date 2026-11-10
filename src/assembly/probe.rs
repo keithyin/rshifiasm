@@ -441,6 +441,7 @@ pub fn load_sources(path: &Path) -> Vec<PafList> {
                 reverse: field_word >> 31 != 0,
                 without_large_indel,
                 exact_region: exact_region != 0,
+                exact_region_byte: exact_region,
                 deleted: block_word >> 31 != 0,
             });
         }

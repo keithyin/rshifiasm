@@ -308,24 +308,19 @@ fn extend_backwards(
                 let mut y_start = window.y_start as i64;
                 let extra_begin = window.extra_begin as i32;
                 let extra_end = window.extra_end as i32;
-
-                let Some(mapped) = determine_overlap_region(
-                    threshold,
-                    y_start,
-                    view.y_read_length,
-                    window_length,
-                ) else {
-                    return;
-                };
-
+                // The reference re-aligns the window exactly where it was
+                // placed (`p->y_start`, `p->extra_*`), without running
+                // `determine_overlap_region` again.
+                let o_len =
+                    window_length - i64::from(extra_end) - i64::from(extra_begin);
                 let target = fill_subregion(
                     &TargetSource::Reads(reads),
                     view.y_identifier,
-                    mapped.start,
-                    mapped.length,
+                    y_start,
+                    o_len,
                     view.y_strand,
-                    mapped.extra_begin,
-                    mapped.extra_end,
+                    extra_begin,
+                    extra_end,
                 );
                 let query = query_slice(query_sequence, x_start, x_length);
 

@@ -560,6 +560,344 @@ pub fn asg_topocut_aux(graph: &Asg, v: u32, max_ext: i32) -> i32 {
     n_ext
 }
 
+/// `is_dedup_weak_arc`: whether another strong arc into the same vertex is
+/// backed by a reverse overlap.
+fn is_dedup_weak_arc(
+    arcs: &[crate::assembly::asg::AsgArc],
+    arc_index: usize,
+    reverse_sources: &[PafList],
+) -> bool {
+    let target = arcs[arc_index].v;
+    for (index, arc) in arcs.iter().enumerate() {
+        if index == arc_index || arc.deleted || !arc.strong {
+            continue;
+        }
+        if arc.overlap > arcs[arc_index].overlap {
+            let wanted = target ^ (arc.v & 1);
+            let found = reverse_sources[(arc.v >> 1) as usize]
+                .hits
+                .iter()
+                .any(|hit| (hit.target_identifier << 1) | u32::from(hit.reverse) == wanted);
+            if found {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `asg_arc_cut_weak`: cuts weak arcs that are dominated by a strong arc
+/// leaving the same vertex.
+///
+/// The ONT branch of `ul_clean_gfa` calls this before every tip-cutting
+/// round with `rev`/`rI`/`max_drop_len` unused; the general arguments are
+/// kept so the port mirrors the reference signature.
+#[allow(clippy::too_many_arguments)]
+pub fn asg_arc_cut_weak(
+    graph: &mut Asg,
+    buffer: &mut Vec<u64>,
+    maximum_extension: i32,
+    length_rate: f32,
+    overlap_unitig_rate: f32,
+    is_overlap_unitig: bool,
+    is_trio: bool,
+    is_topology: bool,
+    minimum_difference: u32,
+    minimum_overlap_unitig: u32,
+    test_bubble: bool,
+    reverse_sources: &[PafList],
+    read_to_unitig: Option<&ReadToUnitig>,
+    trio_labels: &[u8],
+) -> u32 {
+    buffer.clear();
+    let vertex_count = graph.sequences.len() * 2;
+
+    for v in 0..vertex_count as u32 {
+        if graph.sequences[(v >> 1) as usize].deleted {
+            continue;
+        }
+        if test_bubble && graph.sequence_visited[v as usize] != 0 {
+            continue;
+        }
+        let (start, arc_count) = graph.arc_range(v);
+        if arc_count < 2 {
+            continue;
+        }
+        let live = graph.arcs[start..start + arc_count]
+            .iter()
+            .filter(|arc| !arc.deleted)
+            .count();
+        if live < 2 {
+            continue;
+        }
+
+        let mut longest = [0u32; 2];
+        longest[0] = u32::MAX;
+        for i in 0..arc_count {
+            let arc = graph.arcs[start + i];
+            if arc.deleted {
+                continue;
+            }
+            let slot = usize::from(arc.strong);
+            if arc.strong {
+                if arc.overlap > longest[slot] {
+                    longest[slot] = arc.overlap;
+                }
+            } else if arc.overlap < longest[slot] {
+                longest[slot] = arc.overlap;
+            }
+        }
+        if longest[1] <= longest[0] {
+            continue;
+        }
+
+        for i in 0..arc_count {
+            let arc = graph.arcs[start + i];
+            if arc.deleted || arc.strong {
+                continue;
+            }
+            if arc.overlap >= longest[1] {
+                continue;
+            }
+            if is_dedup_weak_arc(
+                &graph.arcs[start..start + arc_count],
+                i as usize,
+                reverse_sources,
+            ) {
+                buffer.push(
+                    (u64::from(arc.overlap) << 32) | (start + i as usize) as u64,
+                );
+            }
+        }
+    }
+
+    radix_sort_u64(buffer);
+    let mut count = 0u32;
+    let sorted_count = buffer.len();
+    for k in 0..sorted_count {
+        let raw_index = buffer[k] as u32 as usize;
+        let ve = graph.arcs[raw_index];
+        if ve.deleted {
+            continue;
+        }
+        let v = (ve.ul >> 32) as u32;
+        let w = ve.v ^ 1;
+        if graph.sequences[(v >> 1) as usize].deleted
+            || graph.sequences[(w >> 1) as usize].deleted
+        {
+            continue;
+        }
+        let nv = graph.arc_count(v);
+        let nw = graph.arc_count(w);
+        if nv <= 1 && nw <= 1 {
+            continue;
+        }
+
+        let mut opposite_flag = u32::MAX;
+        if is_trio {
+            if get_arcs(graph, v, None) <= 1 && get_arcs(graph, w, None) <= 1 {
+                continue;
+            }
+            let trio_flag = get_tip_trio_infor(graph, v ^ 1, trio_labels);
+            opposite_flag = match trio_flag {
+                crate::command_line::options::TRIO_FATHER => {
+                    u32::from(crate::command_line::options::TRIO_MOTHER)
+                }
+                crate::command_line::options::TRIO_MOTHER => {
+                    u32::from(crate::command_line::options::TRIO_FATHER)
+                }
+                _ => u32::MAX,
+            };
+        }
+
+        let (w_start, _) = graph.arc_range(w);
+        let we_index = graph.arcs[w_start..w_start + graph.arc_count(w) as usize]
+            .iter()
+            .position(|arc| arc.v == (v ^ 1))
+            .map(|offset| w_start + offset)
+            .expect("a symmetric graph stores the mirror arc");
+        let we = graph.arcs[we_index];
+        let mutual_overlap = ve.overlap.min(we.overlap);
+        let mutual_occurrence = u32::from(ve.occurrence).min(u32::from(we.occurrence));
+
+        let mut kv = 0u32;
+        let mut v_max_overlap = 0u32;
+        let mut v_max_occurrence = 0u32;
+        let mut v_longest: Option<usize> = None;
+        let (v_start, _) = graph.arc_range(v);
+        for i in 0..graph.arc_count(v) {
+            let arc = graph.arcs[v_start + i as usize];
+            if arc.deleted {
+                continue;
+            }
+            kv += 1;
+            if arc.v == ve.v || !arc.strong || arc.overlap <= ve.overlap {
+                continue;
+            }
+            if is_trio
+                && u32::from(get_tip_trio_infor(graph, arc.v, trio_labels)) == opposite_flag
+            {
+                continue;
+            }
+            let wanted = ve.v ^ (arc.v & 1);
+            let found = reverse_sources[(arc.v >> 1) as usize]
+                .hits
+                .iter()
+                .any(|hit| (hit.target_identifier << 1) | u32::from(hit.reverse) == wanted);
+            if !found {
+                continue;
+            }
+            if v_max_overlap < arc.overlap {
+                v_max_overlap = arc.overlap;
+                v_longest = Some(v_start + i as usize);
+            }
+            if v_max_occurrence < u32::from(arc.occurrence) {
+                v_max_occurrence = u32::from(arc.occurrence);
+            }
+        }
+        if kv < 1 {
+            continue;
+        }
+        if kv >= 2 {
+            if mutual_overlap as f32 > v_max_overlap as f32 * length_rate {
+                continue;
+            }
+            if is_overlap_unitig
+                && mutual_occurrence as f32 > v_max_occurrence as f32 * overlap_unitig_rate
+                && mutual_occurrence > minimum_overlap_unitig
+            {
+                continue;
+            }
+            if mutual_overlap.wrapping_add(minimum_difference) > v_max_overlap {
+                continue;
+            }
+        }
+
+        let mut kw = 0u32;
+        let mut w_max_overlap = 0u32;
+        let mut w_max_occurrence = 0u32;
+        let mut w_longest: Option<usize> = None;
+        for i in 0..graph.arc_count(w) {
+            let arc = graph.arcs[w_start + i as usize];
+            if arc.deleted {
+                continue;
+            }
+            kw += 1;
+            if arc.v == we.v || !arc.strong || arc.overlap <= we.overlap {
+                continue;
+            }
+            if is_trio
+                && u32::from(get_tip_trio_infor(graph, arc.v, trio_labels)) == opposite_flag
+            {
+                continue;
+            }
+            let wanted = we.v ^ (arc.v & 1);
+            let found = reverse_sources[(arc.v >> 1) as usize]
+                .hits
+                .iter()
+                .any(|hit| (hit.target_identifier << 1) | u32::from(hit.reverse) == wanted);
+            if !found {
+                continue;
+            }
+            if w_max_overlap < arc.overlap {
+                w_max_overlap = arc.overlap;
+                w_longest = Some(w_start + i as usize);
+            }
+            if w_max_occurrence < u32::from(arc.occurrence) {
+                w_max_occurrence = u32::from(arc.occurrence);
+            }
+        }
+        if kw < 1 {
+            continue;
+        }
+        if kw >= 2 {
+            if mutual_overlap as f32 > w_max_overlap as f32 * length_rate {
+                continue;
+            }
+            if is_overlap_unitig
+                && mutual_occurrence as f32 > w_max_occurrence as f32 * overlap_unitig_rate
+                && mutual_occurrence > minimum_overlap_unitig
+            {
+                continue;
+            }
+            if mutual_overlap.wrapping_add(minimum_difference) > w_max_overlap {
+                continue;
+            }
+        }
+
+        if kv <= 1 && kw <= 1 {
+            continue;
+        }
+
+        let mut to_delete = false;
+        if is_topology {
+            if kv > 1 && kw > 1 {
+                to_delete = true;
+            } else if kw == 1 {
+                if asg_topocut_aux(graph, w ^ 1, maximum_extension) < maximum_extension {
+                    to_delete = true;
+                }
+            } else if kv == 1
+                && asg_topocut_aux(graph, v ^ 1, maximum_extension) < maximum_extension
+            {
+                to_delete = true;
+            }
+        }
+
+        // `if(rev && rI)`: the ONT call passes a null read-to-unitig map, so
+        // this branch only runs for callers that supply one.
+        if let Some(read_to_unitig) = read_to_unitig {
+            if !to_delete {
+                if let Some(longest) = v_longest {
+                    let target = graph.arcs[longest].v;
+                    if target != ve.v
+                        && trans_path_check(
+                            graph,
+                            ve.v,
+                            target,
+                            reverse_sources,
+                            read_to_unitig,
+                            maximum_extension as u32,
+                            buffer,
+                        ) == 0
+                    {
+                        to_delete = true;
+                    }
+                }
+            }
+            if !to_delete {
+                if let Some(longest) = w_longest {
+                    let target = graph.arcs[longest].v;
+                    if target != we.v
+                        && trans_path_check(
+                            graph,
+                            we.v,
+                            target,
+                            reverse_sources,
+                            read_to_unitig,
+                            maximum_extension as u32,
+                            buffer,
+                        ) == 0
+                    {
+                        to_delete = true;
+                    }
+                }
+            }
+        }
+
+        if to_delete {
+            graph.arcs[raw_index].deleted = true;
+            graph.arcs[we_index].deleted = true;
+            count += 1;
+        }
+    }
+
+    if count > 0 {
+        graph.cleanup();
+    }
+    count
+}
+
 /// `asg_cut_semi_circ`: cuts the input edge of a semi-circular path.
 ///
 /// A vertex with several inputs but a single output starts a "semi-circle"
@@ -2205,6 +2543,7 @@ mod tests {
             reverse: false,
             without_large_indel: true,
             exact_region: exact,
+            exact_region_byte: 0,
             deleted: false,
         }
     }

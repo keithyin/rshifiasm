@@ -1672,6 +1672,7 @@ mod probe_goldens {
                 reverse: hit.reverse != 0,
                 without_large_indel: false,
                 exact_region: hit.exact_region != 0,
+                exact_region_byte: 0,
                 deleted: false,
             })
             .collect();

@@ -306,6 +306,7 @@ pub fn push_ne_ovlp(
             reverse: region.y_strand == 1,
             without_large_indel: region.without_large_indel != 0,
             exact_region: false,
+            exact_region_byte: 0,
             deleted: false,
         };
 
@@ -316,6 +317,7 @@ pub fn push_ne_ovlp(
                 hit.target_start = found.target_start as u32;
                 hit.target_end = found.target_end as u32;
                 hit.exact_region = true;
+                hit.exact_region_byte = 1;
             }
         }
 
@@ -1105,6 +1107,7 @@ mod probe_goldens {
                 reverse: false,
                 without_large_indel: false,
                 exact_region: false,
+                exact_region_byte: 0,
                 deleted: false,
             })
             .collect();

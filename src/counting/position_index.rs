@@ -50,6 +50,15 @@ impl PositionIndex {
     /// The start offset of each list is the running sum of the counts of all
     /// preceding k-mers in the same partition, exactly like `worker_pt_gen`.
     pub fn build(counts: &KmerCountTable, kmer_length: i32) -> Self {
+        Self::build_selected(counts, kmer_length, None)
+    }
+
+    /// `ha_pt_gen` restricted to the k-mers the `--fast` selection kept.
+    pub fn build_selected(
+        counts: &KmerCountTable,
+        kmer_length: i32,
+        keep: Option<&std::collections::HashSet<u64>>,
+    ) -> Self {
         let mut partitions: Vec<IndexPartition> = (0..PARTITION_COUNT)
             .map(|_| IndexPartition {
                 table: new_index_table(),
@@ -60,6 +69,12 @@ impl PositionIndex {
         for (partition_index, partition) in partitions.iter_mut().enumerate() {
             let mut next_start = 0u64;
             for (key, _) in counts.partition_entries(partition_index) {
+                let hash = (key >> COUNTER_BITS << COUNTER_BITS) | partition_index as u64;
+                if let Some(keep) = keep {
+                    if !keep.contains(&hash) {
+                        continue;
+                    }
+                }
                 let count = key & MAXIMUM_COUNT;
                 let (bucket, _) = partition.table.put(key & !MAXIMUM_COUNT);
                 partition.table.set_value_at(bucket, next_start);

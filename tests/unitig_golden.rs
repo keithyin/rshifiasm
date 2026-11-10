@@ -180,6 +180,7 @@ fn load_sources(path: &Path) -> Vec<PafList> {
                 reverse: field_word >> 31 != 0,
                 without_large_indel,
                 exact_region: exact_region != 0,
+                exact_region_byte: exact_region,
                 deleted: block_word >> 31 != 0,
             });
         }
@@ -990,7 +991,8 @@ fn load_reverse_sources(path: &Path) -> Vec<PafList> {
             let target_end = read_u32(&data, &mut position);
             let field_word = read_u32(&data, &mut position);
             let block_word = read_u32(&data, &mut position);
-            let exact_region = read_u8(&data, &mut position) != 0;
+            let exact_region_byte = read_u8(&data, &mut position);
+            let exact_region = exact_region_byte != 0;
             let without_large_indel = read_u8(&data, &mut position) != 0;
             hits.push(PafHit {
                 query_identifier: (qns >> 32) as u32,
@@ -1004,6 +1006,7 @@ fn load_reverse_sources(path: &Path) -> Vec<PafList> {
                 reverse: field_word >> 31 != 0,
                 without_large_indel,
                 exact_region,
+                exact_region_byte,
                 deleted: block_word >> 31 != 0,
             });
         }

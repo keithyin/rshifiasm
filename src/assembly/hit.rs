@@ -10,7 +10,7 @@
 //! weak-overlap marker still uses bit 30 of `bl`, exactly like the reference.
 
 use crate::assembly::asg::AsgArc;
-use crate::container::ksort::introsort_by;
+use crate::container::ksort::{introsort_by, radix_sort_u64};
 use crate::logging;
 use crate::overlap::paf::PafHit;
 
@@ -124,6 +124,7 @@ pub fn set_reverse_overlap(destination: &mut PafHit, source: &PafHit) {
 
     destination.reverse = source.reverse;
     destination.exact_region = source.exact_region;
+    destination.exact_region_byte = source.exact_region_byte;
     destination.matching_length = source.matching_length;
     destination.without_large_indel = source.without_large_indel;
     destination.block_length = source.block_length;
@@ -236,6 +237,163 @@ pub fn normalize_ma_hit_t_single_side_advance(
         "[M::normalize_ma_hit_t_single_side_advance] takes {:.2}s\n",
         logging::realtime_seconds() - start_time
     );
+}
+
+/// `cal_chemical_r_adv`: the minimum depth of the covered intervals of one
+/// read, used to detect chimeric ONT reads.
+///
+/// Every overlap is clipped by `flank` at both ends, and pairs whose reads
+/// have nearly the same length and point at each other's overhang are
+/// skipped as duplicates. The intervals are then swept end to end; the
+/// returned value is the smallest depth seen, `INT64_MAX` when no interval
+/// survives.
+fn minimum_chemical_coverage(
+    hits: &[PafHit],
+    read_lengths: &[u64],
+    length: i64,
+    flank: i64,
+    duplicate_rate: f64,
+    skip_deleted: bool,
+) -> i64 {
+    let length_rate = length as f64 * duplicate_rate;
+    let mut events: Vec<u64> = Vec::new();
+    for hit in hits {
+        if skip_deleted && hit.deleted {
+            continue;
+        }
+        let mut start = i64::from(hit.query_start);
+        let mut end = i64::from(hit.query_end);
+        if start > 0 {
+            start += flank;
+        }
+        if end < length {
+            end -= flank;
+        }
+        if end <= start {
+            continue;
+        }
+
+        let target_length = read_lengths[hit.target_identifier as usize] as i64;
+        let difference = (target_length - length).abs();
+        if difference as f64 <= length_rate
+            && difference as f64 <= target_length as f64 * duplicate_rate
+            && hit.reverse
+        {
+            let uncovered =
+                length - (i64::from(hit.query_end) - i64::from(hit.query_start));
+            let target_uncovered =
+                target_length - (i64::from(hit.target_end) - i64::from(hit.target_start));
+            if uncovered as f64 <= length_rate
+                && target_uncovered as f64 <= target_length as f64 * duplicate_rate
+            {
+                continue;
+            }
+        }
+
+        events.push((start as u64) << 1);
+        events.push(((end as u64) << 1) | 1);
+    }
+
+    radix_sort_u64(&mut events);
+    let mut minimum_coverage = i64::MAX;
+    let mut depth = 0i64;
+    let mut start = 0i64;
+    let mut end = 0i64;
+    for &event in &events {
+        let previous = depth;
+        if event & 1 != 0 {
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+        end = (event >> 1) as i64;
+        if end > start && previous <= minimum_coverage {
+            minimum_coverage = previous;
+        }
+        start = end;
+    }
+    end = length;
+    if end > start && depth <= minimum_coverage {
+        minimum_coverage = depth;
+    }
+    minimum_coverage
+}
+
+/// `gen_chemical_arc_rf`: marks the reads that look chimeric and every
+/// overlap that touches them.
+///
+/// Two passes mirror `worker_hap_dc_ec_chemical_arc_mark`: the first records
+/// the minimum coverage of every read and deletes the overlaps of the ones
+/// at or below `chemical_coverage`; the second visits every reciprocal pair
+/// and propagates the deletion whenever the two halves disagree or either
+/// read is chimeric. The returned mask holds the minimum coverage, or
+/// `255` for a read that was not marked.
+pub fn gen_chemical_arc_rf(
+    sources: &mut [Vec<PafHit>],
+    read_lengths: &[u64],
+    chemical_coverage: i64,
+    chemical_flank: i64,
+) -> (Vec<u8>, u64) {
+    let number_of_reads = sources.len();
+    let mut mask = vec![0u8; number_of_reads];
+    let mut chimeric = 0u64;
+
+    for read in 0..number_of_reads {
+        mask[read] = u8::MAX;
+        let coverage = minimum_chemical_coverage(
+            &sources[read],
+            read_lengths,
+            read_lengths[read] as i64,
+            chemical_flank,
+            0.02,
+            true,
+        );
+        if coverage <= chemical_coverage {
+            mask[read] = coverage as u8;
+            chimeric += 1;
+            for hit in sources[read].iter_mut() {
+                hit.deleted = true;
+            }
+        }
+    }
+
+    for read in 0..number_of_reads {
+        let mut index = 0usize;
+        while index < sources[read].len() {
+            let query = sources[read][index].query_identifier;
+            let target = sources[read][index].target_identifier;
+            if query > target {
+                index += 1;
+                continue;
+            }
+            let mirror = sources[target as usize]
+                .iter()
+                .position(|hit| hit.target_identifier == query);
+            if let Some(mirror) = mirror {
+                let deleted = sources[read][index].deleted
+                    != sources[target as usize][mirror].deleted
+                    || i64::from(mask[query as usize]) <= chemical_coverage
+                    || i64::from(mask[target as usize]) <= chemical_coverage;
+                if read == target as usize {
+                    sources[read][index].deleted = deleted;
+                    sources[read][mirror].deleted = deleted;
+                } else {
+                    let (query_list, target_list) = if (read as u32) < target {
+                        let (left, right) = sources.split_at_mut(target as usize);
+                        (&mut left[read], &mut right[0])
+                    } else {
+                        let (left, right) = sources.split_at_mut(read);
+                        (&mut right[0], &mut left[target as usize])
+                    };
+                    query_list[index].deleted = deleted;
+                    target_list[mirror].deleted = deleted;
+                }
+            }
+            index += 1;
+        }
+    }
+
+    (mask, chimeric)
 }
 
 /// `check_weak_ma_hit`: whether a weak overlap has no strong support.
@@ -500,7 +658,8 @@ pub fn ma_hit_to_arc(
         occurrence: 0,
         strong: hit.matching_length != 0,
         without_large_indel: hit.without_large_indel,
-        exact_region: hit.exact_region as u8,
+        // `t->el = x->el`: the full byte survives into the graph arc.
+        exact_region: hit.exact_region_byte,
     };
 
     (node_length as i32, arc)
@@ -1284,6 +1443,7 @@ fn collect_overlaps_from_different_sources(
             block_length: read_lengths[source.query_identifier as usize] as u32,
             without_large_indel: source.without_large_indel,
             exact_region: source.exact_region,
+            exact_region_byte: source.exact_region_byte,
             deleted: false,
         });
     }
@@ -1417,6 +1577,7 @@ mod tests {
             reverse,
             without_large_indel: true,
             exact_region: false,
+            exact_region_byte: 0,
             deleted: false,
         }
     }

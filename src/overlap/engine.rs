@@ -68,6 +68,7 @@ pub fn compute_candidate_overlaps(
     read_identifier: u64,
     parameters: &CandidateParameters,
     chain_data: &mut ChainData,
+    slot_memory: Option<&mut Vec<OverlapRegion>>,
 ) -> Vec<OverlapRegion> {
     let minimizers = sketch(
         sequence,
@@ -99,6 +100,7 @@ pub fn compute_candidate_overlaps(
         true,
         chain_data,
         &mut overlaps,
+        slot_memory,
     );
 
     apply_chain_limit(&mut overlaps, sequence.len() as u32, parameters.maximum_chain_count);
@@ -118,8 +120,11 @@ pub fn compute_candidate_overlaps(
                 < (right.x_position_start, right.y_identifier)
         });
     } else {
+        // `oreg_xs_lt`: `(x_pos_s << 32) | x_pos_e`, so ties on the start are
+        // ordered by the end, exactly like the reference.
         introsort_by(&mut overlaps, &|left: &OverlapRegion, right: &OverlapRegion| {
-            left.x_position_start < right.x_position_start
+            (u64::from(left.x_position_start) << 32 | u64::from(left.x_position_end))
+                < (u64::from(right.x_position_start) << 32 | u64::from(right.x_position_end))
         });
     }
     overlaps

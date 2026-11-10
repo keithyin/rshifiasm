@@ -21,6 +21,7 @@
 
 use crate::container::ksort::{radix_sort_by_key_32, radix_sort_u64};
 use crate::overlap::region::OverlapRegion;
+use crate::reads::read_store::ReadStore;
 use crate::sequence::encoding::SEQUENCE_NT6_TABLE;
 
 /// `WINDOW_MAX_SIZE`: the largest window the phasing pass handles.
@@ -57,6 +58,16 @@ impl HaplotypeEvidence {
     /// `hh_hp`: whether the observation is marked as a homopolymer.
     pub fn is_homopolymer(&self) -> bool {
         (self.evidence_type >> 1) & 1 == 1
+    }
+
+    /// `hh_bq`: the target base quality packed into bits 2-3.
+    pub fn base_quality(&self) -> u8 {
+        (self.evidence_type >> 2) & 3
+    }
+
+    /// `hh_wq`: the target window quality packed into bits 4-5.
+    pub fn window_quality(&self) -> u8 {
+        (self.evidence_type >> 4) & 3
     }
 }
 
@@ -173,7 +184,7 @@ impl HaplotypeEvidenceAlloc {
 /// `is_st_bs(s, rr, mm)`: the stand-alone test of the second correction round.
 ///
 /// It is always false in the HiFi path because `mm` is `(uint64_t)-1` there.
-fn is_standalone(stats: &SnpStats, rate: f64, maximum: u64) -> bool {
+pub(crate) fn is_standalone(stats: &SnpStats, rate: f64, maximum: u64) -> bool {
     maximum != u64::MAX
         && u64::from(stats.overlap_num) + maximum >= u64::from(stats.occ_0)
         && f64::from(stats.occ_0) * rate + f64::from(stats.overlap_num) >= f64::from(stats.occ_0)
@@ -187,12 +198,54 @@ fn is_standalone(stats: &SnpStats, rate: f64, maximum: u64) -> bool {
 /// reference.
 ///
 /// Returns the number of records written.
+/// `get_wqual` (`Correct.cpp` 9616): the quality of one target base and the
+/// minimum mean quality of the `window`-base sliding window around it.
+pub fn window_quality(
+    reads: &ReadStore,
+    read_id: u32,
+    position: u64,
+    reverse: bool,
+    window: u64,
+) -> (u64, u64) {
+    let length = reads.read_length(read_id as usize);
+    let start = if position + 1 >= window {
+        position + 1 - window
+    } else {
+        0
+    };
+    let end = (position + window).min(length);
+    let levels = reads.read_quality(read_id as usize, start as i64, end as i64, reverse);
+    if levels.is_empty() {
+        return (0, 0);
+    }
+    let base_quality = u64::from(levels[(position - start) as usize]);
+    let window = window as usize;
+    let mut count = 0usize;
+    let mut sum = 0u64;
+    while count < window && count < levels.len() {
+        sum += u64::from(levels[count]);
+        count += 1;
+    }
+    let mut minimum = sum;
+    for index in count..levels.len() {
+        sum -= u64::from(levels[index - window]);
+        sum += u64::from(levels[index]);
+        if sum < minimum {
+            minimum = sum;
+        }
+    }
+    let mean = (minimum as f64 / count as f64).round() as u64;
+    (base_quality, mean)
+}
+
 pub fn push_info(
     hap: &mut HaplotypeEvidenceAlloc,
     a_start: usize,
     a_length: usize,
     out_start: usize,
     overlaps: Option<&[OverlapRegion]>,
+    quality_reads: Option<&ReadStore>,
+    quality_window: u64,
 ) -> usize {
     let zone_end = a_start + a_length;
     radix_sort_by_key_32(&mut hap.list[a_start..zone_end], &|record| {
@@ -295,18 +348,33 @@ pub fn push_info(
     let mut out = 0usize;
     for index in 0..a_length {
         let mut record = hap.list[a_start + index];
+        let target_position = record.overlap_site;
         if !record.is_mismatch() {
             record.overlap_site = hap.snp_stat.len() as u32 - 1;
         } else if allele_identifier[SEQUENCE_NT6_TABLE[record.mismatch_base as usize] as usize]
             != u64::MAX
         {
-            let target_position = record.overlap_site;
             record.coverage = target_position;
             record.overlap_site = allele_identifier
                 [SEQUENCE_NT6_TABLE[record.mismatch_base as usize] as usize]
                 as u32;
         } else {
             continue;
+        }
+        // `v8 != NULL`: pack the base and window qualities of the target into
+        // the evidence type (`hh_bq` bits 2-3, `hh_wq` bits 4-5).
+        if let Some(reads) = quality_reads {
+            let overlaps = overlaps.expect("quality folding needs the overlap list");
+            let target = &overlaps[record.overlap_identifier as usize];
+            let (base_quality, mean_quality) = window_quality(
+                reads,
+                target.y_identifier,
+                u64::from(target_position),
+                target.y_strand != 0,
+                quality_window,
+            );
+            record.evidence_type |= ((base_quality & 3) << 2) as u8;
+            record.evidence_type |= ((mean_quality & 3) << 4) as u8;
         }
         hap.list[out_start + out] = record;
         out += 1;
@@ -700,6 +768,173 @@ pub fn generate_haplotypes_naive_hifi(
     }
 }
 
+/// `generate_haplotypes_sv` (`Correct.cpp` 9115): the structural-variant
+/// promotion used after the ONT indel pass. Unlike the HiFi variant it has no
+/// stand-alone test and runs a second promotion round over the alleles that
+/// the first round scored.
+pub fn generate_haplotypes_sv(
+    hap: &mut HaplotypeEvidenceAlloc,
+    overlaps: &mut [OverlapRegion],
+    informative_coverage: i64,
+    single_haplotype_coverage: i64,
+    mapped_overlaps_length: &mut i64,
+) {
+    if hap.snp_stat.is_empty() || hap.length == 0 {
+        return;
+    }
+    let length = hap.length;
+    hap.snp_srt.clear();
+    radix_sort_by_key_32(&mut hap.list[..length], &|record| {
+        record.overlap_identifier
+    });
+
+    let real_allele = |stats: &SnpStats| -> bool {
+        stats.occ_0 >= 2
+            && stats.occ_1 >= 2
+            && i64::from(stats.occ_0) >= single_haplotype_coverage
+            && i64::from(stats.occ_1) >= informative_coverage
+    };
+
+    let mut k = 1usize;
+    let mut l = 0usize;
+    while k <= length {
+        if k == length || hap.list[k].overlap_identifier != hap.list[l].overlap_identifier {
+            let mut count = 0u64;
+            for index in l..k {
+                let record = hap.list[index];
+                if !record.is_mismatch() {
+                    continue;
+                }
+                let stats = &hap.snp_stat[record.overlap_site as usize];
+                assert_eq!(stats.site, record.site);
+                if real_allele(stats) {
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let key = (u64::from(u32::MAX).wrapping_sub(count) << 32)
+                    .wrapping_add(l as u64);
+                hap.snp_srt.push(key);
+            }
+            l = k;
+        }
+        k += 1;
+    }
+
+    if !hap.snp_srt.is_empty() {
+        radix_sort_u64(&mut hap.snp_srt);
+
+        // First promotion: score every real allele of the ranked overlaps.
+        for key_index in 0..hap.snp_srt.len() {
+            let l = hap.snp_srt[key_index] as u32 as usize;
+            let mut count = 0u64;
+            let mut index = l;
+            while index < length
+                && hap.list[index].overlap_identifier == hap.list[l].overlap_identifier
+            {
+                if hap.list[index].is_mismatch()
+                    && real_allele(&hap.snp_stat[hap.list[index].overlap_site as usize])
+                {
+                    count += 1;
+                }
+                index += 1;
+            }
+            if count == 0 {
+                continue;
+            }
+            let overlap_index = hap.list[l].overlap_identifier as usize;
+            if overlaps[overlap_index].is_match == 1 {
+                overlaps[overlap_index].is_match = 2;
+            }
+            let mut index = l;
+            while index < length
+                && hap.list[index].overlap_identifier == hap.list[l].overlap_identifier
+            {
+                let record = hap.list[index];
+                if record.is_mismatch() {
+                    hap.snp_stat[record.overlap_site as usize].score = 1;
+                } else {
+                    let site = record.overlap_site as usize;
+                    hap.snp_stat[site].occ_0 -= 1;
+                    assert!(hap.snp_stat[site].occ_0 >= 1);
+                }
+                index += 1;
+            }
+        }
+
+        // Second promotion: an overlap still marked as a match but carrying a
+        // scored allele joins the second haplotype.
+        for key_index in 0..hap.snp_srt.len() {
+            let l = hap.snp_srt[key_index] as u32 as usize;
+            let mut count = 0u64;
+            let mut index = l;
+            while index < length
+                && hap.list[index].overlap_identifier == hap.list[l].overlap_identifier
+            {
+                let record = hap.list[index];
+                if record.is_mismatch() {
+                    let stats = &hap.snp_stat[record.overlap_site as usize];
+                    if stats.occ_0 >= 2 && stats.occ_1 >= 2 && stats.score == 1 {
+                        count += 1;
+                    }
+                }
+                index += 1;
+            }
+            let overlap_index = hap.list[l].overlap_identifier as usize;
+            if overlaps[overlap_index].is_match == 1 && count > 0 {
+                overlaps[overlap_index].is_match = 2;
+            }
+        }
+
+        // Reset the scores of the overlaps that stayed in the first haplotype.
+        let mut k = 1usize;
+        let mut l = 0usize;
+        while k <= length {
+            if k == length || hap.list[k].overlap_identifier != hap.list[l].overlap_identifier {
+                let overlap_index = hap.list[l].overlap_identifier as usize;
+                if overlaps[overlap_index].is_match == 1 {
+                    for index in l..k {
+                        if hap.list[index].is_mismatch() {
+                            hap.snp_stat[hap.list[index].overlap_site as usize].score = -1;
+                        }
+                    }
+                }
+                l = k;
+            }
+            k += 1;
+        }
+    }
+
+    // Final marking: promoted overlaps become strong; a match overlap with a
+    // scored real allele is promoted on the spot.
+    let mut k = 1usize;
+    let mut l = 0usize;
+    while k <= length {
+        if k == length || hap.list[k].overlap_identifier != hap.list[l].overlap_identifier {
+            let overlap_index = hap.list[l].overlap_identifier as usize;
+            if overlaps[overlap_index].is_match == 2 {
+                overlaps[overlap_index].strong = 1;
+                *mapped_overlaps_length -= overlap_span(&overlaps[overlap_index]);
+            } else if overlaps[overlap_index].is_match == 1 {
+                for index in l..k {
+                    let record = hap.list[index];
+                    let stats = &hap.snp_stat[record.overlap_site as usize];
+                    if stats.score == 1 && !(stats.occ_0 < 2 || stats.occ_1 < 2) {
+                        overlaps[overlap_index].strong = 1;
+                        if record.is_mismatch() {
+                            overlaps[overlap_index].is_match = 2;
+                            *mapped_overlaps_length -= overlap_span(&overlaps[overlap_index]);
+                            break;
+                        }
+                    }
+                }
+            }
+            l = k;
+        }
+        k += 1;
+    }
+}
+
 /// `x_pos_e + 1 - x_pos_s` with the 32-bit wrap of the reference.
 fn overlap_span(overlap: &OverlapRegion) -> i64 {
     i64::from(
@@ -713,6 +948,18 @@ fn overlap_span(overlap: &OverlapRegion) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_quality_matches_the_sliding_minimum() {
+        let mut reads = ReadStore::default();
+        // Phred 40 ("I") is level 3, "!" is level 0.
+        reads.push_read_with_quality("read", b"ACGTACGT", Some(b"I!IIIIII"));
+        // position 1, window 3: levels [3,0,3,3], base 0, min window sum 6.
+        assert_eq!(window_quality(&reads, 0, 1, false, 3), (0, 2));
+        // A uniform track returns the level itself.
+        reads.push_read_with_quality("flat", b"ACGTACGT", Some(b"IIIIIIII"));
+        assert_eq!(window_quality(&reads, 1, 4, false, 5), (3, 3));
+    }
 
     #[test]
     fn the_window_capacity_matches_the_reference() {

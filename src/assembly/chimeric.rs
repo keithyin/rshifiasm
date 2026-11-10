@@ -416,6 +416,7 @@ mod tests {
             reverse: false,
             without_large_indel: true,
             exact_region: false,
+            exact_region_byte: 0,
             deleted: false,
         }
     }

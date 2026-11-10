@@ -35,7 +35,7 @@ use crate::overlap::region::{CandidatesList, KmerHit, OverlapRegion};
 /// `ul_ov_t` as far as the direct block pass consumes it: the bracket of the
 /// chain plus the fixed interval ends.
 #[derive(Debug, Clone, Copy)]
-pub struct ChainBracket {
+pub(crate) struct ChainBracket {
     /// `qn`: the first chain hit of the bracket, `(uint32_t)-1` for an open
     /// left end.
     pub qn: u32,
@@ -54,7 +54,7 @@ pub struct ChainBracket {
 ///
 /// The reference passes `rid` for debug logging only.
 #[allow(clippy::too_many_arguments)]
-fn ovlp_base_direct(
+pub(crate) fn ovlp_base_direct(
     region: &OverlapRegion,
     hits: &[KmerHit],
     hit_count: i64,
@@ -172,7 +172,7 @@ fn ovlp_base_direct(
 /// builds the chain bracket from the chain ends and calls
 /// [`ovlp_base_direct`].
 #[allow(clippy::too_many_arguments)]
-fn rechain_alignment_ul(
+pub(crate) fn rechain_alignment_ul(
     region: &mut OverlapRegion,
     candidates: &mut CandidatesList,
     output: &mut crate::correction::window::WindowCigar,
@@ -331,7 +331,7 @@ fn rechain_alignment_ul(
 ///
 /// Returns whether the assembled overlap is worth keeping.
 #[allow(clippy::too_many_arguments)]
-fn ul_raw_aln(
+pub(crate) fn ul_raw_aln(
     region: &mut OverlapRegion,
     candidates: &mut CandidatesList,
     targets: &TargetSource,

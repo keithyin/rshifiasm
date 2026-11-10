@@ -20,6 +20,30 @@ pub fn append_inexact_overlap(
     y_read_length: i64,
     add_begin_and_end: bool,
 ) -> bool {
+    append_inexact_overlap_with_template(
+        overlap_list,
+        chained,
+        x_read_length,
+        y_read_length,
+        add_begin_and_end,
+        None,
+    )
+}
+
+/// [`append_inexact_overlap`] with the caller's persistent slot memory.
+///
+/// The reference writes only a subset of the `overlap_region` fields when it
+/// appends: `without_large_indel` is left untouched, so a reused slot keeps
+/// its previous value — from an earlier read or from a region the duplicate
+/// rule popped earlier in the same read. `slot_memory` reproduces that.
+pub fn append_inexact_overlap_with_template(
+    overlap_list: &mut Vec<OverlapRegion>,
+    chained: &OverlapRegion,
+    x_read_length: i64,
+    y_read_length: i64,
+    add_begin_and_end: bool,
+    mut slot_memory: Option<&mut Vec<OverlapRegion>>,
+) -> bool {
     // The reference drops the new overlap when the previous one describes the
     // same target read with an equal or better score.
     if let Some(previous) = overlap_list.last() {
@@ -125,11 +149,23 @@ pub fn append_inexact_overlap(
     }
     region.fake_cigar = fake_cigar;
 
+    // The reference never copies `tmp->overlapLen` into the stored region,
+    // so a freshly appended region keeps the zero from the cleared slot. This
+    // is observable in the duplicate-target tie-break below.
+    region.overlap_length = 0;
     region.alignment_length = 0;
     region.is_match = 0;
     region.non_homopolymer_errors = 0;
     region.strong = 0;
 
+    if let Some(memory) = slot_memory.as_deref_mut() {
+        let index = overlap_list.len();
+        if index >= memory.len() {
+            memory.resize(index + 1, Default::default());
+        }
+        // Never written by the append, so the slot keeps its old value.
+        region.without_large_indel = memory[index].without_large_indel;
+    }
     overlap_list.push(region);
     true
 }

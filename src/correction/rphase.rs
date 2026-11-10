@@ -16,7 +16,7 @@
 
 use crate::container::ksort::{radix_sort_by_key_32, radix_sort_u64};
 use crate::correction::haplotype_evidence::{
-    generate_haplotypes_naive_hifi, push_info, HaplotypeEvidenceAlloc,
+    generate_haplotypes_naive_hifi, generate_haplotypes_sv, push_info, HaplotypeEvidenceAlloc,
 };
 use crate::correction::window::WindowList;
 use crate::correction::window_chain::is_unaligned_window;
@@ -63,6 +63,13 @@ pub struct RphaseScratch {
     pub candidates: Vec<UlOverlap>,
     /// Sort keys; the low 32 bits address [`Self::candidates`].
     pub index: Vec<u64>,
+    /// `b->clist.chainDP`: the ONT DP workspace.
+    pub dp: crate::overlap::region::ChainData,
+    /// `idx`/`buf` of `gen_rphase_dp`.
+    pub dp_index: Vec<u64>,
+    pub dp_result: Vec<u64>,
+    /// `c_idx` reused as the variant vector of `rphase_lidel`.
+    pub lidel_variants: Vec<crate::assembly::ul::UlOv>,
 }
 
 /// `hpc_mask_ff` with a NULL flag buffer, the only form the HiFi path calls.
@@ -152,6 +159,97 @@ pub fn hpc_mask_ff(
         }
     }
 
+    false
+}
+
+/// `hpc_mask_ff_region` (`Correct.cpp` 10454): the interval form of the
+/// homopolymer mask used by the ONT indel pass.
+#[allow(clippy::too_many_arguments)]
+pub fn hpc_mask_ff_region(
+    sequence: &[u8],
+    s0: i64,
+    e0: i64,
+    hpc_flank: i64,
+    hpc_rounds: i64,
+    hpc_cutoff: i64,
+    hpc_rate: f64,
+) -> bool {
+    assert!(e0 >= s0);
+    let sn = sequence.len() as i64;
+    let s = if s0 >= hpc_flank { s0 - hpc_flank } else { 0 };
+    let e = if e0 + hpc_flank <= sn { e0 + hpc_flank } else { sn };
+    let base = if e0 > s0 { e0 - 1 } else { e0 };
+
+    let overlap_ok = |zs: i64, ze: i64| -> bool {
+        let os = zs.max(s0);
+        let oe = ze.min(e0);
+        let ovlp = if oe > os { oe - os } else { 0 };
+        if e0 > s0 {
+            ovlp > 0 && (ovlp as f64) >= ((e0 - s0) as f64 * hpc_rate)
+        } else {
+            zs <= s0 && ze >= e0
+        }
+    };
+
+    for r in 1..=hpc_rounds {
+        let rc = r * hpc_cutoff.max(hpc_rounds);
+
+        // Including the right end.
+        let mut k = base + r;
+        while k < e && (k - r) >= s && sequence[k as usize] == sequence[(k - r) as usize] {
+            k += 1;
+        }
+        let ze = k.min(e);
+        let mut k = base - 1;
+        while k >= s && (k + r) < e && sequence[k as usize] == sequence[(k + r) as usize] {
+            k -= 1;
+        }
+        let zs = (k + 1).max(s);
+        if (ze - zs) > r && (ze - zs) >= rc && overlap_ok(zs, ze) {
+            return true;
+        }
+
+        // Excluding the point, right side.
+        if e0 <= s0 {
+            let mut k = e0 + r + 1;
+            while k < e && (k - r) >= s && sequence[k as usize] == sequence[(k - r) as usize] {
+                k += 1;
+            }
+            let zs = (e0 + 1).max(s);
+            let ze = k.min(e);
+            if (ze - zs) > r && (ze - zs) >= rc {
+                return true;
+            }
+        }
+
+        // Including the left end.
+        let mut k = s0 - r;
+        while k >= s && (k + r) < e && sequence[k as usize] == sequence[(k + r) as usize] {
+            k -= 1;
+        }
+        let zs = (k + 1).max(s);
+        let mut k = s0 + 1;
+        while k < e && (k - r) >= s && sequence[k as usize] == sequence[(k - r) as usize] {
+            k += 1;
+        }
+        let ze = k.min(e);
+        if (ze - zs) > r && (ze - zs) >= rc && overlap_ok(zs, ze) {
+            return true;
+        }
+
+        // Excluding the point, left side.
+        if e0 <= s0 {
+            let mut k = s0 - r - 1;
+            while k >= s && (k + r) < e && sequence[k as usize] == sequence[(k + r) as usize] {
+                k -= 1;
+            }
+            let zs = (k + 1).max(s);
+            let ze = s0.min(e);
+            if (ze - zs) > r && (ze - zs) >= rc {
+                return true;
+            }
+        }
+    }
     false
 }
 
@@ -462,6 +560,12 @@ pub fn rphase_hc(
     mapped_overlaps_length: &mut i64,
     informative_coverage: i64,
     single_haplotype_coverage: i64,
+    query_id: u64,
+    het_cov: i64,
+    hom_cov: i64,
+    n_hap: i64,
+    quality_reads: Option<&crate::reads::read_store::ReadStore>,
+    use_dp: bool,
 ) {
     let query_length = query.len() as i64;
 
@@ -653,7 +757,8 @@ pub fn rphase_hc(
     // Fold the evidence of every site into allele statistics.
     hap.set_snp_matrix(hap.nn_snp, overlaps.len() as u64);
     let evidence_length = hap.length;
-    let statistics_source = if standard_base != 0 {
+    // `z = (std_bs || t8) ? ol->list : NULL`.
+    let statistics_source = if standard_base != 0 || quality_reads.is_some() {
         Some(&overlaps[..])
     } else {
         None
@@ -662,12 +767,39 @@ pub fn rphase_hc(
     let mut group_start = 0usize;
     for k in 1..=evidence_length {
         if k == evidence_length || hap.list[k].site != hap.list[group_start].site {
-            out += push_info(hap, group_start, k - group_start, out, statistics_source);
+            out += push_info(
+                hap,
+                group_start,
+                k - group_start,
+                out,
+                statistics_source,
+                quality_reads,
+                5,
+            );
             group_start = k;
         }
     }
     hap.length = out;
 
+    // `if (dp) gen_rphase_dp(...)` runs before the naive promotion on ONT.
+    if use_dp {
+        crate::correction::rphase_dp::gen_rphase_dp(
+            hap,
+            overlaps,
+            reads,
+            query_id,
+            if standard_base != 0 { 0.05 } else { 0.0 },
+            if standard_base != 0 { 2 } else { u64::MAX },
+            &mut scratch.dp,
+            &mut scratch.dp_index,
+            &mut scratch.dp_result,
+            informative_coverage,
+            single_haplotype_coverage,
+            het_cov,
+            hom_cov,
+            n_hap,
+        );
+    }
     generate_haplotypes_naive_hifi(
         hap,
         overlaps,
@@ -680,7 +812,31 @@ pub fn rphase_hc(
         mapped_overlaps_length,
     );
 
-    assert_eq!(lindel, 0, "rphase_lidel is not ported yet");
+    if lindel != 0 {
+        let found = crate::correction::rphase_lidel::rphase_lidel(
+            overlaps,
+            reads,
+            hap,
+            query,
+            &mut scratch.lidel_variants,
+            &mut scratch.dp_index,
+            &mut scratch.dp_result,
+            boundary,
+            hpc_length,
+            het_cov,
+            hom_cov,
+            n_hap,
+        );
+        if found != 0 {
+            generate_haplotypes_sv(
+                hap,
+                overlaps,
+                informative_coverage,
+                single_haplotype_coverage,
+                mapped_overlaps_length,
+            );
+        }
+    }
 }
 
 /// The window of `cursor` inside `overlap`, used by the tests and by callers
@@ -847,6 +1003,12 @@ mod probe_goldens {
             &mut mapped,
             3,
             3,
+            0,
+            0,
+            0,
+            2,
+            None,
+            false,
         );
 
         let mut lines = Vec::new();

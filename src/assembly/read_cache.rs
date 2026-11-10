@@ -116,13 +116,19 @@ fn write_reads(
     output.write_all(&le_i32(options.homozygous_coverage))?;
     output.write_all(&le_i32(options.heterozygous_coverage))?;
 
-    // The `is_sc` tail is only written in single-cell mode, which is off in
-    // the supported configuration.
+    // `write_All_reads`: in `is_sc` mode the `uint64_t` marker 1 is followed
+    // by each read's packed quality, `read_length/sc_bn` rounded up bytes.
+    // Only the first `ceil(len/4)` bytes carry levels; the reference writes
+    // its uninitialised tail, the port zeroes it.
     if options.single_cell_mode != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "the single-cell cache tail is not implemented",
-        ));
+        output.write_all(&le_u64(1))?;
+        for (length, packed) in reads.read_lengths.iter().zip(reads.qualities.iter()) {
+            output.write_all(packed)?;
+            let stored = (length / 2 + (length % 2)) as usize;
+            for _ in packed.len()..stored {
+                output.write_all(&[0u8])?;
+            }
+        }
     }
 
     output.flush()?;
@@ -143,7 +149,7 @@ fn write_hit(output: &mut impl Write, hit: &PafHit) -> std::io::Result<()> {
     output.write_all(&le_u32(hit.target_identifier))?;
     output.write_all(&le_u32(hit.target_start))?;
     output.write_all(&le_u32(hit.target_end))?;
-    output.write_all(&[u8::from(hit.exact_region)])?;
+    output.write_all(&[hit.exact_region_byte])?;
     output.write_all(&[u8::from(hit.without_large_indel)])?;
     output.write_all(&le_u32(hit.matching_length))?;
     output.write_all(&le_u32(u32::from(hit.reverse)))?;
@@ -186,6 +192,13 @@ pub fn write_all_data_to_disk(
     write_reads(&mut output, options, reads)?;
     drop(output);
 
+    if options.trio_binning_requested()
+        && options.trio_yak_file_names[0].is_some()
+        && options.trio_yak_file_names[1].is_some()
+    {
+        crate::assembly::trio_bin::write_yak_binning(options, reads);
+    }
+
     let source_name = format!("{}.ovlp.source.bin", options.output_file_name);
     let mut output = BufWriter::new(File::create(&source_name)?);
     write_hit_lists(&mut output, forward)?;
@@ -217,12 +230,13 @@ fn read_i32(input: &mut impl Read) -> std::io::Result<i32> {
     Ok(i32::from_le_bytes(buffer))
 }
 
-/// `load_All_reads` (`Process_Read.cpp` 127): rebuilds the read store and
-/// overwrites the homozygous/heterozygous peaks.
-fn load_reads(
-    input: &mut BufReader<File>,
-    options: &mut AssemblyOptions,
-) -> std::io::Result<ReadStore> {
+/// Parses one read block (`<prefix>.ec[0-9]*.bin`) and appends it to
+/// `store`; returns the stored homozygous/heterozygous peaks.
+fn read_read_store(
+    input: &mut impl Read,
+    options: &AssemblyOptions,
+    store: &mut ReadStore,
+) -> std::io::Result<(i32, i32)> {
     let stored_adapter = read_i32(input)?;
     if stored_adapter != options.adapter_length {
         eprintln!(
@@ -287,30 +301,100 @@ fn load_reads(
     let mut trio_labels = vec![0u8; total_reads as usize];
     input.read_exact(&mut trio_labels)?;
 
-    options.homozygous_coverage = read_i32(input)?;
-    options.heterozygous_coverage = read_i32(input)?;
+    let homozygous_coverage = read_i32(input)?;
+    let heterozygous_coverage = read_i32(input)?;
 
-    // The `is_sc` tail is optional; single-cell mode is not supported.
+    store.sequences.extend(sequences);
+    store.read_lengths.extend(read_lengths);
+    store.read_names.extend(read_names);
+    store.trio_labels.extend(trio_labels);
+    store.qualities.extend(vec![Vec::new(); total_reads as usize]);
+    store.total_reads += total_reads;
+    store.total_bases += total_bases;
+
+    eprintln!("Reads has been loaded.");
+    Ok((homozygous_coverage, heterozygous_coverage))
+}
+
+/// `load_All_reads` (`Process_Read.cpp` 127): rebuilds the read store and
+/// overwrites the homozygous/heterozygous peaks.
+fn load_reads(
+    input: &mut BufReader<File>,
+    options: &mut AssemblyOptions,
+) -> std::io::Result<ReadStore> {
+    let mut store = ReadStore::default();
+    let (homozygous_coverage, heterozygous_coverage) = read_read_store(input, options, &mut store)?;
+    options.homozygous_coverage = homozygous_coverage;
+    options.heterozygous_coverage = heterozygous_coverage;
+
+    // The `is_sc` tail is optional; marker 1 is followed by every read's
+    // packed quality (`read_length/sc_bn` rounded up bytes).
     let mut tail = [0u8; 8];
     match input.read_exact(&mut tail) {
         Ok(()) if u64::from_le_bytes(tail) == 1 => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "the single-cell cache tail is not implemented",
-            ));
+            store.qualities.clear();
+            store.qualities.reserve(store.total_reads as usize);
+            for read in 0..store.total_reads as usize {
+                let length = store.read_lengths[read];
+                let stored = (length / 2 + (length % 2)) as usize;
+                let mut packed = vec![0u8; stored];
+                input.read_exact(&mut packed)?;
+                packed.truncate(length.div_ceil(4) as usize);
+                store.qualities.push(packed);
+            }
         }
         _ => {}
     }
 
-    eprintln!("Reads has been loaded.");
-    Ok(ReadStore {
-        read_lengths,
-        read_names,
-        sequences,
-        trio_labels,
-        total_reads,
-        total_bases,
-    })
+    Ok(store)
+}
+
+/// `append_All_reads` (`Process_Read.cpp` 260): appends `<prefix>.ec{id}.bin`
+/// to `store` and consumes `<prefix>.ovlp{id}.source.bin`.
+///
+/// The reference reads every stored hit back only to discard it; the overlap
+/// lists of the pair path are recomputed from the merged reads.
+pub fn append_all_reads(
+    store: &mut ReadStore,
+    options: &mut AssemblyOptions,
+    prefix: &str,
+    id: u32,
+) -> Option<Vec<(bool, u8)>> {
+    let ec_name = format!("{}.ec{}.bin", prefix, id);
+    let source_name = format!("{}.ovlp{}.source.bin", prefix, id);
+    let ec_file = File::open(&ec_name).ok()?;
+    let source_file = File::open(&source_name).ok()?;
+
+    let mut input = BufReader::new(ec_file);
+    match read_read_store(&mut input, options, store) {
+        Ok((homozygous_coverage, heterozygous_coverage)) => {
+            // `asm_opt.hom_cov += hom_cov0` (the reference accumulates).
+            options.homozygous_coverage += homozygous_coverage;
+            options.heterozygous_coverage += heterozygous_coverage;
+        }
+        Err(_) => return None,
+    }
+
+    read_source_overlap_flags(BufReader::new(source_file)).ok()
+}
+
+/// Reads the per-read `is_fully_corrected`/`is_abnormal` flags of one
+/// `ma_hit_t_alloc` file and discards the hits: `append_All_reads` clears
+/// every loaded list but keeps the two flags.
+fn read_source_overlap_flags(mut input: impl Read) -> std::io::Result<Vec<(bool, u8)>> {
+    let read_count = read_u64(&mut input)? as usize;
+    let mut flags = [0u8; 2];
+    let mut result = Vec::with_capacity(read_count);
+    for _ in 0..read_count {
+        input.read_exact(&mut flags)?;
+        let hits = read_u32(&mut input)? as u64;
+        result.push((flags[0] != 0, flags[1]));
+        std::io::copy(
+            &mut input.by_ref().take(hits * 42),
+            &mut std::io::sink(),
+        )?;
+    }
+    Ok(result)
 }
 
 fn read_hit(input: &mut impl Read) -> std::io::Result<PafHit> {
@@ -338,6 +422,7 @@ fn read_hit(input: &mut impl Read) -> std::io::Result<PafHit> {
         reverse: reverse != 0,
         without_large_indel: flags[1] != 0,
         exact_region: flags[0] != 0,
+        exact_region_byte: flags[0],
         deleted: deleted != 0,
     })
 }
@@ -377,7 +462,7 @@ pub fn load_all_data_from_disk(
     let ec_name = format!("{}.ec.bin", options.output_file_name);
     let ec_file = File::open(&ec_name).ok()?;
     let mut input = BufReader::new(ec_file);
-    let reads = match load_reads(&mut input, options) {
+    let mut reads = match load_reads(&mut input, options) {
         Ok(reads) => reads,
         Err(error) => {
             eprintln!("[WARN] failed to load {}: {}", ec_name, error);
@@ -386,7 +471,17 @@ pub fn load_all_data_from_disk(
     };
     drop(input);
 
-    // The trio yak-binning cache is only loaded in trio-binning mode.
+    // `if (ha_opt_triobin(&asm_opt)) { if (!(yak0 && yak1 &&
+    // load_yak_binning(...))) { ha_triobin(&asm_opt); write_yak_binning(...); } }`
+    // — list-only runs replay the lists (and write their phase cache) too.
+    if options.trio_binning_requested() {
+        let dumps_ready = options.trio_yak_file_names[0].is_some()
+            && options.trio_yak_file_names[1].is_some();
+        if !(dumps_ready && crate::assembly::trio_bin::load_yak_binning(options, &mut reads)) {
+            crate::assembly::trio_bin::run_trio_binning(options, &mut reads);
+            crate::assembly::trio_bin::write_yak_binning(options, &reads);
+        }
+    }
 
     let source_name = format!("{}.ovlp.source.bin", options.output_file_name);
     let forward = match File::open(&source_name) {

@@ -3018,6 +3018,142 @@ fn get_contained_reads_chain_by_broken_bub(
     false
 }
 
+/// `get_chimeric_reads_chain_by_broken_bub` (`Overlaps.cpp` 34378): the
+/// chimeric counterpart of the contained chain walker — it follows surviving
+/// edges of surviving reads through a broken-bubble graph.
+#[allow(clippy::too_many_arguments)]
+fn get_chimeric_reads_chain_by_broken_bub(
+    unitigs: &[MaUtg],
+    unitig_graph: &Asg,
+    read_graph: &Asg,
+    sources: &[PafList],
+    coverage_cut: &[CoverageCut],
+    read_to_unitig: &ReadToUnitig,
+    trio_labels: &[u8],
+    parameters: crate::assembly::rescue::RescueParameters,
+    mut end_rid: u32,
+    first_hit: &PafHit,
+    chain_edges: &mut Vec<AsgArc>,
+    return_ava_cur: &mut u32,
+    return_ava_ol: &mut u32,
+    return_chain_len: &mut u32,
+    expect_vis: &[u8],
+    circle_vis: &mut [u8],
+    mut utg_vis: Option<&mut Vec<u8>>,
+    ignore_trio_flag: u32,
+) -> bool {
+    *return_chain_len = u32::MAX;
+    *return_ava_cur = u32::MAX;
+    *return_ava_ol = u32::MAX;
+    chain_edges.clear();
+    let mut chain_len = 0u32;
+
+    let mut h: Option<&PafHit> = Some(first_hit);
+    while let Some(hit) = h {
+        let query_cut = &coverage_cut[hit.query_identifier as usize];
+        let target_cut = &coverage_cut[hit.target_identifier as usize];
+
+        let mut non_trio_flag = u32::MAX;
+        if ignore_trio_flag == 0 {
+            if trio_labels[hit.query_identifier as usize]
+                == crate::command_line::options::TRIO_FATHER
+            {
+                non_trio_flag = u32::from(crate::command_line::options::TRIO_MOTHER);
+            }
+            if trio_labels[hit.query_identifier as usize]
+                == crate::command_line::options::TRIO_MOTHER
+            {
+                non_trio_flag = u32::from(crate::command_line::options::TRIO_FATHER);
+            }
+            if u32::from(trio_labels[hit.target_identifier as usize]) == non_trio_flag {
+                break;
+            }
+        }
+
+        // Chimeric chains need all three deletion flags.
+        if !target_cut.deleted
+            || !hit.deleted
+            || !read_graph.sequences[hit.target_identifier as usize].deleted
+        {
+            break;
+        }
+
+        let (_, is_unitig) = read_to_unitig.get(hit.target_identifier);
+        if is_unitig == 1 {
+            break;
+        }
+
+        let query_length = query_cut.end.wrapping_sub(query_cut.start) as i32;
+        let target_length = target_cut.end.wrapping_sub(target_cut.start) as i32;
+        let (result, t) = crate::assembly::hit::ma_hit_to_arc(
+            hit,
+            query_length,
+            target_length,
+            parameters.maximum_hang,
+            parameters.maximum_hang_rate,
+            parameters.minimum_overlap,
+        );
+        if result < 0 {
+            break;
+        }
+        if (t.ul >> 32) as u32 != end_rid {
+            break;
+        }
+
+        chain_edges.push(t);
+        chain_len += 1;
+
+        if circle_vis[(t.ul >> 33) as usize] != 0 || circle_vis[(t.v >> 1) as usize] != 0 {
+            break;
+        }
+        circle_vis[(t.ul >> 33) as usize] = 1;
+        circle_vis[(t.v >> 1) as usize] = 1;
+
+        let (ava_cur, test_o_len) = get_num_edges2existing_nodes_advance_by_broken_bub(
+            unitigs,
+            unitig_graph,
+            read_graph,
+            sources,
+            coverage_cut,
+            read_to_unitig,
+            trio_labels,
+            parameters,
+            expect_vis,
+            t.v,
+            utg_vis.as_deref_mut(),
+            ignore_trio_flag,
+        );
+        if ava_cur > 0 {
+            *return_ava_cur = ava_cur;
+            *return_ava_ol = test_o_len;
+            *return_chain_len = chain_len;
+            for edge in chain_edges.iter() {
+                circle_vis[(edge.ul >> 33) as usize] = 0;
+                circle_vis[(edge.v >> 1) as usize] = 0;
+            }
+            return true;
+        }
+
+        end_rid = t.v;
+        h = crate::assembly::rescue::get_best_cmk_read(
+            read_graph,
+            sources,
+            coverage_cut,
+            read_to_unitig,
+            trio_labels,
+            parameters,
+            end_rid,
+            ignore_trio_flag,
+        );
+    }
+
+    for edge in chain_edges.iter() {
+        circle_vis[(edge.ul >> 33) as usize] = 0;
+        circle_vis[(edge.v >> 1) as usize] = 0;
+    }
+    false
+}
+
 /// `set_rtg_flag_by_bubble` (`Overlaps.cpp` 35321): flags the reads of
 /// bubble `v` (body, beg and sink) in `vis_flag`.
 fn set_rtg_flag_by_bubble(
@@ -3407,6 +3543,292 @@ pub fn rescue_bubbles_by_contained_reads(
             read_to_unitig.set_raw(v as u32, u32::MAX);
         }
         let _ = u_id;
+    }
+}
+
+/// `rescue_bubbles_by_cmk_reads` (`Overlaps.cpp` 35883): the ONT-only bubble
+/// rescue that follows chimeric reads through broken bubbles. The chemical
+/// mask only gates the call; its contents are unused.
+#[allow(clippy::too_many_arguments)]
+pub fn rescue_bubbles_by_cmk_reads(
+    unitig_graph: &mut Asg,
+    unitigs: &[MaUtg],
+    read_graph: &mut Asg,
+    sources: &[PafList],
+    coverage_cut: &mut [CoverageCut],
+    read_to_unitig: &mut ReadToUnitig,
+    trio_labels: &mut [u8],
+    bub: &BubbleType,
+    bubble_labels: &mut BubbleLabel,
+    parameters: crate::assembly::rescue::RescueParameters,
+    chain_len_thres: u32,
+    beg_idx: u32,
+    occ: u32,
+) {
+    let chain_unitigs = bub.bubble_unitigs.as_ref().expect("chain unitigs built");
+    for sequence in unitig_graph.sequences.iter_mut() {
+        sequence.coverage_class = crate::assembly::hit::PRIMARY_LABEL;
+    }
+
+    let mut new_edges: Vec<AsgArc> = Vec::new();
+    let mut chain_edges: Vec<AsgArc> = Vec::new();
+    let mut u_vecs: Vec<u64> = Vec::new();
+    let mut expect_vis = vec![0u8; read_graph.sequences.len()];
+    let mut circle_vis = vec![0u8; read_graph.sequences.len()];
+    let mut utg_vis = vec![0u8; unitig_graph.sequences.len()];
+
+    for v in 0..unitig_graph.sequences.len() as u32 {
+        let unitig = &unitigs[v as usize];
+        if unitig.reads.is_empty() {
+            continue;
+        }
+        if unitig_graph.sequences[v as usize].deleted {
+            continue;
+        }
+        for read in &unitig.reads {
+            let read_id = (read >> 33) as u32;
+            read_to_unitig.set(
+                read_id,
+                v,
+                true,
+                Some(read_graph.sequences[read_id as usize].coverage_class),
+            );
+        }
+    }
+
+    for chain in chain_unitigs.iter() {
+        if chain.reads.len() < 3 {
+            continue;
+        }
+        for bub_i in 1..chain.reads.len() - 1 {
+            let m_bub = (chain.reads[bub_i] >> 33) as u64;
+            if m_bub < beg_idx as u64 || m_bub >= beg_idx as u64 + occ as u64 {
+                continue;
+            }
+            let l_bub = (chain.reads[bub_i - 1] >> 33) as u64;
+            let r_bub = (chain.reads[bub_i + 1] >> 33) as u64;
+
+            set_rtg_flag_by_bubble(bub, unitigs, read_graph, l_bub as u32, &mut expect_vis, 1);
+            set_rtg_flag_by_bubble(bub, unitigs, read_graph, r_bub as u32, &mut expect_vis, 1);
+            set_rtg_flag_by_bubble(bub, unitigs, read_graph, m_bub as u32, &mut expect_vis, 1);
+
+            let (_, _, body, _) = get_bubbles(bub, m_bub);
+            for &node in body {
+                let u_id = (node >> 1) as usize;
+                let unitig = &unitigs[u_id];
+                if unitig.reads.is_empty() {
+                    continue;
+                }
+                for k_v in 0..2u32 {
+                    let v = ((u_id as u32) << 1) + k_v;
+                    if get_real_length(unitig_graph, v) != 0 {
+                        continue;
+                    }
+
+                    let end_rid = if v & 1 == 1 {
+                        unitig.start ^ 1
+                    } else {
+                        unitig.end ^ 1
+                    };
+
+                    let hits = &sources[(end_rid >> 1) as usize].hits;
+                    let mut ava_max = 0u32;
+                    let mut ava_ol_max = 0u32;
+                    let mut ava_min_chain = u32::MAX;
+                    let mut best: Option<usize> = None;
+                    let mut ava_cur = 0u32;
+                    let mut test_o_len = 0u32;
+                    let mut ava_chain_len = 0u32;
+
+                    for k in 0..hits.len() {
+                        if get_chimeric_reads_chain_by_broken_bub(
+                            unitigs,
+                            unitig_graph,
+                            read_graph,
+                            sources,
+                            coverage_cut,
+                            read_to_unitig,
+                            trio_labels,
+                            parameters,
+                            end_rid,
+                            &hits[k],
+                            &mut chain_edges,
+                            &mut ava_cur,
+                            &mut test_o_len,
+                            &mut ava_chain_len,
+                            &expect_vis,
+                            &mut circle_vis,
+                            Some(&mut utg_vis),
+                            1,
+                        ) {
+                            let mut is_update = false;
+                            if ava_cur > ava_max {
+                                is_update = true;
+                            } else if ava_cur == ava_max {
+                                if ava_chain_len < ava_min_chain {
+                                    is_update = true;
+                                } else if ava_chain_len == ava_min_chain
+                                    && test_o_len > ava_ol_max
+                                {
+                                    is_update = true;
+                                }
+                            }
+
+                            if is_update {
+                                ava_min_chain = ava_chain_len;
+                                ava_max = ava_cur;
+                                ava_ol_max = test_o_len;
+                                best = Some(k);
+                            }
+                        }
+                    }
+
+                    if ava_max == 0 {
+                        continue;
+                    }
+                    let k = best.expect("a best hit exists");
+                    get_chimeric_reads_chain_by_broken_bub(
+                        unitigs,
+                        unitig_graph,
+                        read_graph,
+                        sources,
+                        coverage_cut,
+                        read_to_unitig,
+                        trio_labels,
+                        parameters,
+                        end_rid,
+                        &hits[k],
+                        &mut chain_edges,
+                        &mut ava_cur,
+                        &mut test_o_len,
+                        &mut ava_chain_len,
+                        &expect_vis,
+                        &mut circle_vis,
+                        None,
+                        1,
+                    );
+                    if chain_edges.is_empty() {
+                        continue;
+                    }
+                    let t_max = *chain_edges.last().expect("non-empty chain");
+
+                    let mut rbub_edges: Vec<AsgArc> = Vec::new();
+                    let mut scan_index = 0usize;
+                    let mut r_edge = AsgArc::default();
+                    while get_edge2existing_node_advance_by_broken_bub(
+                        unitigs,
+                        unitig_graph,
+                        read_graph,
+                        sources,
+                        coverage_cut,
+                        read_to_unitig,
+                        trio_labels,
+                        parameters,
+                        &expect_vis,
+                        t_max.v,
+                        &mut scan_index,
+                        &mut r_edge,
+                        1,
+                    ) {
+                        rbub_edges.push(r_edge);
+                    }
+
+                    minor_transitive_reduction_r_g(read_graph, &mut rbub_edges);
+
+                    for edge in chain_edges.iter() {
+                        let t_max = *edge;
+                        let (contain_rid, is_unitig) = read_to_unitig.get(t_max.v >> 1);
+                        let contain_rid = if is_unitig == 1 || is_unitig == u32::MAX {
+                            u32::MAX
+                        } else {
+                            contain_rid
+                        };
+                        u_vecs.push((u64::from(contain_rid) << 32) | u64::from(t_max.v >> 1));
+
+                        read_graph.sequences[(t_max.v >> 1) as usize].deleted = false;
+                        coverage_cut[(t_max.v >> 1) as usize].deleted = false;
+                        coverage_cut[(t_max.v >> 1) as usize].class =
+                            crate::assembly::hit::PRIMARY_LABEL;
+
+                        if let Some(t) = get_edge_from_source(
+                            sources,
+                            coverage_cut,
+                            parameters.maximum_hang,
+                            parameters.maximum_hang_rate,
+                            parameters.minimum_overlap,
+                            (t_max.ul >> 32) as u32,
+                            t_max.v,
+                        ) {
+                            new_edges.push(t);
+                        }
+                        if let Some(t) = get_edge_from_source(
+                            sources,
+                            coverage_cut,
+                            parameters.maximum_hang,
+                            parameters.maximum_hang_rate,
+                            parameters.minimum_overlap,
+                            t_max.v ^ 1,
+                            ((t_max.ul >> 32) as u32) ^ 1,
+                        ) {
+                            new_edges.push(t);
+                        }
+                    }
+
+                    for edge in rbub_edges.iter() {
+                        let t = *edge;
+                        if t.deleted {
+                            continue;
+                        }
+                        new_edges.push(t);
+                        if let Some(t) = get_edge_from_source(
+                            sources,
+                            coverage_cut,
+                            parameters.maximum_hang,
+                            parameters.maximum_hang_rate,
+                            parameters.minimum_overlap,
+                            t.v ^ 1,
+                            ((t.ul >> 32) as u32) ^ 1,
+                        ) {
+                            new_edges.push(t);
+                        }
+                    }
+                }
+            }
+
+            set_rtg_flag_by_bubble(bub, unitigs, read_graph, l_bub as u32, &mut expect_vis, 0);
+            set_rtg_flag_by_bubble(bub, unitigs, read_graph, r_bub as u32, &mut expect_vis, 0);
+            set_rtg_flag_by_bubble(bub, unitigs, read_graph, m_bub as u32, &mut expect_vis, 0);
+        }
+    }
+
+    finish_bubble_rescue(
+        read_graph,
+        sources,
+        coverage_cut,
+        bubble_labels,
+        trio_labels,
+        &mut new_edges,
+        parameters.minimum_length_threshold,
+    );
+
+    for a_nodes in u_vecs.iter() {
+        let mut w = (*a_nodes & 0xffffffff) as u32;
+        w <<= 1;
+        if !read_graph.sequences[(w >> 1) as usize].deleted
+            && (get_real_length(read_graph, w) != 0 || get_real_length(read_graph, w ^ 1) != 0)
+        {
+            read_to_unitig.set_raw(w >> 1, u32::MAX);
+        } else {
+            read_graph.delete_sequence(w >> 1);
+            coverage_cut[(w >> 1) as usize].deleted = true;
+        }
+    }
+
+    for v in 0..read_to_unitig.len() {
+        let (_, is_unitig) = read_to_unitig.get(v as u32);
+        if is_unitig == 1 {
+            read_to_unitig.set_raw(v as u32, u32::MAX);
+        }
     }
 }
 
@@ -3863,6 +4285,7 @@ pub fn rescue_bubble_by_chain(
     min_ovlp: i32,
     chain_len_thres: u32,
     minimum_length_threshold: i64,
+    chemical_mask: Option<&[u8]>,
 ) -> Result<(), String> {
     let parameters = RescueParameters {
         maximum_hang: max_hang,
@@ -3963,6 +4386,30 @@ pub fn rescue_bubble_by_chain(
         bub.full_bubble_count as u32,
         (bub.broken_bubble_count + bub.broken_end_bubble_count + bub.tangle_bubble_count) as u32,
     );
+
+    // `if(cmk)`: the ONT-only fourth pass over chimeric reads.
+    if chemical_mask.is_some() {
+        unitig_graph = crate::assembly::unitig::ma_ug_gen_primary(
+            read_graph,
+            crate::assembly::hit::PRIMARY_LABEL,
+        );
+        reset_bub(&mut bub, &mut unitig_graph.graph, &unitig_graph.unitigs, &ir_het, &mut new_rtg_edges);
+        rescue_bubbles_by_cmk_reads(
+            &mut unitig_graph.graph,
+            &unitig_graph.unitigs,
+            read_graph,
+            sources,
+            coverage_cut,
+            read_to_unitig,
+            trio_labels,
+            &bub,
+            bubble_labels,
+            parameters,
+            chain_len_thres,
+            bub.full_bubble_count as u32,
+            (bub.broken_bubble_count + bub.broken_end_bubble_count + bub.tangle_bubble_count) as u32,
+        );
+    }
 
     Ok(())
 }

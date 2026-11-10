@@ -100,6 +100,7 @@ mod tests {
             reverse: false,
             without_large_indel: false,
             exact_region: false,
+            exact_region_byte: 0,
             deleted: false,
         }]];
         write_requested_outputs(&options, &reads, &paf, false).unwrap();

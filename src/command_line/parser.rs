@@ -953,22 +953,14 @@ fn check_supported(options: &AssemblyOptions) -> bool {
         eprintln!("[ERROR] the ultra-long integration (--ul) is not implemented yet");
         return false;
     }
+    if options.hic_partition_requested() {
+        eprintln!("[ERROR] the Hi-C phasing branch (--h1/--h2) is not implemented yet");
+        return false;
+    }
     if options.flags & super::options::FLAG_VERBOSE_GFA != 0 {
         eprintln!(
             "[ERROR] --dbg-gfa (the .pt_flt index checkpoint and verbose GFA dump) is not implemented yet"
         );
-        return false;
-    }
-    if options.required_read_name.is_some() {
-        eprintln!("[ERROR] -b (single-read correction debugging) is not implemented yet");
-        return false;
-    }
-    if options.ont_mode != 0 {
-        eprintln!("[ERROR] the ONT correction branch is not implemented yet");
-        return false;
-    }
-    if options.flags & super::options::FLAG_FAST != 0 {
-        eprintln!("[ERROR] the fast-mode correction index is not implemented yet");
         return false;
     }
     true

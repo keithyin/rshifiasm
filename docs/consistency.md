@@ -96,7 +96,7 @@
 | P5 组装图 | `p_utg.gfa`、`p_ctg.gfa` 逐字节一致 | ✅ 完成（r_utg/p_utg 全链路一致；p_ctg 探针级 + e2e 一致，见下文实测） |
 | P6 单倍型 | `hap1/hap2.p_ctg.gfa`、`a_ctg.gfa` 一致 | ✅ 完成（`hap1/hap2.p_ctg.*` 探针级 + e2e 逐字节一致，见下文实测；`--dual-scaf` 的完整路径见下文 `trans_base_infer` 一节） |
 | P7 Hi-C/trio | trio 全部分支逐字节；Hi-C 需额外测试数据 | ✅ trio（名单模式/`--trio-dual`/`-5`/`--dual-scaf`）；⏳ Hi-C |
-| P8 ONT/UL | 需额外测试数据 | ⏳ 待实现 |
+| P8 ONT/UL | 需额外测试数据 | ✅ ONT（全部 GFA/BED/ovlp 逐字节一致；`--fast` 亦一致）；⏳ UL |
 
 ## 已验证的翻译细节
 
@@ -2236,3 +2236,380 @@ gfa/noseq/lowQ.bed 共 9 项全部 identical，`.ovlp.source.bin`/
 UL 基础与 `--dual-scaf` 已接入 `output_trio_graph_joint`
 （`options.self_scaffolding != 0`）；默认/trio-dual/-5 路径不受影响，
 `cargo test --release` 全绿（333 passed）。
+
+## Trio Stage B：yak k-mer dump（2026-11-09，已完成）
+
+`-1/-2` 此前只被解析、不产生任何效应（静默分歧）。本轮补齐
+（`src/assembly/trio_bin.rs`）：
+
+| Rust | C++ |
+|---|---|
+| `ha_triobin_yak` | Trio.cpp 261 |
+| `restore_core` | `yak_ch_restore_core`（Trio.cpp 66，TRIOBIN1/2 模式） |
+| `classify_read` / `tb_classify` | `tb_worker` / `tb_classify`（Trio.cpp 203/173） |
+| `yak_hash64` | Trio.cpp 的掩码版 `yak_hash64`（每步截断到 `2k` 位，与 `hash64_64` 加尾部掩码不同） |
+| `write_yak_binning` / `load_yak_binning` / `test_yak_binning` | Overlaps.cpp 23501 / 23534、Trio.cpp 352 |
+
+要点：
+
+- dump 头：`"YAK\2"` + `u32 (k, pre, counter_bits=10)`；每个子表
+  `u32 capacity, u32 size` + `size` 个 `u64` 键，键为
+  `(hash >> pre) << 10 | count`。参考按 `hash & ((1<<pre)-1)` 分表，
+  Rust 在读取时用子表序号恢复被 dump 丢弃的低 `pre` 位，扁平表以完整
+  hash 为键，等价于 `(bucket, hash>>pre)` 的查找语义。
+- 装载：`count >= mid_cnt` 记 2、`>= min_cnt` 记 1，父本左移 0 位、
+  母本左移 2 位；同一 k-mer 在两个 dump 中出现时低位按位或合并。
+- 分类：逐 k-mer 查表得到 4 位类别，父本私有/母本私有的连续段长度累计到
+  `sc[0]/sc[1]`，再按 `tb_classify`（`ratio_thres=0.33`）判定
+  FATHER/MOTHER/AMBIGU；yak 结果覆盖名单结果。
+- 缓存：写 `<out>.hap1/hap2.phase.bin`，首行 `read\tdump路径` 作为
+  校验键；装载时若两个 phase 文件的首行都与当前 dump 路径一致，则用
+  phase 名单重放（`ha_triobin` 名单模式），否则重新分类并写回缓存。
+  名单模式下参考也会在缓存装载路径重放名单并写出带 `(null)` 键的
+  phase 文件，Rust 已对齐。
+- 测试数据：`scripts/gen_yak_dump.py` 按名单把读段 k-mer 以固定 count 5
+  写入两个 dump（伪单倍型共享 k-mer 会自然产生 AMBIGU 读段）。
+
+门禁（`-t1`，chr11-2M + 上述 dump）：
+
+| 项目 | 结果 |
+|---|---|
+| `dip.hap1/hap2`、`p_utg`、`r_utg` 的 gfa/noseq/lowQ.bed（12 项） | C++ 与 Rust **逐字节一致** |
+| `out.hap1/hap2.phase.bin` | 逐字节一致（28 / 23 条被判为私有） |
+| `.ovlp.source/.reverse.bin` | 逐字节一致 |
+| `.ec.bin` | 既有 padding 豁免 |
+| 第二次运行（装载 `.ec.bin` + phase 缓存） | C++ 0.22s / Rust 0.73s，产物仍逐字节一致 |
+| 名单模式缓存回归（`-3/-4` 两轮） | 产物与 `reference_trio.*` 一致；phase 文件逐字节一致（2752 / 2874 条，首行 `(null)`） |
+
+`cargo test --release`：334 passed（新增 yak dump 读取/分类单测）。
+
+## `--sec-in` 配对模式（2026-11-09，部分完成，暂时门禁）
+
+`ha_assemble_pair`（Assembly.cpp 2128）的前端已落地，但还缺 C++ 旧路径的
+窗口级单倍型证据簇，输出尚不一致，因此 `--sec-in` 目前在 parse 期显式拒绝，
+不会静默产生错误结果。
+
+已落地：
+
+| Rust | C++ |
+|---|---|
+| `read_cache::append_all_reads` / `skip_source_overlap_list` | `append_All_reads`（Process_Read.cpp 260；读回 hit 后丢弃） |
+| `correction::pair::run_overlap_correction` | `ha_overlap_cal(r, read_from_store=1)` + `worker_ovec_cal0` 主干 |
+| `assemble_pair` | Assembly.cpp 2128（含 `.ec{0,1}.bin` / `.ovlp{0,1}.source.bin` 装载、缓存重放） |
+| `correct_overlap` 新增 `is_consensus` 参数 | `worker_ovec_cal0` 传 0 |
+
+缺口：`partition_overlaps_advance`（Correct.cpp 10626）及其依赖
+`cluster_advance` / `markSNP_detail` / `markSNP_advance` /
+`addSNPtohaplotype_advance` / `insert_snp_ee` / `lable_large_indels`（约
+1.5k 行）。缺它时所有重叠加都留在 forward PAF，`reverse_paf` 为空，
+GFA 与 C++ 不一致（实测 18 个产物不同）。
+
+## ONT 基础层（2026-11-09，进行中）
+
+为 P8 ONT 打底，已完成与格式相关的部分（`src/reads/read_store.rs`、
+`read_cache.rs`、`read_writeback.rs`）：
+
+- 2-bit 质量值 `rsc`：`compress_quality` / `retrieve_quality` 复刻
+  `ha_compress_qual` / `retrive_bqual`（每字节 4 个 level、尾部左移填充；
+  `sc_tb = {10,20,30,40,50,60,70,80}`）。
+- 读入过滤：`--ont` 打开 `is_sc` 后按 `rl_cut` 与 `flt_quals(qual, 33,
+  sc_cut)` 过滤读段。
+- `.ec.bin` 的 `is_sc` 尾部：marker `u64=1` + 每读段
+  `ceil(len/2)` 字节质量（仅前 `ceil(len/4)` 字节有效；参考写入未初始化
+  尾部，Rust 写 0，与既有 `.ec.bin` padding 豁免一致）。
+- `Output_corrected_fastq`（`.ec.fq`）：质量按 `sc_tb[level]+32` 展开。
+- `write_requested_outputs` 在 `is_sc` 时自动选择 fastq。
+- 单测：打包/还原、反向区间、`flt_quals`、fastq 质量展开。
+
+尚未实现（`--ont`/`--fast` 仍被 parse 期拒绝）：ONT worker 参数分支
+（`bw_thres=0.05`、`WINDOW_OHC`、`align_gap_rate=0.006/max=64`）、
+`q8/t8` 质量回写、chemical 掩码
+（`gen_chemical_arc_rf`/`try_rescue_overlaps`）、图清理的 ONT 分支、
+`--fast` 的 DP 选点索引。
+
+本轮（续）已落地的 ONT 相位部件：
+
+- `haplotype_evidence::window_quality`（`get_wqual`，Correct.cpp 9616）：
+  目标碱基质量 + `sc_wn=5` 滑动窗最小均值。
+- `push_info` 增加 `quality_reads`/`quality_window` 参数：`v8 != NULL`
+  分支把 `tqual`/`wqual` 打包进证据 type 的 2-5 位（`hh_bq`/`hh_wq`）。
+- `generate_haplotypes_sv`（Correct.cpp 9115）：ONT indel 趟之后的
+  结构变异提升（两轮提升 + 分数重置 + 最终 strong 标记）。
+- `rphase_hc` 增加 `quality_reads`/`use_dp` 参数；HiFi 调用传
+  `None/false`，行为不变（`statistics_source` 条件改为
+  `std_bs || t8`）。
+- `correction::rphase_dp`（新模块）：`gen_rphase_dp`（Correct.cpp 9648）
+  及其 `gen_rphase_dp0_single_path` / `comput_sc_rphase` / `is_hpc_vec` /
+  `get_hq_value` / `fill_incom` 全族，含质量感知等位过滤、不完整观测补齐、
+  最长兼容路径 DP 与三轮紧凑化；`rphase_hc` 的 `use_dp` 分支已接入
+  （在 naive 提升之前调用）。HiFi 不进入该分支。
+- `correction::rphase_lidel`（新模块）：`rphase_lidel` / `rphase_lidel_cc` /
+  `rcall_lidel_variant` / `gen_ov_lidel_variant` / `push_idel_info` /
+  `extract_sub_cigar_sv` / `iter_sub_cigar_sv` / `extract_sub_err` /
+  `cal_lindel_dd` / `set_cgid` / `is_get_group` 全族（Correct.cpp
+  18674–20190），以及 `rphase::hpc_mask_ff_region`。`rphase_hc` 的
+  `lindel` 分支接入：返回非零时调用 `generate_haplotypes_sv`。
+  注意复刻了参考的两处死代码：`rphase_lidel` 的二级 `qe` 排序条件
+  `k > i + k` 恒假；`rcall_lidel_variant` 的 `bn0` 恒 0。
+
+`cargo test --release`：338 passed。
+
+
+## ONT 分支完成（2026-11-10）
+
+`--ont` 从 parse 期拒绝改为完整通路，门禁语料为 `-t1 --ont` 跑
+chr11-2M（FASTA 转成统一高质量 FASTQ，见 `/tmp` 临时语料）。
+
+关键落地点：
+
+- 纠错参数：`bw_thres=0.05`、`WINDOW_OHC=375`、`align_gap_rate=0.006`、
+  `align_gap_max=64`、`HPC_PL=12`，并给 `rphase_hc` 传
+  `quality_reads/use_dp/lindel`（`rphase_dp`、`rphase_lidel` 在上一轮已落地）。
+- 质量回写（`worker_sl_ec` 的 is_sc 分支）：`corrected_quality_from_consensus_cigar`
+  按 consensus cigar 重建 2-bit 质量——match/mismatch 复制原质量，insertion
+  用 `get_wqual` 的最小窗均值；窗口上界取**纠错后**读长（参考在写回前已更新
+  `read_length`，因此插入点靠近末尾时窗口为空、质量为 0）。轮次翻转时质量
+  轨道同步反向（`worker_hap_post_rev`）。
+- `is_uncorrected_read`：ONT 最终 overlap 重建后，若存在 ≥1600bp 未覆盖段，
+  清空该读 overlap 列表（`worker_hap_dc_ec_gen_new_idx`）。
+- 化学掩码 `gen_chemical_arc_rf`（`cal_chemical_r_adv` 两遍扫描）与
+  `normalize_ma_hit_t_single_side_advance(cmk)`；ONT 跳过
+  `clean_weak_ma_hit_t`；`clean_graph` 不再 `renew_graph_init`。
+- 图清理 ONT 分支：`asg_arc_cut_weak`（含 `is_dedup_weak_arc`）在初始、
+  每轮、收尾各调用一次，参数 0.975/16/1/拓扑。
+- `post_rescue` 的额外两趟：`rescue_chimeric_reads_aggressive`
+  （`get_chimeric_reads_chain`/`get_best_cmk_read`）与
+  `rescue_bubbles_by_cmk_reads`（`get_chimeric_reads_chain_by_broken_bub`）。
+  cmk 数组内容在参考中只用于门控，内部实现未读取。
+
+门禁：三轮纠错后 `.ec.fq`、`.ovlp.source.bin`、`.ovlp.reverse.bin` 与 C++
+逐字节一致；`.ec.bin` 仅已知的尾部 padding 字节不同。完整组装 15 个
+GFA/BED 产物全部逐字节一致（chimeric reads 计数 44 与 C++ 相同）。
+
+## `--fast` 位置索引完成（2026-11-10）
+
+`ha_pt_gen_dp` 的两遍构造已移植（`refine_sketch`/`refine_select`）：
+
+- 第一遍带 `HAF_COUNT_REFINE`：每个 read 的 minimizer 临时 `rid=count`，按
+  前缀/后缀/中段三段做最长兼容链 DP，选中集合决定哪些 k-mer 进入索引；
+  参考的前缀只取 `rei`、后缀只取 `rsi`，移植时已按此对齐。
+- `ha_pt_shrink`：只为选中 k-mer 建立位置槽（按原计数分配），最终遍把所有
+  出现位置写入。
+- 日志与 C++ 一致：`collect 239688/2264901 minimizers`、
+  `indexed 984668 positions, counted 31849 ...` 等逐轮一致。
+
+门禁：`-t1 --fast` 全部 15 个 GFA/BED 与 C++ 逐字节一致，两个 ovlp bin
+一致，`.ec.bin` 仅 padding 差异。
+
+## `--sec-in` pair 模式（2026-11-10，主体完成，仍有极小差异）
+
+`--sec-in` 是 `ha_assemble_pair` 入口：读取 `<prefix>.ec0/1.bin` 与
+`<prefix>.ovlp0/1.source.bin`，跑 `ha_overlap_cal(round=n-1, read_from_store=1)`
+后进入同一组装图。`partition_overlaps_advance` 全族已移植（新模块
+`correction::partition`）：
+
+- `markSNP_detail` / `markSNP_advance` / `addSNPtohaplotype_details` /
+  `addSNPtohaplotype_advance` / `cluster_advance` / `insert_snp_ee` /
+  `lable_large_indels`；窗口 flag 数组为 `WINDOW_MAX_SIZE=428`。
+- `correct_overlap` 现在在 `recalcate_window_advance` 之后调用
+  `partition_overlaps_advance`，再按 `is_consensus` 决定是否共识。
+- pair worker 的覆盖率时序：C++ 在 worker 之后才把新峰值写回 `hom_cov`，
+  移植已对齐。
+- pair 缓存兼容修复：
+  - `append_All_reads` 丢弃 hits 但保留 `is_fully_corrected`/`is_abnormal`，
+    Rust 现从 `.ovlpN.source.bin` 读回并作为初始 flags。
+  - `ma_hit_t::el` 是完整字节（pair 链化会写入 `shared_seed` 原值，如 223），
+    `PafHit` 新增 `exact_region_byte` 并透传到 `asg_arc_t.el`。
+  - `append_inexact_overlap_region_alloc` 不写 `overlapLen`，槽位保持 0；
+    `without_large_indel` 也不写，复用槽位时保留上一读段的值——pair 路径
+    以持久槽位模板复刻。
+  - 候选列表按 `(x_pos_s<<32|x_pos_e)` 排序（`oreg_xs_lt`）。
+
+本轮继续修复后：
+
+- `append_inexact_overlap_region_alloc` 的槽位语义：`without_large_indel`
+  从不写入，槽位保留旧值。模板改为**可变、只增不减**的槽位内存，并在每次
+  追加时原位读取/保留（去重 pop 后复用同一槽仍取该槽旧值）。
+- `extend_backwards` 对已对齐窗口重算时，C++ 直接使用窗口已有的
+  `y_start/extra_*` 和 `o_len`，不再调用 `determine_overlap_region`；
+  修正后 read 508/3338 的 error_rate 与 `is_match=3` 和 C++ 一致。
+- 候选列表最终按 `x_pos_s<<32|x_pos_e` 排序（`oreg_xs_lt`）。
+
+当前状态：
+
+| 项目 | 结果 |
+|---|---|
+| `.ec0.bin/.ec1.bin/.ovlp0.*/.ovlp1.*` | 逐字节一致 |
+| `pair.ovlp.source.bin` | **逐字节一致** |
+| 全部 `lowQ.bed` | 逐字节一致 |
+| `pair.ovlp.reverse.bin` | 161/5626 条读的 `without_large_indel` 不同 |
+| `p_utg/r_utg/p_ctg/hap1/hap2` GFA | 各有一条 contig 序列差异 |
+
+剩余差异已定位为参考实现的**越界写（UB）**：pair 路径的
+`markSNP_detail` / `addSNPtohaplotype_details` 会以负下标写
+`hap->flag`（实测如 `flag[-101]`；`flag` 前紧邻 `length/size` 等字段），
+而 C++ 的 olist 槽位 `without_large_indel` 还会出现无法由任一次正常写入
+解释的陈旧 1。复刻这些行为需要按 C++ 结构体布局模拟越界内存破坏，不属于
+可移植的迁移目标；Rust 侧保持边界检查。
+
+## `-b` 单读调试（完成）
+
+`-b <names>` 在默认路径上的参考行为：创建 `<names>.debug.stdout`、
+`<names>.debug.r0.fa`、`<names>.debug.r1.fa` 三个空文件，打印 4 行提示，
+**只跑第一轮纠错**（`ha_ec` round 0），随后 `exit(0)`；该路径从未填充
+`read_id`，因此两个 fa 文件保持为空。
+
+Rust 已在 `assemble` 的未命中缓存分支接入：`run_single_correction_round`
+执行一轮 `cal_ec_r` 等价流程（不计 final overlap pass），随后创建同样的
+三个空文件并返回。门禁：`-t1 -b /tmp/names.txt` 的日志行位置（65–68、
+137–138）与统计值（`# bases`、`# corrected bases`、exact/non-exact）
+与 C++ 完全一致，三个文件均为 0 字节，退出码 0。
+
+## `--dbg-gfa` 可行性结论（2026-11-10）
+
+参考实现把 `.pt_flt`/`.ct_flt` 索引、`*.all.debug.{source,reverse,coverage_cut,ruIndex,asg_t,...}.bin`
+等中间状态序列化到磁盘，重启时据此跳过计数/纠错。实测两次完全相同的 C++
+运行（同参数、同输入、`-t1`）产出的 checkpoint **互不一致**：
+
+| 文件 | 结果 |
+|---|---|
+| `ref.pt_flt` | 字节 2827 起不同（哈希桶内计数项） |
+| `ref.ct_flt` | 字节 2232 起不同（出现不同的碱基内容） |
+| `ref.all.debug.source.bin` / `reverse.bin` | 字节 40 起不同（`ma_hit_t` 的未初始化 `cc` 字段） |
+| `ref.all.debug.asg_t.bin` | 偏移 101384 的 8 字节字段不同（指针/未初始化值） |
+
+即参考实现的 checkpoint 本身不是确定性的，且其中包含未初始化内存与指针值。
+在这种前提下"逐字节一致的 `--dbg-gfa` 移植"不可定义，Rust 侧保持 parse 期
+显式拒绝；最终 GFA/BED 产物在默认路径已逐字节一致。若将来需要该项，只能
+以"逻辑等价、可重启"为目标，逐字段对齐格式并允许这些字段不同。
+
+## `--ul` 测试门禁准备（2026-11-10）
+
+现有 `chr11-2M.fa.gz` 没有配套的超长读数据，因此用默认装配的 contig 合成
+UL 读段，先把参考输出固定下来：
+
+```bash
+cargo run --release -- -t1 -o /tmp/dg/ref /home/keith/Downloads/chr11-2M.fa.gz
+scripts/gen_ul_reads.py /tmp/dg/ref.bp.p_ctg.gfa /tmp/ul.fq 20   # 739 条，44.7Mb
+hifiasm -t1 --ul /tmp/ul.fq -o /tmp/ulref /home/keith/Downloads/chr11-2M.fa.gz
+```
+
+参考实现耗时约 192s，产物除常规 GFA/BED 外还新增
+`*.uidx.bin`（HiFi 去重索引）、`*.ul.ovlp.bin`（UL 重叠）、
+`*.re.uidx.bin`、`*.re.ul.ovlp.bin`、`*.re.ul.msk.bin`（`ul_clean_round`
+一轮重对齐）。两次完全相同的 `-t1` 运行结果：
+
+| 文件 | 结果 |
+|---|---|
+| `bp.p_ctg.gfa`、`bp.hap1/2.p_ctg.gfa`、`bp.p_utg.gfa`、`bp.r_utg.gfa` | 逐字节一致 |
+| 全部 `lowQ.bed`、`re.ul.msk.bin` | 逐字节一致 |
+| `ul.ovlp.bin`、`re.ul.ovlp.bin` | 不一致（缓存内含未初始化/填充字段） |
+
+因此 UL 分支的门禁应取 8 个 GFA/BED（与默认路径一致），缓存文件按参考
+实现的非确定性对待。
+
+日志锚点（`-t1`，均出现在默认纠错/最终重叠之后）：
+
+```
+[M::uidx_l_build] Index has been built.
+[M::scall_ul_pipeline::] ==> # reads: 739, # bases: ...
+[M::rescall_ul_pipeline::] ==> # reads: ..., # fully corrected reads: ...
+[M::print_integert_ovlp_stat::] # UL reads::..., # UL ovlps::...
++[M::realloc_rdb_adv] rid_n0::... -[M::realloc_rdb_adv] ...
++[M::update_paf] dn::...  [M::renew_ng] ...
+[M::adjust_utg_by_trio] ... [M::output_trio_graph_joint] ...
+```
+
+移植缺口（按执行顺序）：
+
+1. `ul_load`（`inter.cpp` 21693）→ `gen_UL_ovlps`（21473）：`dedup_HiFis`
+   （21185）建 `ul_idx_t`，复用 `uidx_l_build`/`uidx_write`，随后
+   `ul_v_call` → `scall_ul_pipeline`（19984）→
+   `worker_ul_scall_alignment`（9220）：`ul_map_lchain`（`anchor.cpp`
+   2287，= `minimizers_qgen` + `lchain_qgen_mcopy`）、
+   `ul_rid_lalign_adv`（`Correct.cpp` 25083）与 `gen_rid_raw_chain`
+   （`inter.cpp` 9179）。
+2. `update_ovlp_src` / `update_ovlp_src_bl`（`inter.cpp` 19930 附近）把
+   UL 重叠并入 `sources`。
+3. `create_ul_info`（`Overlaps.cpp` 39176）与 `gen_init_sg` 的 UL 分支
+   （`rescue_src_ul`、`ma_sg_gen_ul`、`clean_contain_g`、
+   `asg_arc_del_trans_ul`）。
+4. `ul_clean_gfa` 的 `is_ou` 分支（`gfa_ut.cpp` 3027）：`update_sg_uo`、
+   `ul_refine_alignment`、`clean_contain_g`、`asg_arc_cut_contain`、
+   `asg_arc_del_trans_ul`；Rust 当前把该参数固定为 `false`。
+5. `gradually_renew_g` → `renew_g` → `ul_realignment_gfa`
+   （`gfa_ut.cpp` 17598）及其依赖 `ul_realignment`、`gen_bubble_chain`、
+   `init_ul_resolve_t`、`ul_re_correct`、`gen_ul2ul`、`renew_ng`、
+   `realloc_rdb_adv`（`gfa_ut.cpp` 14663/15107/15220）。
+
+Rust 侧已具备大部分底层原语：`align_ul_ed_post_extz`
+（`correction/hc_align.rs`）、`lchain_qgen_mcopy_fast`
+（`overlap/qgen_chain.rs`）、`WindowPool`（`correction/interval.rs`），以及
+`assembly/ul.rs` 里 `--dual-scaf` 需要的 `UlOv`/`UcBlock`、读-单位图索引和
+线性链 DP。
+
+### 已落地（2026-11-10 续）
+
+- `src/assembly/ul_store.rs`：`all_ul_t`/`ul_vec_t`/`uc_block_t` 存储、
+  `ha_encode_base`、`append_ul_t`、`determine_chain_distance`、
+  `gen_ul_vec_rid_t`，以及 `.ul.ovlp.bin` 的读写。缓存中的 `uc_block_t`
+  填充字节在参考实现里是未初始化值，回环测试
+  （`tests/ul_store_golden.rs`，读取 `reference/ul.ul.ovlp.bin`）按字段
+  校验布局并用零填充回写。
+- `src/assembly/ul_index.rs`：`dedup_HiFis` 的读图构造（QC/TC 删除、
+  `asg_symm`、传递缩减、`ma_ug_gen`）、`append_inexact_edges`、
+  `ul_contain_gen`、`gen_cov_track`、`gen_r_contain`、
+  `gen_r_ug_idx`（含 containment）。C++ 的 `ma_hit_t::cc` 用与 `sources`
+  同形的并行计数数组替代，供 `update_ug_uo_t` 写 `AsgArc::occurrence`。
+- 单位图索引 `build_unitig_minimizer_index`：用 `retrieve_u_seq` 的语义
+  （`correction::target::unitig_sub_region`）把 575 条单位图物化为合成
+  `ReadStore`，复用 `KmerCountTable`/`sketch`/`PositionIndex` 实现
+  `ha_ft_ul_gen`/`ha_pt_ul_gen`。对 `/tmp/ulref` 的参考缓存逐值校验：
+  `dedup_HiFis` 的 `575 unitigs / 1910 edges / 4022 cc_num / 13197295 bases`
+  与日志完全一致；过滤器 `128` 条、位置索引 `303018` 个 k-mer /
+  `1716900` 个位置与 C++ 的
+  `ha_ct_shrink`/`ha_ft_ul_gen`/`ha_pt_ul_gen` 日志逐值一致
+  （`tests/ul_reference_probe.rs`，`--ignored`，依赖 `/tmp/ulref`）。
+- `src/correction/ul_align.rs`：`ul_map_lchain`（`collect_qgen_seeds` +
+  `lchain_qgen_mcopy_fast` 的 `copy_number=1`/无覆盖率窗配置，等价于非
+  fast 的 `lchain_qgen_mcopy`）、`win_cluster_filter`、
+  `ul_local_aln_first` 与 `ul_rid_lalign_adv_first`（首轮
+  `align_ul_ed_post_extz` + `OVERLAP_THRESHOLD_NOSI_FILTER` 判定）。
+
+#### 下一步缺口（按执行顺序）
+
+1. `ul_rid_lalign_adv` 第二轮（`ul_local_aln` 的 `aux_o` 分支）：
+   `gen_sub_ov_adv(_cigar)`、`extract_subov(_cigar)`、`gen_raln` 及其
+   `hc_aln_exz_simi_adv`/`hc_aln_exz_by_exist_cigar_with_p`/
+   `cal_exz_infi_simi_adv` 依赖、`fusion_chain_ovlp`、
+   `cigar_gen_by_chain_adv_local`、`dedup_ul_ov_t`。
+2. `gen_rid_raw_chain`：`gl_rchain_lin_contain_adv`、
+   `connect_detect`、`get_ecov_contain_adv`、`get_rid_backward_cigar_err`、
+   `propagate_transitive_reduction`、`gen_trans_aln`、`select_clean_chain`。
+3. `scall_ul_pipeline`/`worker_for_ul_scall_alignment` 的读入、
+   `append_ul_t`、`gen_ul_vec_rid_t` 接线，以及 `update_ovlp_src` /
+   `update_ovlp_src_bl`（`determine_connective_backtrack`）。
+4. `create_ul_info`、`gen_init_sg` 的 UL 分支（`rescue_src_ul`、
+   `ma_sg_gen_ul`、`clean_contain_g`、`asg_arc_del_trans_ul`）与
+   `ul_clean_gfa` 的 `is_ou` 分支。
+5. `gradually_renew_g`/`renew_g`/`ul_realignment_gfa` 全链
+   （`ul_realignment`、`gen_bubble_chain`、`init_ul_resolve_t`、
+   `ul_re_correct`、`gen_ul2ul`、`renew_ng`、`realloc_rdb_adv`）。
+
+下一步缺口：单位图上的 minimizer 过滤表/位置索引
+（`ha_ft_ul_gen`/`ha_pt_ul_gen`）、`minimizers_qgen` 的 UL 版种子收集、
+`ul_rid_lalign_adv`/`gen_rid_raw_chain`、`get_ul_g`，然后才是
+`create_ul_info`、`gen_init_sg`/`ul_clean_gfa` 的 `is_ou` 分支与
+`gradually_renew_g`/`ul_realignment_gfa`。
+
+## 仍未迁移的分支
+
+- `--ul`（超长读整合，ul 路径，parse 期显式拒绝）。合成数据门禁与完整
+  缺口清单见上一节；仍需移植 `ul_load`/`ul_realignment_gfa` 两条链路。
+- Hi-C（`--h1/--h2/--enzyme`，parse 期显式拒绝）。缺口是 `hic.cpp` 的
+  短读比对索引（`hc_pt`）、`hic_short_align`/`hic_analysis` 与
+  `output_hic_graph` 链路，需要 Hi-C 测试数据才能建立门禁。
+- `--dbg-gfa`（`.pt_flt`/图 checkpoint 与 verbose GFA，parse 期显式拒绝；
+  原因见上一节：参考实现的 checkpoint 非确定性）。
+
+`cargo test --release`：338 passed。

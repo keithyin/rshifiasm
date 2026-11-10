@@ -33,6 +33,9 @@ pub struct PafHit {
     /// `extract_max_exact` finds one, and rewrites the four coordinates above
     /// to that sub-region, with the ends exclusive.
     pub exact_region: bool,
+    /// The reference stores `shared_seed` itself in the one-byte `el` field;
+    /// the pair-mode caches can therefore carry values other than one.
+    pub exact_region_byte: u8,
     /// `del`: the assembly stage's deletion flag. PAF output ignores it.
     pub deleted: bool,
 }
@@ -91,6 +94,7 @@ pub fn push_overlaps(
             // whole-overlap coordinate convention it stores is never consumed
             // as an exact region, so the flag stays clear.
             exact_region: false,
+            exact_region_byte: 0,
             deleted: false,
         });
     }

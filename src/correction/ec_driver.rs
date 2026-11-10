@@ -47,6 +47,9 @@ const KMER_GOOD_RATIO: f64 = 0.333;
 /// `WINDOW_HC`: window length of the HiFi refinement.
 const ALIGNMENT_WINDOW_LENGTH: i64 = 775;
 
+/// `WINDOW_OHC`: window length of the ONT refinement.
+const ONT_ALIGNMENT_WINDOW_LENGTH: i64 = 375;
+
 /// `WINDOW_HC_FAST`: window length of the consensus vote.
 const CONSENSUS_WINDOW_LENGTH: u64 = 512;
 
@@ -73,6 +76,18 @@ const COPY_NUMBER_KMER_HIT_CUTOFF: u32 = 32;
 
 /// Band width of the chaining step, the HiFi branch of `bw_thres`.
 const BAND_WIDTH_THRESHOLD: f64 = 0.02;
+
+/// Band width of the ONT branch of `bw_thres`.
+const ONT_BAND_WIDTH_THRESHOLD: f64 = 0.05;
+
+/// `align_gap_rate` of the ONT refinement.
+const ONT_ALIGNMENT_GAP_RATE: f64 = 0.006;
+
+/// `align_gap_max` of the ONT refinement.
+const ONT_ALIGNMENT_GAP_MAX: i64 = 64;
+
+/// `HPC_PL`: homopolymer compression strength of the ONT phasing pass.
+const ONT_HPC_LENGTH: u64 = 12;
 
 /// `MIN_COVERAGE_THRESHOLD * 2`: depth every stretch of a read must reach to
 /// be fully corrected.
@@ -154,17 +169,11 @@ pub fn run_error_correction(
     reads: &mut ReadStore,
     filter_table: Option<&KmerFilterTable>,
 ) -> Result<ErrorCorrectionResult, &'static str> {
-    if options.ont_mode != 0 {
-        return Err("the ONT correction branch is not implemented yet");
-    }
-    if options.single_cell_mode != 0 {
+    if options.single_cell_mode != 0 && options.ont_mode == 0 {
         return Err("the single-cell correction branch is not implemented yet");
     }
     if options.partial_correction_round_count != 0 {
         return Err("partial correction rounds are not implemented yet");
-    }
-    if options.flags & FLAG_FAST != 0 {
-        return Err("the fast-mode correction index is not implemented yet");
     }
 
     let number_of_rounds = options.correction_round_count.max(1) as usize;
@@ -235,6 +244,43 @@ pub fn run_error_correction(
         corrected_bases,
         index: None,
     })
+}
+
+/// One correction round only, the `-b` debugging entry of `ha_ec`.
+///
+/// `ha_ec` exits right after `cal_ec_r` of round zero when a debug read list
+/// was supplied, so the final overlap pass never runs.
+pub fn run_single_correction_round(
+    options: &mut AssemblyOptions,
+    reads: &mut ReadStore,
+    filter_table: Option<&KmerFilterTable>,
+) -> Result<(), &'static str> {
+    let total_reads = reads.total_reads as usize;
+    let mut state = CorrectionState::new(total_reads);
+    let mut consensus_cigars: Vec<Vec<u16>> = vec![Vec::new(); total_reads];
+
+    options.reset_to_round(0);
+    let counts = count_minimizers(options, reads, filter_table);
+    options.homozygous_coverage = counts.homozygous_coverage;
+    options.heterozygous_coverage = counts.heterozygous_coverage;
+    if filter_table.is_none() {
+        options.update_coverage(counts.homozygous_coverage);
+    }
+    let index = counts
+        .index
+        .ok_or("the correction rounds require the normal counting mode")?;
+    let number_of_rounds = options.correction_round_count.max(1) as usize;
+    correct_round(
+        options,
+        reads,
+        &mut state,
+        &mut consensus_cigars,
+        &index,
+        filter_table,
+        0,
+        number_of_rounds,
+    );
+    Ok(())
 }
 
 /// `cal_ec_r`: one correction round, from the worker pass to the orientation
@@ -359,6 +405,7 @@ fn correct_read(
     // `worker_hap_ec` recomputes these from the round's coverage estimate.
     let high_occurrence = (f64::from(options.homozygous_coverage) * (2.0 - KMER_GOOD_RATIO)) as u32;
     let low_occurrence = (f64::from(options.homozygous_coverage) * KMER_GOOD_RATIO) as u32;
+    let is_ont = options.ont_mode != 0;
 
     // `h_ec_lchain`: the HiFi parameters are the accurate chaining set.
     let chaining = set_lchain_parameters(true, options.k_mer_length as u32);
@@ -392,7 +439,11 @@ fn correct_read(
             maximum_distance: chaining.maximum_distance,
             gap_penalty: chaining.gap_penalty,
             skip_penalty: chaining.skip_penalty,
-            band_width_rate: BAND_WIDTH_THRESHOLD,
+            band_width_rate: if is_ont {
+                ONT_BAND_WIDTH_THRESHOLD
+            } else {
+                BAND_WIDTH_THRESHOLD
+            },
             quick_check: chaining.quick_check != 0,
             append_both_ends: true,
             generate_offset: true,
@@ -425,13 +476,17 @@ fn correct_read(
         &mut auxiliary,
         &state.forward[read_identifier].hits,
         options.maximum_overlap_divergence_error_correction,
-        ALIGNMENT_WINDOW_LENGTH,
+        if is_ont {
+            ONT_ALIGNMENT_WINDOW_LENGTH
+        } else {
+            ALIGNMENT_WINDOW_LENGTH
+        },
         KMER_HIT_THRESHOLD,
         &mut exact_order,
         &mut cells,
-        false,
-        -1.0,
-        -1,
+        is_ont,
+        if is_ont { ONT_ALIGNMENT_GAP_RATE } else { -1.0 },
+        if is_ont { ONT_ALIGNMENT_GAP_MAX } else { -1 },
     );
     // The reference compacts `ol->length = k` in place; the port returns the
     // kept count instead.
@@ -450,12 +505,18 @@ fn correct_read(
         0,
         PHASING_WINDOW_LENGTH,
         PHASING_OCCURRENCE_THRESHOLD,
-        0,
-        0,
-        0,
+        if is_ont { ONT_HPC_LENGTH } else { 0 },
+        if is_ont { 1 } else { 0 },
+        if is_ont { 1 } else { 0 },
         &mut mapped_overlaps_length,
         options.informative_coverage,
         options.single_haplotype_coverage,
+        read_identifier as u64,
+        i64::from(options.heterozygous_coverage),
+        i64::from(options.homozygous_coverage),
+        i64::from(options.polyploidy),
+        if is_ont { Some(reads) } else { None },
+        is_ont,
     );
     stage!("phase");
 
@@ -556,6 +617,7 @@ fn update_exact_overlaps(
         for hit in state.forward[read_identifier].hits.iter_mut() {
             if hit.exact_region && quick_exact_match(hit, reads, &query, consensus_cigars) {
                 hit.exact_region = true;
+                hit.exact_region_byte = 1;
                 exact += 1;
             } else {
                 hit.exact_region = false;
@@ -609,7 +671,23 @@ fn reverse_complement_round(state: &mut CorrectionState, reads: &mut ReadStore) 
             reads,
         );
         let sequence = reads.read_sequence_reverse_complement(read_identifier);
+        // `worker_hap_post_rev` also reverses the 2-bit quality track.
+        let quality = if reads.qualities[read_identifier].is_empty() {
+            None
+        } else {
+            let mut levels = reads.read_quality(
+                read_identifier,
+                0,
+                reads.read_lengths[read_identifier] as i64,
+                false,
+            );
+            levels.reverse();
+            Some(crate::reads::read_store::pack_quality_levels(&levels))
+        };
         write_corrected_read_back(reads, read_identifier, &sequence);
+        if let Some(quality) = quality {
+            reads.qualities[read_identifier] = quality;
+        }
     }
 }
 
@@ -630,6 +708,7 @@ mod tests {
             reverse: false,
             without_large_indel: true,
             exact_region: true,
+            exact_region_byte: 0,
             deleted: false,
         }
     }

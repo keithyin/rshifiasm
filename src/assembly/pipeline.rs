@@ -140,6 +140,24 @@ pub fn build_string_graph_without_clean(
     // Stage dumps for local debugging; see `assembly::probe`.
     let dump_directory = probe::prepare_directory().ok().flatten();
 
+    // The ONT branch clears the deletion flags and the read-to-unitig map
+    // before the rescue pass, then builds the chemical mask that later
+    // stages consume (`Overlaps.cpp` 39714–39725). The HiFi path leaves the
+    // flags alone until `clean_graph` resets them.
+    let chemical_mask = if is_ont {
+        renew_graph_init(&mut forward, &mut reverse, &mut read_to_unitig);
+        let (mask, chimeric) = crate::assembly::hit::gen_chemical_arc_rf(
+            &mut forward,
+            &reads.read_lengths,
+            options.chemical_coverage as i64,
+            options.chemical_flank_length as i64,
+        );
+        eprintln!("[M::gen_chemical_arc_rf] # chimeric reads: {}", chimeric);
+        Some(mask)
+    } else {
+        None
+    };
+
     // `try_rescue_overlaps(sources, reverse_sources, n_read, 4, is_ont)`.
     try_rescue_overlaps(
         &mut forward,
@@ -162,13 +180,25 @@ pub fn build_string_graph_without_clean(
     );
 
     // `clean_graph` head: `if(!cmk) renew_graph_init(...)`. On the HiFi path
-    // `cmk` is NULL, so every deletion flag is cleared and the read-to-unitig
-    // map is reset to the unmapped sentinel.
-    renew_graph_init(&mut forward, &mut reverse, &mut read_to_unitig);
+    // `cmk` is NULL; the ONT branch already reset the flags before the
+    // chemical mask was built.
+    if !is_ont {
+        renew_graph_init(&mut forward, &mut reverse, &mut read_to_unitig);
+    }
 
     // `clean_graph`: mirror both sides, then drop the weakly supported hits.
-    normalize_ma_hit_t_single_side_advance(&mut forward, is_ont, None, 0);
-    normalize_ma_hit_t_single_side_advance(&mut reverse, false, None, 0);
+    normalize_ma_hit_t_single_side_advance(
+        &mut forward,
+        is_ont,
+        chemical_mask.as_deref(),
+        options.chemical_coverage as u32,
+    );
+    normalize_ma_hit_t_single_side_advance(
+        &mut reverse,
+        false,
+        chemical_mask.as_deref(),
+        options.chemical_coverage as u32,
+    );
     probe::try_dump_stage_raw(
         dump_directory.as_deref(),
         "d00a_after_normalize",
@@ -199,7 +229,11 @@ pub fn build_string_graph_without_clean(
         &read_to_unitig,
         &trio_flags,
     );
-    clean_weak_ma_hit_t(&mut forward, &reverse, &reads.read_lengths, u32::MAX);
+    // `if(!(asm_opt.is_ont)) clean_weak_ma_hit_t(...)`: the ONT chemical mask
+    // already replaced the weak-overlap filter.
+    if !is_ont {
+        clean_weak_ma_hit_t(&mut forward, &reverse, &reads.read_lengths, u32::MAX);
+    }
     probe::try_dump_stage_raw(
         dump_directory.as_deref(),
         "d01_after_weak_clean",
@@ -271,6 +305,7 @@ pub fn build_string_graph_without_clean(
         &mut bubble_labels,
         &output_file_name,
         min_thres,
+        chemical_mask.as_deref(),
         telo_end.as_ref(),
         dump_directory.as_deref(),
     )?;
@@ -491,6 +526,7 @@ fn ul_clean_gfa(
     bubble_labels: &mut BubbleLabel,
     output_file_name: &str,
     min_thres: i64,
+    chemical_mask: Option<&[u8]>,
     telo_end: Option<&TeloEnd>,
     dump_directory: Option<&std::path::Path>,
 ) -> Result<(), String> {
@@ -498,6 +534,7 @@ fn ul_clean_gfa(
     let minimum_overlap = options.minimum_overlap_length;
     let maximum_hang_rate = options.maximum_hang_rate;
     let bed_inconsistency_rate = options.bed_inconsistency_rate as u32;
+    let is_ont = options.ont_mode != 0;
     let clean_round = options.cleaning_round_count;
     let min_drop = f64::from(options.minimum_drop_rate);
     let max_drop = f64::from(options.maximum_drop_rate);
@@ -521,6 +558,25 @@ fn ul_clean_gfa(
     let vertex_count = graph.sequences.len() * 2;
 
     // `asg_arc_cut_tips(sg, max_tip, &bu, is_ou, is_ou?rI:NULL, uopt->te)`.
+    // The ONT branch runs `asg_arc_cut_weak` first (`gfa_ut.cpp` 3057).
+    if is_ont {
+        crate::assembly::gfa_clean::asg_arc_cut_weak(
+            graph,
+            &mut buffer,
+            max_tip_i32,
+            0.975,
+            0.0,
+            false,
+            false,
+            true,
+            16,
+            1,
+            false,
+            reverse_sources,
+            None,
+            trio_flags,
+        );
+    }
     asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
     probe::try_dump_stage(
         dump_directory,
@@ -536,6 +592,26 @@ fn ul_clean_gfa(
     for round in 0..clean_round {
         if drop > max_drop {
             drop = max_drop;
+        }
+
+        if is_ont {
+            crate::assembly::gfa_clean::asg_arc_cut_weak(
+                graph,
+                &mut buffer,
+                max_tip_i32,
+                0.975,
+                0.0,
+                false,
+                false,
+                true,
+                16,
+                1,
+                false,
+                reverse_sources,
+                None,
+                trio_flags,
+            );
+            asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
         }
 
         asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, telo_end);
@@ -620,6 +696,26 @@ fn ul_clean_gfa(
         );
 
         drop += step;
+    }
+
+    if is_ont {
+        crate::assembly::gfa_clean::asg_arc_cut_weak(
+            graph,
+            &mut buffer,
+            max_tip_i32,
+            0.975,
+            0.0,
+            false,
+            false,
+            true,
+            16,
+            1,
+            false,
+            reverse_sources,
+            None,
+            trio_flags,
+        );
+        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
     }
 
     asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, telo_end);
@@ -719,6 +815,7 @@ fn ul_clean_gfa(
         bubble_labels,
         min_thres,
         dump_directory,
+        chemical_mask,
     );
 
     ug_ext_gfa(
@@ -799,6 +896,7 @@ fn post_rescue(
     bubble_labels: &mut BubbleLabel,
     min_thres: i64,
     dump_directory: Option<&std::path::Path>,
+    chemical_mask: Option<&[u8]>,
 ) {
     let parameters = RescueParameters {
         maximum_hang: options.maximum_hang_length,
@@ -882,9 +980,34 @@ fn post_rescue(
         trio_labels,
     );
 
-    // `cmk` is NULL on the HiFi path, so `rescue_chimeric_reads_aggressive`
-    // is not called.
-
+    // `if(cmk) rescue_chimeric_reads_aggressive(...)`.
+    if chemical_mask.is_some() {
+        crate::assembly::rescue::rescue_chimeric_reads_aggressive(
+            None,
+            graph,
+            sources,
+            coverage_cut,
+            read_to_unitig,
+            trio_labels,
+            parameters,
+            10,
+            true,
+            false,
+            None,
+            None,
+            bubble_labels,
+        );
+    }
+    probe::try_dump_stage(
+        dump_directory,
+        "d14b_after_rescue_chimeric",
+        Some(graph),
+        sources,
+        reverse_sources,
+        Some(coverage_cut),
+        read_to_unitig,
+        trio_labels,
+    );
     set_hom_global_coverage(
         options,
         graph,
@@ -914,8 +1037,9 @@ fn post_rescue(
     // The reference runs this pass unconditionally; on a non-trio corpus it
     // is a no-op (probe d15 == d16), so the port only enters it when the
     // trio front end is active until its remaining dependencies
-    // (the Purge_Dups hap-alignment candidate scan) are ported.
-    if !options.trio_binning_requested() {
+    // (the Purge_Dups hap-alignment candidate scan) are ported. ONT needs
+    // it because the chemical-mask pass adds a fourth rescue.
+    if !options.trio_binning_requested() && chemical_mask.is_none() {
         return;
     }
     if let Err(error) = crate::assembly::bubble_chain::rescue_bubble_by_chain(
@@ -936,6 +1060,7 @@ fn post_rescue(
         options.minimum_overlap_length,
         10,
         min_thres,
+        chemical_mask,
     ) {
         eprintln!("[ERROR] rescue_bubble_by_chain failed: {}", error);
     }

@@ -146,6 +146,98 @@ pub fn corrected_read_from_consensus_cigar(original: &[u8], cells: &[u16]) -> Op
     Some(corrected)
 }
 
+/// `get_wqual` over an already-unpacked quality track: the minimum mean of a
+/// `window`-wide sliding sum around `position`.
+///
+/// `length` is the reference's `Get_READ_LENGTH`, which `worker_sl_ec` has
+/// already updated to the corrected length before it rebuilds the quality
+/// track. The source levels still describe the pre-correction read, so the
+/// window can stop before the end of `levels`.
+fn window_quality_levels(levels: &[u8], position: usize, window: usize, length: usize) -> u8 {
+    let start = if position + 1 >= window {
+        position + 1 - window
+    } else {
+        0
+    };
+    let end = (position + window).min(length);
+    if start >= end {
+        return 0;
+    }
+    let end = end.min(levels.len());
+    if start >= end {
+        return 0;
+    }
+    let track = &levels[start..end];
+    let count = window.min(track.len());
+    let mut sum: u64 = track[..count].iter().map(|&value| u64::from(value)).sum();
+    let mut minimum = sum;
+    for index in count..track.len() {
+        sum -= u64::from(track[index - window]);
+        sum += u64::from(track[index]);
+        if sum < minimum {
+            minimum = sum;
+        }
+    }
+    (minimum as f64 / count as f64).round() as u8
+}
+
+/// The quality half of `worker_sl_ec`: rebuilds the corrected quality track
+/// from the consensus cigar.
+///
+/// Match and mismatch cells copy the original quality levels; insertion
+/// cells take the minimum window quality around the insertion point. The
+/// rebuilt levels are packed with the reference's 2-bit layout.
+fn corrected_quality_from_consensus_cigar(
+    reads: &ReadStore,
+    read_identifier: usize,
+    cells: &[u16],
+    corrected_length: usize,
+) -> Option<Vec<u8>> {
+    use crate::overlap::stored_overlap::pop_trace_bp_f_full;
+
+    let original_length = reads.read_lengths[read_identifier] as i64;
+    let source = reads.read_quality(read_identifier, 0, original_length, false);
+    if source.is_empty() {
+        return None;
+    }
+
+    let mut levels = vec![0u8; corrected_length];
+    let mut cell = 0usize;
+    let mut original_index = 0usize;
+    let mut corrected_index = 0usize;
+    while cell < cells.len() {
+        let (next, operation, _, _, length) = pop_trace_bp_f_full(cells, cell);
+        let length = length as usize;
+        let original_window_start = original_index;
+        let corrected_window_start = corrected_index;
+        if operation != 2 {
+            original_index += length;
+        }
+        if operation != 3 {
+            corrected_index += length;
+        }
+        match operation {
+            0 | 1 => {
+                let available = source.len().saturating_sub(original_window_start);
+                let copy_length = length.min(available).min(corrected_index - corrected_window_start);
+                levels[corrected_window_start..corrected_window_start + copy_length]
+                    .copy_from_slice(&source[original_window_start..original_window_start + copy_length]);
+            }
+            2 => {
+                let quality =
+                    window_quality_levels(&source, original_window_start, 5, corrected_length);
+                for position in corrected_window_start..corrected_index {
+                    levels[position] = quality;
+                }
+            }
+            _ => {}
+        }
+        cell = next;
+    }
+
+    Some(crate::reads::read_store::pack_quality_levels(&levels))
+}
+
 /// `worker_sl_ec` for one read: applies the read's consensus cigar to the
 /// stored sequence. Returns whether the read changed (`false` when the cigar
 /// has no error and the reference leaves it alone).
@@ -153,7 +245,12 @@ pub fn apply_consensus_to_read(reads: &mut ReadStore, read_identifier: usize, ce
     let original = reads.read_sequence(read_identifier);
     match corrected_read_from_consensus_cigar(&original, cells) {
         Some(corrected) => {
+            let quality =
+                corrected_quality_from_consensus_cigar(reads, read_identifier, cells, corrected.len());
             write_corrected_read_back(reads, read_identifier, &corrected);
+            if let Some(quality) = quality {
+                reads.qualities[read_identifier] = quality;
+            }
             true
         }
         None => false,
@@ -182,7 +279,23 @@ pub fn write_corrected_fastq<W: Write>(writer: &mut W, reads: &ReadStore) -> io:
         writer.write_all(b"\n")?;
         writer.write_all(&sequence)?;
         writer.write_all(b"\n+\n")?;
-        writer.write_all(&vec![b'!'; sequence.len()])?;
+        // `sc_tb[level] + 33 - 1`: the 2-bit level expanded back to a Phred
+        // character. Reads without qualities fall back to the lowest level.
+        let quality = reads.read_quality(
+            identifier,
+            0,
+            sequence.len() as i64,
+            false,
+        );
+        let encoded: Vec<u8> = quality
+            .iter()
+            .map(|&level| {
+                crate::reads::read_store::QUALITY_THRESHOLDS[level as usize]
+                    .wrapping_add(33)
+                    .wrapping_sub(1)
+            })
+            .collect();
+        writer.write_all(&encoded)?;
         writer.write_all(b"\n")?;
     }
     Ok(())
@@ -256,9 +369,23 @@ mod tests {
         let reads = store();
         let mut output = Vec::new();
         write_corrected_fastq(&mut output, &reads).unwrap();
+        // No quality track: every level decodes to `sc_tb[0] + 32` (`*`).
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "@read_a\nACGTACGT\n+\n!!!!!!!!\n@read_b\nTTTTGGGG\n+\n!!!!!!!!\n"
+            "@read_a\nACGTACGT\n+\n********\n@read_b\nTTTTGGGG\n+\n********\n"
+        );
+    }
+
+    #[test]
+    fn corrected_fastq_expands_the_two_bit_levels() {
+        let mut reads = ReadStore::default();
+        reads.push_read_with_quality("read_a", b"ACGT", Some(b"5I5I"));
+        let mut output = Vec::new();
+        write_corrected_fastq(&mut output, &reads).unwrap();
+        // `5` (Phred 20) is level 1 (`4`), `I` (Phred 40) is level 3 (`H`).
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "@read_a\nACGT\n+\n4H4H\n"
         );
     }
 

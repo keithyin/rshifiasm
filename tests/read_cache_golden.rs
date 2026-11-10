@@ -254,6 +254,7 @@ fn sample_state(total_reads: usize) -> CorrectionState {
         reverse: true,
         without_large_indel: true,
         exact_region: false,
+        exact_region_byte: 0,
         deleted: false,
     };
     let mut forward = vec![PafList::default(); total_reads];

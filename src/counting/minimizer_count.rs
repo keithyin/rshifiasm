@@ -8,7 +8,7 @@
 use crate::command_line::options::{AssemblyOptions, FLAG_FAST, FLAG_NO_HPC};
 use crate::counting::filter_table::KmerFilterTable;
 use crate::counting::kmer_counter::{KmerCountTable, MAXIMUM_COUNT};
-use crate::counting::minimizer::sketch;
+use crate::counting::minimizer::{low_count_threshold, refine_sketch, sketch};
 use crate::counting::peak_analysis::analyze_count;
 use crate::counting::position_index::{PositionIndex, PositionRecord};
 use crate::logging;
@@ -18,7 +18,7 @@ use crate::reads::ReadStore;
 pub struct MinimizerCounts {
     /// Counts of every selected minimizer, after singleton removal.
     pub counts: KmerCountTable,
-    /// Position index, empty in fast mode.
+    /// Position index; built in both normal and `--fast` mode.
     pub index: Option<PositionIndex>,
     /// Total number of minimizers selected over all reads, `n_mz`.
     pub total_minimizers: u64,
@@ -147,7 +147,75 @@ pub fn count_minimizers(
         Some(index)
     } else {
         eprintln!("[M::ha_pt_gen::] counting in fast mode");
-        None
+        // `ha_pt_gen_dp`: the refine pass keeps only the minimizers of the
+        // low-frequency DP chains; the final pass then indexes every
+        // occurrence of the surviving k-mers.
+        let count_by_hash: std::collections::HashMap<u64, u32> = counts
+            .iter_kmer_counts()
+            .map(|(hash, count)| (hash, count as u32))
+            .collect();
+        let minimum_frequency = low_count_threshold(homozygous_coverage, heterozygous_coverage);
+        let mut selected: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut selected_occurrences = 0u64;
+        for read_id in 0..reads.total_reads as usize {
+            let sequence = reads.read_sequence(read_id);
+            let mut sketch_result =
+                sketch_read(options, &sequence, read_id, use_homopolymer_compression, filter_table);
+            for minimizer in &mut sketch_result {
+                minimizer.read_identifier =
+                    count_by_hash.get(&minimizer.hash).copied().unwrap_or(0);
+            }
+            if options.dynamic_programming_minimum_length > 0 {
+                refine_sketch(
+                    &mut sketch_result,
+                    sequence.len() as i32,
+                    options.dynamic_programming_minimum_length,
+                    options.dynamic_programming_error_rate,
+                    minimum_frequency,
+                );
+            }
+            selected_occurrences += sketch_result.len() as u64;
+            for minimizer in &sketch_result {
+                selected.insert(minimizer.hash);
+            }
+        }
+        if options.minimizer_window_size > 1 {
+            eprintln!("[M::yak_count] collected {} minimizers", selected_occurrences);
+        }
+
+        let mut index = PositionIndex::build_selected(&counts, options.k_mer_length, Some(&selected));
+        for read_id in 0..reads.total_reads as usize {
+            let sequence = reads.read_sequence(read_id);
+            let minimizers =
+                sketch_read(options, &sequence, read_id, use_homopolymer_compression, filter_table);
+            for minimizer in minimizers {
+                index.insert(
+                    minimizer.hash,
+                    PositionRecord {
+                        read_identifier: minimizer.read_identifier,
+                        position: minimizer.position,
+                        reverse: minimizer.reverse,
+                        span: minimizer.span,
+                    },
+                );
+            }
+        }
+        if options.minimizer_window_size > 1 {
+            eprintln!("[M::yak_count] collected {} minimizers", total_minimizers);
+        }
+        debug_assert_eq!(
+            index.capacity(),
+            index.total_positions(),
+            "the final pass must fill every slot of the selected k-mers"
+        );
+        eprintln!(
+            "[M::ha_pt_gen::{:.3}*{:.2}] ==> indexed {} positions, counted {} distinct minimizer k-mers",
+            logging::realtime_seconds(),
+            logging::cpu_usage(),
+            index.total_positions(),
+            index.distinct_count()
+        );
+        Some(index)
     };
 
     MinimizerCounts {
