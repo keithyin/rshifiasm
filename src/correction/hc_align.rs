@@ -155,10 +155,27 @@ pub fn align_hc_ed_post_extz(
         // The mapped target position, shifted by the gap the chain already
         // knows about.
         let mut target_start = (query_start - x_start) + y_start;
-        target_start += region
+        let gap_shift = region
             .fake_cigar
             .y_start_offset(query_start)
-            .expect("the fake cigar must cover every query window start");
+            .unwrap_or_else(|| {
+                panic!(
+                    "the fake cigar must cover every query window start: qs={} xs={} xe={}                      sites={:?} windows={}",
+                    query_start,
+                    x_start,
+                    x_end,
+                    (0..region.fake_cigar.len())
+                        .map(|i| {
+                            (
+                                region.fake_cigar.gap_position(i),
+                                region.fake_cigar.gap_shift(i),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    region.window_cigar.windows.len(),
+                )
+            });
+        target_start += gap_shift;
 
         let alignment_length = query_length + (threshold << 1);
         if let Some(target) = determine_overlap_region(
@@ -595,10 +612,27 @@ pub fn align_ul_ed_post_extz(
         // The mapped target position, shifted by the gap the chain already
         // knows about.
         let mut target_start = (query_start - x_start) + y_start;
-        target_start += region
+        let gap_shift = region
             .fake_cigar
             .y_start_offset(query_start)
-            .expect("the fake cigar must cover every query window start");
+            .unwrap_or_else(|| {
+                panic!(
+                    "the fake cigar must cover every query window start: qs={} xs={} xe={}                      sites={:?} windows={}",
+                    query_start,
+                    x_start,
+                    x_end,
+                    (0..region.fake_cigar.len())
+                        .map(|i| {
+                            (
+                                region.fake_cigar.gap_position(i),
+                                region.fake_cigar.gap_shift(i),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    region.window_cigar.windows.len(),
+                )
+            });
+        target_start += gap_shift;
 
         let alignment_length = query_length + (threshold << 1);
         if let Some(target) = determine_overlap_region(

@@ -831,20 +831,35 @@ pub fn set_ul_ov_t_by_mg_lchain(l: &MgLchain) -> UlOv {
 }
 
 /// `get_offset_adjust` (`Overlaps.h` 1169).
-fn get_offset_adjust(offset: u32, offset_len: u32, target_len: u32) -> u32 {
+pub(crate) fn get_offset_adjust(offset: u32, offset_len: u32, target_len: u32) -> u32 {
     (f64::from(offset) / f64::from(offset_len) * f64::from(target_len)) as u32
 }
 
-/// `infer_rovlp` (`Correct.cpp` 19083) with `bi = bj = NULL`, `ridx = NULL`.
+/// `infer_rovlp` (`Correct.cpp` 19083) with `bi = bj = NULL` and a unitig
+/// graph (`ug != NULL`): the lengths come from the unitigs.
 pub fn infer_rovlp(li: &UlOv, lj: &UlOv, unitigs: &[MaUtg]) -> i64 {
-    let in_len = i64::from(unitigs[li.tn as usize].length);
+    infer_rovlp_with_lengths(
+        li,
+        lj,
+        &|id| i64::from(unitigs[id as usize].length),
+    )
+}
+
+/// `infer_rovlp` with `ug == NULL`: the lengths come from `R_INF` (the entry
+/// `tn` is a read id).
+pub fn infer_rovlp_reads(li: &UlOv, lj: &UlOv, read_lengths: &[u64]) -> i64 {
+    infer_rovlp_with_lengths(li, lj, &|id| read_lengths[id as usize] as i64)
+}
+
+fn infer_rovlp_with_lengths(li: &UlOv, lj: &UlOv, length: &dyn Fn(u32) -> i64) -> i64 {
+    let in_len = length(li.tn);
     let mut is = i64::from(li.ts);
     let mut ie = i64::from(li.te);
     let irev = li.rev;
     let iqs = i64::from(li.qs);
     let iqe = i64::from(li.qe);
 
-    let jn = i64::from(unitigs[lj.tn as usize].length);
+    let jn = length(lj.tn);
     let mut js = i64::from(lj.ts);
     let mut je = i64::from(lj.te);
     let jrev = lj.rev;

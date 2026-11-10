@@ -276,7 +276,7 @@ pub(crate) fn rechain_alignment_ul(
 
         if retry {
             let previous_count = output.windows.len();
-            ovlp_base_direct(
+            super::ul_align::ovlp_base_aln(
                 region,
                 &candidates.list[base..base + chain_count as usize],
                 chain_count,

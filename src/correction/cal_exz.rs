@@ -16,7 +16,10 @@
 //! and the band is part of the output.
 
 use crate::alignment::edit_distance::{
-    extension_backward_trace, extension_forward_trace, global_trace,
+    band_word_count, extension_backward_64, extension_backward_no_trace,
+    extension_backward_trace, extension_forward_64, extension_forward_no_trace,
+    extension_forward_trace, global_64, global_no_trace, global_trace,
+    semi_global_64_absent_diagonal, semi_global_absent_diagonal_no_trace,
     semi_global_absent_diagonal_trace,
 };
 use crate::correction::hc_align::BitExtz;
@@ -463,6 +466,359 @@ pub fn cal_exz_infi_adv(
             cal_exz_extension_1(extz, &target_sequence, query_sequence, threshold)
         }
         _ => cal_exz_semi(
+            extz,
+            &target_sequence,
+            query_sequence,
+            threshold,
+            auxiliary_begin as i32,
+        ),
+    }
+
+    if extz.is_aligned() {
+        extz.result.pattern_start += target_start as i32;
+        extz.result.pattern_end += target_start as i32;
+        extz.result.text_start += query_start as i32;
+        extz.result.text_end += query_start as i32;
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// The `_simi` variants. The UL second-pass alignment (`hc_aln_exz_simi_adv`)
+// calls the no-traceback kernels; the dispatch below mirrors
+// `cal_exz_global_simi` and friends (`Correct.cpp` 15496-15607). The 128-bit
+// and multi-word `infi` instances are word-level equivalent, so one
+// width-generic kernel covers both, exactly like the `_trace` layer.
+// ---------------------------------------------------------------------------
+
+/// `cal_exz_global_simi`: global alignment without traceback.
+pub fn cal_exz_global_simi(extz: &mut BitExtz, pattern: &[u8], text: &[u8], threshold: i32) {
+    if band_word_count(threshold) <= 1 {
+        global_64(
+            pattern,
+            pattern.len() as i32,
+            text,
+            text.len() as i32,
+            threshold,
+            &mut extz.result,
+        );
+    } else {
+        global_no_trace(
+            pattern,
+            pattern.len() as i32,
+            text,
+            text.len() as i32,
+            threshold,
+            &mut extz.result,
+        );
+    }
+}
+
+/// `cal_exz_extension_0_simi`: forward extension without traceback.
+pub fn cal_exz_extension_0_simi(extz: &mut BitExtz, pattern: &[u8], text: &[u8], threshold: i32) {
+    if band_word_count(threshold) <= 1 {
+        extension_forward_64(
+            pattern,
+            pattern.len() as i32,
+            text,
+            text.len() as i32,
+            threshold,
+            &mut extz.result,
+        );
+    } else {
+        extension_forward_no_trace(
+            pattern,
+            pattern.len() as i32,
+            text,
+            text.len() as i32,
+            threshold,
+            &mut extz.result,
+        );
+    }
+}
+
+/// `cal_exz_extension_1_simi`: backward extension without traceback.
+pub fn cal_exz_extension_1_simi(extz: &mut BitExtz, pattern: &[u8], text: &[u8], threshold: i32) {
+    if band_word_count(threshold) <= 1 {
+        extension_backward_64(
+            pattern,
+            pattern.len() as i32,
+            text,
+            text.len() as i32,
+            threshold,
+            &mut extz.result,
+        );
+    } else {
+        extension_backward_no_trace(
+            pattern,
+            pattern.len() as i32,
+            text,
+            text.len() as i32,
+            threshold,
+            &mut extz.result,
+        );
+    }
+}
+
+/// `cal_exz_semi_simi`: semi-global alignment on an absent anti-diagonal
+/// without traceback.
+pub fn cal_exz_semi_simi(
+    extz: &mut BitExtz,
+    pattern: &[u8],
+    text: &[u8],
+    threshold: i32,
+    auxiliary_begin: i32,
+) {
+    if band_word_count(threshold) <= 1 {
+        semi_global_64_absent_diagonal(
+            pattern,
+            pattern.len() as i32,
+            text,
+            text.len() as i32,
+            threshold,
+            auxiliary_begin,
+            &mut extz.result,
+        );
+    } else {
+        semi_global_absent_diagonal_no_trace(
+            pattern,
+            pattern.len() as i32,
+            text,
+            text.len() as i32,
+            threshold,
+            auxiliary_begin,
+            &mut extz.result,
+        );
+    }
+}
+
+/// `adjust_ext_offset_fixed_t` (`Correct.cpp` 15811): the extension shrink of
+/// [`adjust_ext_offset`] with caller-supplied clamping bounds instead of the
+/// sequence lengths.
+#[allow(clippy::too_many_arguments)]
+pub fn adjust_ext_offset_fixed_t(
+    query_start: &mut i64,
+    query_end: &mut i64,
+    target_start: &mut i64,
+    target_end: &mut i64,
+    query_minimum: i64,
+    query_maximum: i64,
+    target_minimum: i64,
+    target_maximum: i64,
+    threshold: i64,
+    mode: i64,
+) {
+    if mode == MODE_FORWARD_EXTENSION {
+        let query_offset = query_maximum - *query_start;
+        let target_offset = target_maximum - *target_start;
+        if query_offset <= target_offset {
+            *query_end = query_maximum;
+            *target_end = *target_start + query_offset + threshold;
+        } else {
+            *target_end = target_maximum;
+            *query_end = *query_start + target_offset + threshold;
+        }
+    } else if mode == MODE_BACKWARD_EXTENSION {
+        let query_offset = *query_end - query_minimum;
+        let target_offset = *target_end - target_minimum;
+        if query_offset <= target_offset {
+            *query_start = query_minimum;
+            *target_start = *target_end - query_offset - threshold;
+        } else {
+            *target_start = target_minimum;
+            *query_start = *query_end - target_offset - threshold;
+        }
+    }
+    if *query_start < query_minimum {
+        *query_start = query_minimum;
+    }
+    if *target_start < target_minimum {
+        *target_start = target_minimum;
+    }
+    if *query_end > query_maximum {
+        *query_end = query_maximum;
+    }
+    if *target_end > target_maximum {
+        *target_end = target_maximum;
+    }
+}
+
+/// `cal_exact_simi_exz` (`Correct.cpp` 15918): the exact-match shortcut of
+/// [`cal_exact_exz`] with the target identity and strand taken from the
+/// caller (the UL second pass may call without an overlap region).
+///
+/// `state` carries only `pattern_start`/`pattern_end` (`pts`/`pte`); the
+/// `pthre` half of the state is not touched.
+#[allow(clippy::too_many_arguments)]
+pub fn cal_exact_simi_exz(
+    targets: &TargetSource,
+    extz: &mut BitExtz,
+    query: &[u8],
+    identifier: usize,
+    strand: u8,
+    query_start: i64,
+    query_end: i64,
+    mut target_start: i64,
+    mut target_end: i64,
+    state: &mut ExzAdvState,
+    mode: i64,
+    region: Option<&OverlapRegion>,
+) -> bool {
+    extz.clear_align();
+    extz.result.threshold = 0;
+    extz.cigar.packed.clear();
+
+    let target_total_length = targets.length(identifier);
+    let mut query_length = query_end - query_start;
+
+    if mode == MODE_SEMI_GLOBAL {
+        if let Some(region) = region {
+            target_start = (query_start - i64::from(region.x_position_start))
+                + i64::from(region.y_position_start);
+            target_start += region
+                .fake_cigar
+                .y_start_offset(query_start)
+                .expect("the fake cigar must cover the query start");
+            target_end = target_start + query_length;
+        }
+    } else if mode == MODE_FORWARD_EXTENSION {
+        target_end = target_start + query_length;
+    } else if mode == MODE_BACKWARD_EXTENSION {
+        target_start = target_end - query_length;
+    }
+    if target_start < 0 {
+        target_start = 0;
+    }
+    if target_start > target_total_length {
+        target_start = target_total_length;
+    }
+    if target_end > target_total_length {
+        target_end = target_total_length;
+    }
+    query_length = query_end - query_start;
+    let target_length = target_end - target_start;
+    if query_length != target_length {
+        return false;
+    }
+
+    let query_sequence = &query[query_start as usize..query_end as usize];
+    let target_sequence = targets.sub_region(identifier, target_start, target_length, strand);
+    state.pattern_start = target_start;
+    state.pattern_end = target_end;
+
+    if query_sequence != target_sequence.as_slice() {
+        return false;
+    }
+
+    extz.result.error = 0;
+    extz.cigar.push(0, query_length as u32);
+    extz.result.pattern_length = target_length as i32;
+    extz.result.pattern_start = 0;
+    extz.result.pattern_end = target_length as i32 - 1;
+    extz.result.text_length = query_length as i32;
+    extz.result.text_start = 0;
+    extz.result.text_end = query_length as i32 - 1;
+
+    extz.result.pattern_start += target_start as i32;
+    extz.result.pattern_end += target_start as i32;
+    extz.result.text_start += query_start as i32;
+    extz.result.text_end += query_start as i32;
+    true
+}
+
+/// `cal_exz_infi_simi_adv` (`Correct.cpp` 15838): the no-traceback sibling of
+/// [`cal_exz_infi_adv`]. The target identity and strand come from the caller;
+/// `region` is only consulted for the semi-global mapping and is `None` on
+/// every UL second-pass call site.
+#[allow(clippy::too_many_arguments)]
+pub fn cal_exz_infi_simi_adv(
+    targets: &TargetSource,
+    extz: &mut BitExtz,
+    query: &[u8],
+    identifier: usize,
+    strand: u8,
+    mut query_start: i64,
+    mut query_end: i64,
+    mut target_start: i64,
+    mut target_end: i64,
+    state: &mut ExzAdvState,
+    mut threshold: i64,
+    query_minimum: i64,
+    query_maximum: i64,
+    target_minimum: i64,
+    target_maximum: i64,
+    mode: i64,
+    region: Option<&OverlapRegion>,
+) -> bool {
+    extz.clear_align();
+    let mut auxiliary_begin = 0i64;
+
+    let mut query_length = query_end - query_start;
+    let mut target_length = target_end - target_start;
+    let mut diagonal_distance = query_length.max(target_length);
+    if mode == MODE_SEMI_GLOBAL {
+        if let Some(region) = region {
+            let (start, end, auxiliary) = update_semi_coord(
+                region,
+                targets,
+                query_start,
+                query_end,
+                threshold.min(diagonal_distance),
+            );
+            target_start = start;
+            target_end = end;
+            auxiliary_begin = auxiliary;
+        }
+    } else if mode == MODE_FORWARD_EXTENSION || mode == MODE_BACKWARD_EXTENSION {
+        adjust_ext_offset_fixed_t(
+            &mut query_start,
+            &mut query_end,
+            &mut target_start,
+            &mut target_end,
+            query_minimum,
+            query_maximum,
+            target_minimum,
+            target_maximum,
+            threshold.min(diagonal_distance),
+            mode,
+        );
+    }
+
+    if !(query_end > query_start
+        && target_end > target_start
+        && target_start != -1
+        && target_end != -1)
+    {
+        return false;
+    }
+
+    query_length = query_end - query_start;
+    target_length = target_end - target_start;
+    diagonal_distance = query_length.max(target_length);
+    if threshold > diagonal_distance {
+        threshold = diagonal_distance;
+    }
+    if threshold <= state.threshold {
+        return false;
+    }
+    state.threshold = threshold;
+
+    let query_sequence = &query[query_start as usize..query_end as usize];
+    let target_sequence = targets.sub_region(identifier, target_start, target_length, strand);
+    state.pattern_start = target_start;
+    state.pattern_end = target_end;
+
+    let threshold = threshold as i32;
+    match mode {
+        MODE_GLOBAL => cal_exz_global_simi(extz, &target_sequence, query_sequence, threshold),
+        MODE_FORWARD_EXTENSION => {
+            cal_exz_extension_0_simi(extz, &target_sequence, query_sequence, threshold)
+        }
+        MODE_BACKWARD_EXTENSION => {
+            cal_exz_extension_1_simi(extz, &target_sequence, query_sequence, threshold)
+        }
+        _ => cal_exz_semi_simi(
             extz,
             &target_sequence,
             query_sequence,

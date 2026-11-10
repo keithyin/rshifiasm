@@ -1873,6 +1873,427 @@ pub fn extension_backward_trace(
     result.pattern_end = pattern_pivot - saved_start;
 }
 
+// ---------------------------------------------------------------------------
+// The non-trace (`_simi`) kernels.
+//
+// The `_simi` dispatch wrappers (`cal_exz_global_simi` and friends) call the
+// `ed_band_cal_*_w` kernels without traceback. They share the recurrence of
+// the `_trace` kernels but differ in three observable ways: they always reset
+// the state (the `_trace` kernels keep the previous alignment when
+// `ez->err <= thre` and short-circuit when it is zero), they never build a
+// cigar, and their end scans run unconditionally instead of being guarded by
+// the previous error.
+// ---------------------------------------------------------------------------
+
+/// Width-generic global alignment without traceback, the counterpart of
+/// `ed_band_cal_global_infi_w`. It also stands in for the 64-bit and 128-bit
+/// kernels, which perform the same arithmetic on the band bits.
+pub fn global_no_trace(
+    pattern: &[u8],
+    pattern_length: i32,
+    text: &[u8],
+    text_length: i32,
+    threshold: i32,
+    result: &mut EditDistanceResult,
+) {
+    result.reset(threshold, pattern_length, text_length);
+    result.pattern_start = 0;
+    result.text_start = 0;
+
+    let pn = pattern_length;
+    let tn = text_length;
+    if pn > tn + threshold || tn > pn + threshold {
+        return;
+    }
+
+    let mut vectors = BandedVectors::new(band_word_count(threshold));
+    let first_length = (threshold + 1).min(pn);
+    vectors.fill_pattern(pattern, first_length, threshold);
+    let mut error = threshold;
+    initialise_seeded_masks(&mut vectors, threshold);
+
+    let last_text_index = tn - 1;
+    let cutoff = threshold + (threshold << 1);
+    let new_bit = threshold << 1;
+    let mut pattern_index = threshold;
+    let mut text_index = 0i32;
+
+    while text_index < last_text_index {
+        vectors.core(text[text_index as usize]);
+        if vectors.diagonal_zero[0] & 1 == 0 {
+            error += 1;
+            if error > cutoff {
+                return;
+            }
+        }
+
+        vectors.shift_pattern();
+        text_index += 1;
+        pattern_index += 1;
+        if pattern_index < pn {
+            let code = SEQUENCE_NT4_TABLE[pattern[pattern_index as usize] as usize] as usize;
+            if code < 4 {
+                vectors.pattern[code][(new_bit >> 6) as usize] |= 1u64 << (new_bit & 63);
+            }
+        }
+    }
+
+    vectors.core(text[last_text_index as usize]);
+    if vectors.diagonal_zero[0] & 1 == 0 {
+        error += 1;
+        if error > cutoff {
+            return;
+        }
+    }
+
+    let mut site = tn - 1 - threshold;
+    let final_site = pn - 1;
+    let mut index = 0i32;
+    while site < final_site {
+        error += vector_bit(&vectors.vertical_positive, index);
+        error -= vector_bit(&vectors.vertical_negative, index);
+        index += 1;
+        site += 1;
+    }
+    if site == final_site && error <= threshold {
+        result.error = error;
+        result.pattern_end = pn - 1;
+        result.text_end = tn - 1;
+    }
+}
+
+/// Width-generic semi-global alignment on an absent anti-diagonal without
+/// traceback, the counterpart of `ed_band_cal_semi_infi_w_absent_diag`.
+pub fn semi_global_absent_diagonal_no_trace(
+    pattern: &[u8],
+    pattern_length: i32,
+    text: &[u8],
+    text_length: i32,
+    threshold: i32,
+    absolute_diagonal: i32,
+    result: &mut EditDistanceResult,
+) {
+    result.reset(threshold, pattern_length, text_length);
+    result.pattern_start = -1;
+    result.pattern_end = -1;
+    result.text_start = 0;
+    result.text_end = text_length - 1;
+
+    let pn = pattern_length;
+    let tn = text_length;
+    let cutoff = threshold + (threshold << 1);
+    if pn > tn + cutoff || tn > pn + cutoff {
+        return;
+    }
+
+    let mut vectors = BandedVectors::new(band_word_count(threshold));
+    let first_length = ((threshold << 1) + 1 - absolute_diagonal).min(pn);
+    vectors.fill_pattern(pattern, first_length, absolute_diagonal);
+    set_low_bits(&mut vectors.vertical_negative, absolute_diagonal);
+
+    let mut error = absolute_diagonal;
+    let last_text_index = tn - 1;
+    let new_bit = threshold << 1;
+    let mut pattern_index = (threshold << 1) - absolute_diagonal;
+    let mut text_index = 0i32;
+
+    while text_index < last_text_index {
+        vectors.core(text[text_index as usize]);
+        if vectors.diagonal_zero[0] & 1 == 0 {
+            error += 1;
+            if error > cutoff {
+                return;
+            }
+        }
+
+        vectors.shift_pattern();
+        text_index += 1;
+        pattern_index += 1;
+        if pattern_index < pn {
+            let code = SEQUENCE_NT4_TABLE[pattern[pattern_index as usize] as usize] as usize;
+            if code < 4 {
+                vectors.pattern[code][(new_bit >> 6) as usize] |= 1u64 << (new_bit & 63);
+            }
+        }
+    }
+
+    vectors.core(text[last_text_index as usize]);
+    if vectors.diagonal_zero[0] & 1 == 0 {
+        error += 1;
+        if error > cutoff {
+            return;
+        }
+    }
+
+    let mut site = tn - 1 - absolute_diagonal;
+    let available = pn - tn + absolute_diagonal;
+    let mut ungapped_error = i32::MAX;
+    let mut index = 0i32;
+    while site < 0 && index < available {
+        error += vector_bit(&vectors.vertical_positive, index);
+        error -= vector_bit(&vectors.vertical_negative, index);
+        index += 1;
+        site += 1;
+    }
+    if error <= threshold && error <= result.error {
+        result.error = error;
+        result.pattern_end = site;
+    }
+
+    site -= index;
+    while index < available {
+        error += vector_bit(&vectors.vertical_positive, index);
+        error -= vector_bit(&vectors.vertical_negative, index);
+        index += 1;
+        if error <= threshold && error <= result.error {
+            result.error = error;
+            result.pattern_end = site + index;
+        }
+        if index == threshold {
+            ungapped_error = error;
+        }
+    }
+    if ungapped_error <= threshold && ungapped_error == result.error {
+        result.pattern_end = site + threshold;
+    }
+}
+
+/// Width-generic forward extension without traceback, the counterpart of
+/// `ed_band_cal_extension_infi_0_w`.
+pub fn extension_forward_no_trace(
+    pattern: &[u8],
+    pattern_length: i32,
+    text: &[u8],
+    text_length: i32,
+    threshold: i32,
+    result: &mut EditDistanceResult,
+) {
+    result.reset(threshold, pattern_length, text_length);
+    result.pattern_start = 0;
+    result.text_start = 0;
+    result.pattern_end = -1;
+    result.text_end = -1;
+
+    let mut pn = pattern_length;
+    let mut tn = text_length;
+    if pn > tn + threshold {
+        pn = tn + threshold;
+    } else if tn > pn + threshold {
+        tn = pn + threshold;
+    }
+
+    let mut vectors = BandedVectors::new(band_word_count(threshold));
+    let first_length = (threshold + 1).min(pn);
+    vectors.fill_pattern(pattern, first_length, threshold);
+    let mut error = threshold;
+    initialise_seeded_masks(&mut vectors, threshold);
+
+    let last_text_index = tn - 1;
+    let cutoff = threshold + (threshold << 1);
+    let new_bit = threshold << 1;
+    let pattern_end = pn - 1;
+    let mut temporary_error = i32::MAX;
+    let mut pattern_index = threshold;
+    let mut text_index = 0i32;
+
+    while text_index < last_text_index {
+        vectors.core(text[text_index as usize]);
+        if vectors.diagonal_zero[0] & 1 == 0 {
+            error += 1;
+            if error > cutoff {
+                return;
+            }
+        }
+
+        {
+            let mut pattern_offset = text_index - threshold;
+            let mut shift = text_index + threshold - pattern_end;
+            if shift >= 0 {
+                if temporary_error == i32::MAX {
+                    temporary_error = error;
+                    let mut position = 0i32;
+                    while pattern_offset < pattern_end {
+                        temporary_error += vector_bit(&vectors.vertical_positive, position);
+                        temporary_error -= vector_bit(&vectors.vertical_negative, position);
+                        pattern_offset += 1;
+                        position += 1;
+                    }
+                } else {
+                    shift = (threshold << 1) - shift;
+                    if shift >= 0 {
+                        temporary_error += vector_bit(&vectors.horizontal_positive, shift);
+                        temporary_error -= vector_bit(&vectors.horizontal_negative, shift);
+                    }
+                }
+                if temporary_error <= threshold && temporary_error < result.error {
+                    result.error = temporary_error;
+                    result.pattern_end = pattern_end;
+                    result.text_end = text_index;
+                }
+            }
+        }
+
+        vectors.shift_pattern();
+        text_index += 1;
+        pattern_index += 1;
+        if pattern_index < pn {
+            let code = SEQUENCE_NT4_TABLE[pattern[pattern_index as usize] as usize] as usize;
+            if code < 4 {
+                vectors.pattern[code][(new_bit >> 6) as usize] |= 1u64 << (new_bit & 63);
+            }
+        }
+    }
+
+    vectors.core(text[last_text_index as usize]);
+    if vectors.diagonal_zero[0] & 1 == 0 {
+        error += 1;
+        if error > cutoff {
+            return;
+        }
+    }
+
+    let mut site = tn - 1 - threshold;
+    let final_site = pn - 1;
+    let mut index = 0i32;
+    while site < final_site {
+        error += vector_bit(&vectors.vertical_positive, index);
+        error -= vector_bit(&vectors.vertical_negative, index);
+        index += 1;
+        site += 1;
+        if error <= threshold && error < result.error {
+            result.error = error;
+            result.pattern_end = site;
+            result.text_end = tn - 1;
+        }
+    }
+    if error <= threshold && error < result.error {
+        result.error = error;
+        result.pattern_end = site;
+        result.text_end = tn - 1;
+    }
+}
+
+/// Width-generic backward extension without traceback, the counterpart of
+/// `ed_band_cal_extension_infi_1_w`. Both sequences are consumed from their
+/// right ends and the reported start offsets are measured from the pivots.
+pub fn extension_backward_no_trace(
+    pattern: &[u8],
+    pattern_length: i32,
+    text: &[u8],
+    text_length: i32,
+    threshold: i32,
+    result: &mut EditDistanceResult,
+) {
+    result.reset(threshold, pattern_length, text_length);
+    result.pattern_start = i32::MAX;
+    result.text_start = i32::MAX;
+    result.pattern_end = pattern_length - 1;
+    result.text_end = text_length - 1;
+
+    let mut pn = pattern_length;
+    let mut tn = text_length;
+    if pn > tn + threshold {
+        pn = tn + threshold;
+    } else if tn > pn + threshold {
+        tn = pn + threshold;
+    }
+
+    let pattern_pivot = result.pattern_end;
+    let text_pivot = result.text_end;
+
+    let mut vectors = BandedVectors::new(band_word_count(threshold));
+    let first_length = (threshold + 1).min(pn);
+    vectors.fill_pattern_backward(pattern, pattern_pivot, first_length, threshold);
+    let mut error = threshold;
+    initialise_seeded_masks(&mut vectors, threshold);
+
+    let last_text_index = tn - 1;
+    let cutoff = threshold + (threshold << 1);
+    let new_bit = threshold << 1;
+    let pattern_end = pn - 1;
+    let mut temporary_error = i32::MAX;
+    let mut pattern_index = threshold;
+    let mut text_index = 0i32;
+
+    while text_index < last_text_index {
+        vectors.core(text[(text_pivot - text_index) as usize]);
+        if vectors.diagonal_zero[0] & 1 == 0 {
+            error += 1;
+            if error > cutoff {
+                return;
+            }
+        }
+
+        {
+            let mut pattern_offset = text_index - threshold;
+            let mut shift = text_index + threshold - pattern_end;
+            if shift >= 0 {
+                if temporary_error == i32::MAX {
+                    temporary_error = error;
+                    let mut position = 0i32;
+                    while pattern_offset < pattern_end {
+                        temporary_error += vector_bit(&vectors.vertical_positive, position);
+                        temporary_error -= vector_bit(&vectors.vertical_negative, position);
+                        pattern_offset += 1;
+                        position += 1;
+                    }
+                } else {
+                    shift = (threshold << 1) - shift;
+                    if shift >= 0 {
+                        temporary_error += vector_bit(&vectors.horizontal_positive, shift);
+                        temporary_error -= vector_bit(&vectors.horizontal_negative, shift);
+                    }
+                }
+                if temporary_error <= threshold && temporary_error < result.error {
+                    result.error = temporary_error;
+                    result.pattern_start = pattern_pivot - pattern_end;
+                    result.text_start = text_pivot - text_index;
+                }
+            }
+        }
+
+        vectors.shift_pattern();
+        text_index += 1;
+        pattern_index += 1;
+        if pattern_index < pn {
+            let code =
+                SEQUENCE_NT4_TABLE[pattern[(pattern_pivot - pattern_index) as usize] as usize]
+                    as usize;
+            if code < 4 {
+                vectors.pattern[code][(new_bit >> 6) as usize] |= 1u64 << (new_bit & 63);
+            }
+        }
+    }
+
+    vectors.core(text[(text_pivot - last_text_index) as usize]);
+    if vectors.diagonal_zero[0] & 1 == 0 {
+        error += 1;
+        if error > cutoff {
+            return;
+        }
+    }
+
+    let mut site = tn - 1 - threshold;
+    let final_site = pn - 1;
+    let mut index = 0i32;
+    while site < final_site {
+        error += vector_bit(&vectors.vertical_positive, index);
+        error -= vector_bit(&vectors.vertical_negative, index);
+        index += 1;
+        site += 1;
+        if error <= threshold && error < result.error {
+            result.error = error;
+            result.pattern_start = pattern_pivot - site;
+            result.text_start = text_pivot + 1 - tn;
+        }
+    }
+    if error <= threshold && error < result.error {
+        result.error = error;
+        result.pattern_start = pattern_pivot - site;
+        result.text_start = text_pivot + 1 - tn;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

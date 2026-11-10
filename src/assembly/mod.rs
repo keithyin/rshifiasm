@@ -32,6 +32,8 @@ pub mod break_contig;
 pub mod read_cache;
 pub mod unitig;
 pub mod ul;
+pub mod ul_raw_chain;
+pub mod ul_scall;
 pub mod ul_index;
 pub mod ul_store;
 pub mod dual_scaf;
