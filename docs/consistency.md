@@ -2654,12 +2654,24 @@ Rust 侧已具备大部分底层原语：`align_ul_ed_post_extz`
   `get_rid_backward_cigar_err(qs=382)` 返回 35、Rust 返回 34，即扫描到
   qs=382 所在窗口 `[310,464]` 内部时少计 1 个错误。
 - 已排除：输入 tk、第一遍 P1REG/P1WIN（含唯一 clen=17 gap 窗口）、cells、
-  第二遍 tk、connect(3,2) 结果均与参考一致；`infer_rovlp`/`get_ecov_contain_adv`
-  结构一致。剩余差异在 `get_rid_backward_cigar_err` 对 `exz` 复用状态
-  （`exz.ps/pe/ts/te` 的惰性 gen_clip 判定）或 `rtrace_iter` 游标的处理上。
-- 下一步：用 `-O0` 重编 Correct.o 的 `get_rid_backward_cigar_err`，对 read 5
-  的 `(ai=3, qs=382)` 调用逐窗口打印 `k/q[0]/q[1]/f/werr/exz.*`，与 Rust 的
-  `iterator`/`extz` 状态逐字段对拍，定位第一次分叉的窗口。
+  第二遍 tk（199 条）、connect(3,2) 的返回 err、`infer_rovlp`/
+  `get_ecov_contain_adv`/`gen_clip_win_err`/`extract_sub_werr`/`pop_trace_back`
+  结构，均一致。
+- 继续下钻到第二遍 trace（`bl->tc`，277 条）发现：`c_qe` 与参考普遍不同
+  （如 C 6245 / Rust 6214、C 624 / Rust 551），而 `c_qs/c_ts/c_te/c_wsid/
+  c_weid/c_wsii/c_weii/pfx/sfx/mid` 全同。这使 `get_rid_backward_cigar_err`
+  的游标 `iterator.qoff` 在 `connect(3,0)` 入口为 C=777 / Rust=760（差 17，
+  恰为一个 gap 窗口 span），进而 post-loop 补足少算 1。`c_qe` = gen_raln
+  窗口段（不含尾部延伸）的 max `q[1]`，说明 **`extract_subov_cigar` 的
+  窗口范围（first/last）或 `gen_raln` 部分窗口的 `hc_aln_exz_by_exist_cigar_with_p`
+  文本端**在 Rust 上偏小；tk.qe 因尾部延伸到 query_length 仍是同值而掩盖了它。
+- 已确认这不是 trace 条数问题：`gen_sub_ov_adv_cigar` 先推 tk+trace，
+  `dedup_ul_ov_t` 只删 tk 不删 trace，故 trace(277) > tk(199)；tk.qn 仍指向
+  正确 trace。
+- 下一步：对 read 5 某条子 overlap，打印 C/Rust 的 `extract_subov_cigar`
+  的 `first/last/k` 与 `win_boundary_offset` 的 `q[0]/q[1]`，以及部分窗口
+  `hc_aln_exz_by_exist_cigar_with_p` 返回的 `text_start/text_end`，定位
+  `c_qe` 首次分叉的窗口。
 
 ## 仍未迁移的分支
 
