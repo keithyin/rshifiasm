@@ -22,8 +22,9 @@ use crate::correction::interval::{get_interval, IntervalBuffer, WindowPool};
 use crate::correction::recalculate::similarity_pass;
 use crate::correction::region::THRESHOLD_MAXIMUM;
 use crate::correction::target::TargetSource;
+use crate::correction::ul_align::{is_alnw, ALNW_SENTINEL};
 use crate::correction::window::number_of_windows;
-use crate::overlap::region::OverlapRegion;
+use crate::overlap::region::{CandidatesList, KmerHit, OverlapRegion};
 use crate::reads::read_store::ReadStore;
 
 /// `G_CHAIN_BW` (`inter.h` 7).
@@ -783,4 +784,217 @@ pub fn dp_commen_sketch(
         }
     }
     win_n as u64
+}
+
+/// `push_adp_k_hits` (`Correct.cpp` 14758): push the anchor hits of one
+/// `[qs, qs)` / `[ts, te)` bracket plus its two `readID = 0x7fffffff`
+/// sentinels onto `cl`, returning the next scan position.
+#[allow(clippy::too_many_arguments)]
+fn push_adp_k_hits(
+    cl: &mut CandidatesList,
+    cln: i64,
+    qs: u64,
+    qe: u64,
+    ts: u64,
+    te: u64,
+    read_id: u32,
+    ci: i64,
+    _debug_id: i64,
+) -> i64 {
+    let mut k = ci;
+    let mut previous: i64 = -1;
+    if cl.length > cln {
+        previous = cl.length - 1;
+        debug_assert!(is_alnw(&cl.list[previous as usize]));
+    }
+    while k < cln
+        && cl.list[k as usize].read_identifier == read_id
+        && (cl.list[k as usize].self_offset as u64) < qs
+    {
+        let hit = cl.list[k as usize];
+        k += 1;
+        if hit.offset as u64 >= ts {
+            continue;
+        }
+        if previous >= 0 {
+            let last = &cl.list[previous as usize];
+            if last.offset >= hit.offset || last.self_offset >= hit.self_offset {
+                continue;
+            }
+        }
+        let mut pushed = hit;
+        pushed.read_identifier = hit.count;
+        cl.list.push(pushed);
+        cl.length = cl.list.len() as i64;
+    }
+    if qs == u64::MAX || qe == u64::MAX {
+        return k;
+    }
+    cl.list.push(KmerHit {
+        read_identifier: ALNW_SENTINEL,
+        count: u32::MAX,
+        reverse_strand: false,
+        self_offset: qs as u32,
+        offset: ts as u32,
+    });
+    cl.length = cl.list.len() as i64;
+    while k < cln
+        && cl.list[k as usize].read_identifier == read_id
+        && (cl.list[k as usize].self_offset as u64) < qe
+    {
+        k += 1;
+    }
+    cl.list.push(KmerHit {
+        read_identifier: ALNW_SENTINEL,
+        count: u32::MAX,
+        reverse_strand: true,
+        self_offset: (qe - 1) as u32,
+        offset: (te - 1) as u32,
+    });
+    cl.length = cl.list.len() as i64;
+    k
+}
+
+/// `gen_weight_khits0` (`Correct.cpp` 14799): label the hits of `[qs, qe)` with
+/// the chain weight `dp`.
+fn gen_weight_khits0(
+    qs: u32,
+    qe: u32,
+    hits: &mut [KmerHit],
+    count: i64,
+    mut k: i64,
+    dp: i64,
+) -> i64 {
+    while k >= 0 && hits[k as usize].self_offset >= qs {
+        k -= 1;
+    }
+    if k < 0 {
+        k = 0;
+    }
+    while k < count && hits[k as usize].self_offset < qe {
+        if hits[k as usize].self_offset >= qs
+            && hits[k as usize].self_offset < qe
+            && !is_alnw(&hits[k as usize])
+        {
+            hits[k as usize].read_identifier = dp as u32;
+        }
+        k += 1;
+    }
+    k
+}
+
+/// `gen_weight_khits` (`Correct.cpp` 14810): sweep the `iidx` endpoints and
+/// weight each anchor run by its coverage depth.
+fn gen_weight_khits(idx: &[u64], hits: &mut [KmerHit]) {
+    let count = hits.len() as i64;
+    let mut k = 0i64;
+    let mut depth = 0i64;
+    let mut begin = 0i64;
+    for entry in idx {
+        let previous_depth = depth;
+        let end;
+        if ((entry >> 32) & 1) != 0 {
+            depth -= 1;
+            end = ((entry >> 33) + 1) as i64;
+        } else {
+            depth += 1;
+            end = (entry >> 33) as i64;
+        }
+        if end > begin {
+            k = gen_weight_khits0(begin as u32, end as u32, hits, count, k, previous_depth);
+        }
+        begin = end;
+    }
+}
+
+/// `gen_cns_chain` (`Correct.cpp` 14847): turns one overlap's aligned windows
+/// into a candidate anchor chain in `cl` (appended from the current length) and
+/// returns the number of hits. `need_filter_khit` must be false (the UL
+/// gap-filling driver passes 0), so `lchain_dp_trace` is not run.
+pub fn gen_cns_chain(
+    regions: &mut [OverlapRegion],
+    region_index: usize,
+    cl: &mut CandidatesList,
+    iidx: Option<&[u64]>,
+    _maximum_length_gap: i64,
+    _small_gap_rate: f64,
+    need_filter_khit: bool,
+) -> i64 {
+    let window_count = regions[region_index].window_cigar.windows.len() as i64;
+    if window_count <= 0 {
+        return 0;
+    }
+    let target_identifier = regions[region_index].y_identifier as i64;
+    let mut query_start: i64 = -1;
+    let mut query_end: i64 = -1;
+    let mut target_start: i64 = -1;
+    let mut target_end: i64 = -1;
+    let mut chain_index = regions[region_index].shared_seed as i64;
+    let read_identifier = cl.list[chain_index as usize].read_identifier;
+    let chain_start = cl.length;
+    let mut aligned = 0i64;
+
+    for k in 0..window_count {
+        let window = regions[region_index].window_cigar.windows[k as usize];
+        if window.extra_end < 0 && window.y_end != -1 {
+            if query_start == -1 {
+                query_start = window.x_start as i64;
+                target_start =
+                    regions[region_index].window_cigar.windows[(k - 1) as usize].y_end as i64 + 1;
+            }
+            query_end = window.x_end as i64 + 1;
+            target_end = window.y_end as i64 + 1;
+        } else {
+            if query_start != -1 {
+                chain_index = push_adp_k_hits(
+                    cl,
+                    chain_start,
+                    query_start as u64,
+                    query_end as u64,
+                    target_start as u64,
+                    target_end as u64,
+                    read_identifier,
+                    chain_index,
+                    target_identifier,
+                );
+                aligned += 1;
+            }
+            query_start = -1;
+            query_end = -1;
+            target_start = -1;
+            target_end = -1;
+        }
+    }
+    if query_start != -1 {
+        chain_index = push_adp_k_hits(
+            cl,
+            chain_start,
+            query_start as u64,
+            query_end as u64,
+            target_start as u64,
+            target_end as u64,
+            read_identifier,
+            chain_index,
+            target_identifier,
+        );
+        aligned += 1;
+    }
+    push_adp_k_hits(
+        cl,
+        chain_start,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        read_identifier,
+        chain_index,
+        target_identifier,
+    );
+    let hit_count = cl.length - chain_start;
+    if let Some(iidx) = iidx {
+        gen_weight_khits(iidx, &mut cl.list[chain_start as usize..]);
+    }
+    let _ = (aligned, need_filter_khit);
+    cl.length = chain_start;
+    hit_count
 }
