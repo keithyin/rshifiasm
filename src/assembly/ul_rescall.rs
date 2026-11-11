@@ -24,7 +24,7 @@ use crate::correction::region::THRESHOLD_MAXIMUM;
 use crate::correction::target::TargetSource;
 use crate::correction::ul_align::{is_alnw, ALNW_SENTINEL};
 use crate::correction::window::number_of_windows;
-use crate::overlap::region::{CandidatesList, KmerHit, OverlapRegion};
+use crate::overlap::region::{CandidatesList, ChainData, KmerHit, OverlapRegion};
 use crate::reads::read_store::ReadStore;
 
 /// `G_CHAIN_BW` (`inter.h` 7).
@@ -1117,4 +1117,258 @@ fn k_hits_bcheck(
         }
     }
     true
+}
+
+/// `filter_adp_k_hits` (`Correct.cpp` 15017): copy the anchors of one bracket
+/// into the compacted array at `cmi`, clip the ones too far from the
+/// neighbouring brackets, refine them with [`crate::overlap::chaining::chain_refine`],
+/// and return the next scan position.
+#[allow(clippy::too_many_arguments)]
+fn filter_adp_k_hits(
+    anchors: &mut [KmerHit],
+    anchor_count: i64,
+    chain_data: &mut ChainData,
+    query_start: u64,
+    query_end: u64,
+    target_start: u64,
+    _target_end: u64,
+    read_identifier: u32,
+    cursor: i64,
+    copy_index: &mut i64,
+    previous_end: Option<&KmerHit>,
+    small_bw_rate: f64,
+    min_small_bw: i64,
+) -> i64 {
+    let mut k = cursor;
+    let copy_start = *copy_index;
+    while k < anchor_count
+        && anchors[k as usize].read_identifier == read_identifier
+        && (anchors[k as usize].self_offset as u64) < query_start
+    {
+        let hit = anchors[k as usize];
+        k += 1;
+        if hit.offset as u64 >= target_start {
+            continue;
+        }
+        if let Some(previous) = previous_end {
+            if previous.offset >= hit.offset || previous.self_offset >= hit.self_offset {
+                continue;
+            }
+        }
+        anchors[*copy_index as usize] = hit;
+        *copy_index += 1;
+    }
+    let boundary = KmerHit {
+        self_offset: query_start as u32,
+        offset: target_start as u32,
+        ..KmerHit::default()
+    };
+    let end_anchor: Option<&KmerHit> = if query_start == u64::MAX || query_end == u64::MAX {
+        None
+    } else {
+        Some(&boundary)
+    };
+    if *copy_index > copy_start {
+        let kept = filter_bad_khits(
+            previous_end,
+            end_anchor,
+            &mut anchors[copy_start as usize..*copy_index as usize],
+            small_bw_rate,
+            min_small_bw,
+        );
+        *copy_index = copy_start + kept as i64;
+        if *copy_index > copy_start {
+            *copy_index = copy_start
+                + crate::overlap::chaining::chain_refine(
+                    &mut anchors[copy_start as usize..*copy_index as usize],
+                    *copy_index - copy_start,
+                    chain_data,
+                    50,
+                    5000,
+                    512,
+                    16,
+                );
+        }
+    }
+    while k < anchor_count
+        && anchors[k as usize].read_identifier == read_identifier
+        && (anchors[k as usize].self_offset as u64) < query_end
+    {
+        k += 1;
+    }
+    k
+}
+
+/// `refine_khits` (`Correct.cpp` 15046): rebuild one overlap's anchor runs.
+pub fn refine_khits(
+    region: &mut OverlapRegion,
+    candidates: &mut CandidatesList,
+    small_gap_rate: f64,
+) {
+    let window_count = region.window_cigar.windows.len() as i64;
+    if window_count <= 0 {
+        return;
+    }
+    let mut query_start: i64 = -1;
+    let mut query_end: i64 = -1;
+    let mut target_start: i64 = -1;
+    let mut target_end: i64 = -1;
+    let mut cursor = region.shared_seed as i64;
+    let mut copy_index = cursor;
+    let read_identifier = candidates.list[cursor as usize].read_identifier;
+    let mut previous = KmerHit {
+        self_offset: u32::MAX,
+        offset: u32::MAX,
+        ..KmerHit::default()
+    };
+    let mut aligned = 0i64;
+    let minimum_gap = 64i64;
+
+    for k in 0..window_count {
+        let window = region.window_cigar.windows[k as usize];
+        if window.extra_end < 0 && window.y_end != -1 {
+            if query_start == -1 {
+                query_start = window.x_start as i64;
+                target_start =
+                    region.window_cigar.windows[(k - 1) as usize].y_end as i64 + 1;
+            }
+            query_end = window.x_end as i64 + 1;
+            target_end = window.y_end as i64 + 1;
+        } else {
+            if query_start != -1 {
+                let previous_end = if aligned != 0 { Some(&previous) } else { None };
+                cursor = filter_adp_k_hits(
+                    &mut candidates.list,
+                    candidates.length,
+                    &mut candidates.chain_data,
+                    query_start as u64,
+                    query_end as u64,
+                    target_start as u64,
+                    target_end as u64,
+                    read_identifier,
+                    cursor,
+                    &mut copy_index,
+                    previous_end,
+                    small_gap_rate,
+                    minimum_gap,
+                );
+                previous.self_offset = (query_end - 1) as u32;
+                previous.offset = (target_end - 1) as u32;
+                aligned += 1;
+            }
+            query_start = -1;
+            query_end = -1;
+            target_start = -1;
+            target_end = -1;
+        }
+    }
+    if query_start != -1 {
+        let previous_end = if aligned != 0 { Some(&previous) } else { None };
+        cursor = filter_adp_k_hits(
+            &mut candidates.list,
+            candidates.length,
+            &mut candidates.chain_data,
+            query_start as u64,
+            query_end as u64,
+            target_start as u64,
+            target_end as u64,
+            read_identifier,
+            cursor,
+            &mut copy_index,
+            previous_end,
+            small_gap_rate,
+            minimum_gap,
+        );
+        previous.self_offset = (query_end - 1) as u32;
+        previous.offset = (target_end - 1) as u32;
+        aligned += 1;
+    }
+    let _ = aligned;
+    let previous_end = if aligned != 0 { Some(&previous) } else { None };
+    cursor = filter_adp_k_hits(
+        &mut candidates.list,
+        candidates.length,
+        &mut candidates.chain_data,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        read_identifier,
+        cursor,
+        &mut copy_index,
+        previous_end,
+        small_gap_rate,
+        minimum_gap,
+    );
+    for k in copy_index..cursor {
+        candidates.list[k as usize].read_identifier = ALNW_SENTINEL;
+    }
+}
+
+/// `count_k_hits_adv` (`Correct.cpp` 15118): refine every overlap's anchors,
+/// group them by query position, and label each position's support count
+/// (`cnt`), with the `khit`-base check when `base_check` is set.
+pub fn count_k_hits_adv(
+    targets: &TargetSource<'_>,
+    regions: &mut [OverlapRegion],
+    candidates: &mut CandidatesList,
+    index: &mut Vec<u64>,
+    small_gap_rate: f64,
+    khit: u64,
+    base_check: bool,
+) {
+    let overlap_count = regions.len();
+    let mut candidate_count = candidates.length;
+    index.clear();
+    for k in 0..overlap_count {
+        index.push(((regions[k].shared_seed as u64) << 32) | k as u64);
+        refine_khits(&mut regions[k], candidates, small_gap_rate);
+    }
+    radix_sort_u64(index);
+
+    let mut write = 0usize;
+    for k in 0..overlap_count {
+        let overlap = index[k] as u32 as usize;
+        let mut cursor = regions[overlap].shared_seed as i64;
+        let target_identifier = candidates.list[cursor as usize].read_identifier;
+        regions[overlap].shared_seed = write as i32;
+        while cursor < candidate_count
+            && candidates.list[cursor as usize].read_identifier == target_identifier
+            && candidates.list[cursor as usize].read_identifier != ALNW_SENTINEL
+        {
+            let mut hit = candidates.list[cursor as usize];
+            hit.read_identifier = index[k] as u32;
+            hit.count = 0;
+            candidates.list[write] = hit;
+            index.push(((hit.self_offset as u64) << 32) | write as u64);
+            write += 1;
+            cursor += 1;
+        }
+    }
+    candidate_count = write as i64;
+    candidates.length = candidate_count;
+
+    let sorted_start = overlap_count;
+    radix_sort_u64(&mut index[sorted_start..]);
+    let sorted_count = index.len() - overlap_count;
+    // Group the same self_offset together and set each hit's support count.
+    let mut run_start = 0usize;
+    for run_end in 1..=sorted_count {
+        if run_end == sorted_count
+            || (index[sorted_start + run_start] >> 32) != (index[sorted_start + run_end] >> 32)
+        {
+            let mut support = (run_end - run_start) as u32;
+            if base_check && support > 1 {
+                let ids = &index[sorted_start + run_start..sorted_start + run_end];
+                let checked = k_hits_bcheck(targets, regions, candidates, khit, ids, ids.len() as i64);
+                if !checked {
+                    support = 1;
+                }
+            }
+            for i in run_start..run_end {
+                candidates.list[index[sorted_start + i] as u32 as usize].count = support;
+            }
+            run_start = run_end;
+        }
+    }
 }
