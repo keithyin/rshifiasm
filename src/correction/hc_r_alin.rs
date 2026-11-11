@@ -199,6 +199,7 @@ fn refine_overlaps(
                 maximum_error_rate,
                 THRESHOLD_MAXIMUM,
                 false,
+                None,
             );
             overlaps[index].is_match = 0;
             if extension.error_rate > error_rate {

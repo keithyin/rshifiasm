@@ -14,6 +14,9 @@ use crate::assembly::ul::{infer_rovlp_unitigs, UlOv};
 use crate::assembly::unitig::UnitigGraph;
 use crate::container::ksort::{radix_sort_by_key_32, radix_sort_u64};
 use crate::correction::ec_driver::PafList;
+use crate::correction::hc_align::window_se_by_normalized_start;
+use crate::correction::interval::{get_interval, IntervalBuffer, WindowPool};
+use crate::correction::window::number_of_windows;
 use crate::overlap::region::OverlapRegion;
 use crate::reads::read_store::ReadStore;
 
@@ -323,4 +326,168 @@ pub fn gen_shared_intervals(
     }
     let _ = is_sorted;
     res.len()
+}
+
+/// `get_adjust_winid` (`Correct.cpp` 3079): the window index in `region` whose
+/// `x_start` equals `win_beg`, or `-1`.
+fn get_adjust_winid(region: &OverlapRegion, win_beg: i64, win_len: i64) -> i64 {
+    let x_start = region.x_position_start as i64;
+    let mut win_id = (win_beg - (x_start / win_len) * win_len) / win_len;
+    let count = region.window_cigar.windows.len();
+    if win_id >= 0
+        && (win_id as usize) < count
+        && region.window_cigar.windows[win_id as usize].x_start as i64 == win_beg
+    {
+        return win_id;
+    }
+    if count == 0 {
+        return -1;
+    }
+    if win_id as u64 > count as u64 {
+        win_id = count as i64;
+    }
+    let mut index = win_id - 1;
+    while index >= 0 {
+        let window = &region.window_cigar.windows[index as usize];
+        if window.x_start as i64 == win_beg {
+            return index;
+        }
+        if (window.x_start as i64) < win_beg {
+            return -1;
+        }
+        index -= 1;
+    }
+    -1
+}
+
+/// `set_herror_win` (`Correct.cpp` 3099): marks overlaps whose window has no
+/// supporting alignment as `is_match = 4` and records the freshly matched
+/// windows in `v_idx` (`(offset << 32) | count`, followed by the
+/// `(window_start << 32) | window_end` runs).
+#[allow(clippy::too_many_arguments)]
+pub fn set_herror_win(
+    overlaps: &mut [OverlapRegion],
+    dummy: &mut IntervalBuffer,
+    v_idx: &mut Vec<u64>,
+    maximum_overlap_divergence: f64,
+    read_length: i64,
+    block_length: i64,
+) {
+    let mut pool = WindowPool::new(
+        read_length,
+        block_length,
+        (1.0 / maximum_overlap_divergence) as i64,
+    );
+    let window_length = pool.window_length;
+    let index_count = number_of_windows(0, read_length, block_length) as usize;
+    v_idx.clear();
+    v_idx.resize(index_count, 0);
+    let mut index_i = 0usize;
+    let mut flag = 0i32;
+    while let Some((window_start, window_end)) = pool.next_window() {
+        if flag == -2 {
+            break;
+        }
+        dummy.length = 0;
+        dummy.partial_length = 0;
+        flag = get_interval(window_start, window_end, overlaps, dummy, window_length);
+        v_idx[index_i] = (v_idx.len() as u64) << 32;
+        index_i += 1;
+
+        // Does a matched window of the full-window group already cover it?
+        let mut has_matched = false;
+        for i in 0..dummy.length as usize {
+            let identifier = dummy.overlap_identifiers[i] as u32 as usize;
+            let is_match = overlaps[identifier].is_match;
+            if is_match != 3 && is_match != 4 {
+                continue;
+            }
+            if get_adjust_winid(&overlaps[identifier], window_start, window_length) >= 0 {
+                has_matched = true;
+                break;
+            }
+        }
+        if has_matched {
+            continue;
+        }
+
+        // Every full window is unmatched: mark the overlaps it covers.
+        let mut matched = 0usize;
+        for i in 0..dummy.length as usize {
+            let identifier = dummy.overlap_identifiers[i] as u32 as usize;
+            let is_match = overlaps[identifier].is_match;
+            if is_match != 3 && is_match != 4 {
+                continue;
+            }
+            overlaps[identifier].is_match = 4;
+            overlaps[identifier].alignment_length += (window_end + 1 - window_start) as u32;
+            matched += 1;
+        }
+        if matched > 0 {
+            v_idx.push(((window_start as u64) << 32) | window_end as u64);
+            v_idx[index_i - 1] += 1;
+        }
+
+        // The partial (short) windows at the end of the buffer.
+        let size = dummy.overlap_identifiers.len();
+        let partial = dummy.partial_length as usize;
+        let start_short = size - partial;
+        let mut mlen = start_short;
+        let mut unmatched = 0usize;
+        for i in start_short..size {
+            let identifier = dummy.overlap_identifiers[i] as u32 as usize;
+            let is_match = overlaps[identifier].is_match;
+            if is_match != 3 && is_match != 4 {
+                continue;
+            }
+            let (window_se, window_ee) = window_se_by_normalized_start(
+                &overlaps[identifier],
+                window_start,
+                block_length,
+            );
+            let window_id = get_adjust_winid(&overlaps[identifier], window_se, block_length);
+            if window_id >= 0 {
+                dummy.overlap_identifiers[i] =
+                    ((window_id as u64) << 32) | (dummy.overlap_identifiers[i] as u32 as u64);
+                if mlen != i {
+                    dummy.overlap_identifiers.swap(mlen, i);
+                }
+                mlen += 1;
+            } else {
+                dummy.overlap_identifiers[i] =
+                    (0xffff_ffffu64 << 32) | (dummy.overlap_identifiers[i] as u32 as u64);
+                unmatched += 1;
+                let _ = window_ee;
+            }
+        }
+        if unmatched == 0 {
+            continue;
+        }
+        for i in mlen..size {
+            let identifier = dummy.overlap_identifiers[i] as u32 as usize;
+            let is_match = overlaps[identifier].is_match;
+            if is_match != 3 && is_match != 4 {
+                continue;
+            }
+            let (window_se, window_ee) =
+                window_se_by_normalized_start(&overlaps[identifier], window_start, block_length);
+            let mut covered = false;
+            for k in start_short..mlen {
+                let matched_id = dummy.overlap_identifiers[k] as u32 as usize;
+                let window_id = (dummy.overlap_identifiers[k] >> 32) as usize;
+                let window = &overlaps[matched_id].window_cigar.windows[window_id];
+                if window.x_start as i64 <= window_se && window.x_end as i64 >= window_ee {
+                    covered = true;
+                    break;
+                }
+            }
+            if !covered {
+                let region = &mut overlaps[identifier];
+                region.is_match = 4;
+                region.alignment_length += (window_ee + 1 - window_se) as u32;
+                v_idx.push(((window_se as u64) << 32) | window_ee as u64);
+                v_idx[index_i - 1] += 1;
+            }
+        }
+    }
 }

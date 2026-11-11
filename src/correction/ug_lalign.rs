@@ -567,6 +567,7 @@ fn ug_lalign(
                 maximum_error_rate,
                 THRESHOLD_MAXIMUM,
                 true,
+                None,
             );
             overlaps[index].is_match = 0; // must be reset here
             if extension.error_rate <= error_rate {

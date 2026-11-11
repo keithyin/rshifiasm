@@ -998,7 +998,7 @@ fn pass_qovlp(overlap_length: i64, aligned_length: i64, ratio: f64) -> bool {
 
 /// `get_win_se_by_normalize_xs`: the block [start, end] that contains the
 /// aligned origin, clipped to the overlap.
-fn window_se_by_normalized_start(
+pub(crate) fn window_se_by_normalized_start(
     region: &OverlapRegion,
     normalized_start: i64,
     block_length: i64,
@@ -1170,6 +1170,26 @@ pub(crate) fn backtrace_window_in_place(
 /// anchored at its end and the right one at `y_start - query_length`, so a
 /// block is extended from whichever side the chain makes available.
 #[allow(clippy::too_many_arguments)]
+/// `check_coverage_gap` (`Correct.cpp` 1068): whether the `[w_s, w_e]` query
+/// interval is one of the windows `set_herror_win` marked as freshly matched
+/// for its block. `v_idx[wid]` packs `(offset << 32) | count`.
+fn check_coverage_gap(v_idx: &[u64], w_s: u64, w_e: u64, block_s: i64) -> bool {
+    let wid = (w_s / block_s as u64) as usize;
+    let packed = v_idx[wid];
+    let count = (packed & 0xffff_ffff) as usize;
+    let offset = (packed >> 32) as usize;
+    for index in 0..count {
+        let entry = v_idx[offset + index];
+        if (entry >> 32) == w_s && entry as u32 as u64 == w_e {
+            return true;
+        }
+    }
+    false
+}
+
+/// `gen_extend_err_0_exz` (`Correct.cpp` 13224): the error of one unmatched
+/// block, anchored to its neighbour windows.
+#[allow(clippy::too_many_arguments)]
 pub fn gen_extend_err_0_exz(
     region: &mut OverlapRegion,
     targets: &TargetSource,
@@ -1181,7 +1201,17 @@ pub fn gen_extend_err_0_exz(
     query_start: i64,
     query_end: i64,
     previous_window: i64,
+    v_idx: Option<&[u64]>,
 ) -> i64 {
+    // `if(uref && v_idx && z->is_match == 4)`: an unmatched coverage gap is
+    // charged a flat threshold instead of being aligned.
+    if let Some(v_idx) = v_idx {
+        if region.is_match == 4
+            && check_coverage_gap(v_idx, query_start as u64, query_end as u64, block_length)
+        {
+            return i64::from(THRESHOLD_MAXIMUM);
+        }
+    }
     let query_length = query_end + 1 - query_start;
     let target_identifier = region.y_identifier as usize;
     let reverse_strand = region.y_strand as u8;
@@ -1323,6 +1353,7 @@ pub fn gen_extend_err_exz(
     maximum_error_rate: f64,
     maximum_errors: i64,
     secondary_check: bool,
+    v_idx: Option<&[u64]>,
 ) -> ExtensionError {
     let overlap_length = region.x_position_end as i64 + 1 - region.x_position_start as i64;
     let mut result = ExtensionError {
@@ -1373,6 +1404,7 @@ pub fn gen_extend_err_exz(
                 window_start,
                 window_end,
                 window_identifier,
+                v_idx,
             );
             if maximum_error_rate > 0.0
                 && total_error as f64 > overlap_length as f64 * maximum_error_rate
@@ -1414,6 +1446,7 @@ pub fn gen_extend_err_exz(
                 window_start,
                 window_end,
                 window_identifier,
+                v_idx,
             );
             if maximum_error_rate > 0.0
                 && total_error as f64 > overlap_length as f64 * maximum_error_rate
@@ -1628,6 +1661,7 @@ mod tests {
                 maximum_error_rate,
                 THRESHOLD_MAXIMUM,
                 false,
+                None,
             );
             let full = gen_extend_err_exz(
                 &mut region,
@@ -1640,6 +1674,7 @@ mod tests {
                 0.0,
                 THRESHOLD_MAXIMUM,
                 false,
+                None,
             );
             Some(ExtensionExpectation { early, full })
         } else {
