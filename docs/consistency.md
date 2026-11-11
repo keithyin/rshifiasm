@@ -2653,6 +2653,17 @@ UL scall 对齐门禁至此通过。后续按执行顺序移植 `update_ovlp_src
 `create_ul_info` → `gen_init_sg` UL 分支 → `ul_clean_gfa` 的 `is_ou` 分支 →
 `gradually_renew_g`/`ul_realignment_gfa`。
 
+**`update_ovlp_src` 簇（2026-11-11，已移植 `src/assembly/ul_src.rs`）**：
+`determine_connective_backtrack`（inter.cpp 19874）沿 UL 块的主链 `pidx`
+回溯，对连续的全长块（`te-ts >= read_len`、`pchain`、`el`）在 `sources[li.hid]`
+里找到 `qn==li.hid && tn==lk.hid` 且 `ma_hit_to_arc` 的 `ul>>32==li_v、
+v==lk_v` 的命中并 `bl++`；`update_ovlp_src`（19916）先清零所有 `bl` 再按
+`ridx` 逐 HiFi 读标注；`update_ovlp_src_bl`（19976）把 `bl` 在正反两向对称化
+（`qn<=tn` 方向处理一次，求和写回）。编译通过；e2e 门禁待 `ul_load` 编排与
+下游（`create_ul_info` → `gen_init_sg` 的 `rescue_src_ul`/`ma_sg_gen_ul`/
+`clean_contain_g`/`asg_arc_del_trans_ul` → `ul_clean_gfa` 的 `is_ou` →
+`ul_realignment_gfa` 簇）接线后启用。
+
 ## 仍未迁移的分支
 
 - `--ul`（超长读整合，ul 路径，parse 期显式拒绝）。合成数据门禁与完整
