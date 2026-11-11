@@ -38,6 +38,7 @@ pub mod ul_index;
 pub mod ul_store;
 pub mod ul_src;
 pub mod ul_graph;
+pub mod ul_rescall;
 pub mod dual_scaf;
 pub mod ctg_trans;
 pub mod scaf_tangle;

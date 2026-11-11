@@ -851,6 +851,12 @@ pub fn infer_rovlp_reads(li: &UlOv, lj: &UlOv, read_lengths: &[u64]) -> i64 {
     infer_rovlp_with_lengths(li, lj, &|id| read_lengths[id as usize] as i64)
 }
 
+/// `infer_rovlp(li, lj, NULL, NULL, NULL, ug)`: the query overlap length with
+/// the unitig-graph target lengths.
+pub fn infer_rovlp_unitigs(li: &UlOv, lj: &UlOv, unitigs: &[crate::assembly::asg::MaUtg]) -> i64 {
+    infer_rovlp_with_lengths(li, lj, &|id| unitigs[id as usize].length as i64)
+}
+
 fn infer_rovlp_with_lengths(li: &UlOv, lj: &UlOv, length: &dyn Fn(u32) -> i64) -> i64 {
     let in_len = length(li.tn);
     let mut is = i64::from(li.ts);
