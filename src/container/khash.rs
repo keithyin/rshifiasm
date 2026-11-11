@@ -213,6 +213,44 @@ impl U64HashTable {
         !self.keys.is_empty() && bucket < self.bucket_count() && self.used.is_used(bucket)
     }
 
+    /// `log2` of the bucket count, the `bits` field of the reference table.
+    pub fn bits(&self) -> u32 {
+        self.bits
+    }
+
+    /// Rebuilds a table from its serialized parts (`prefix##_load`).
+    ///
+    /// `used_words` holds the packed used-bucket bitmap, `keys` and `values`
+    /// the per-bucket entries in bucket order. An empty `keys` slice
+    /// reproduces a never-allocated table.
+    pub fn from_raw_parts(
+        bits: u32,
+        used_words: Vec<u32>,
+        keys: Vec<u64>,
+        values: Vec<u64>,
+        hash_function: fn(u64) -> u32,
+        ignored_low_bits: u32,
+    ) -> Self {
+        let count = used_words
+            .iter()
+            .map(|word| word.count_ones())
+            .sum::<u32>();
+        Self {
+            bits,
+            count,
+            used: UsedBitmap { words: used_words },
+            keys,
+            values,
+            hash_function,
+            ignored_low_bits,
+        }
+    }
+
+    /// The used-bucket bitmap in word order, `h->used[0..__kh_fsize(n)]`.
+    pub fn used_words(&self) -> &[u32] {
+        &self.used.words
+    }
+
     /// Iterates over live entries in ascending bucket order, matching the
     /// `for (k = 0; k < kh_end(h); ++k)` loops of the original code.
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {

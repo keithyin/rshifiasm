@@ -35,6 +35,7 @@ pub mod ul;
 pub mod ul_raw_chain;
 pub mod ul_scall;
 pub mod ul_index;
+pub mod ul_load;
 pub mod ul_store;
 pub mod ul_src;
 pub mod ul_graph;

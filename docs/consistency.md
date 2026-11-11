@@ -2664,6 +2664,27 @@ v==lk_v` 的命中并 `bl++`；`update_ovlp_src`（19916）先清零所有 `bl` 
 `clean_contain_g`/`asg_arc_del_trans_ul` → `ul_clean_gfa` 的 `is_ou` →
 `ul_realignment_gfa` 簇）接线后启用。
 
+**`ul_load` 编排接线（2026-11-12，已移植 `src/assembly/ul_load.rs` 并接线
+`pipeline.rs`）**：`ul_load`（inter.cpp 21693）＝ `ha_opt_update_cov` →
+`init_mg_opt`(k=19,w=10,cutoff=max_n_chain) → 缓存路径 `load_all_ul_t`/
+`write_all_ul_t`（`.ul.ovlp.bin`，无条件尝试，与 `-i` 无关）→
+`gen_UL_ovlps`（21473：`dedup_HiFis` → uidx 缓存 `uidx_load`/`uidx_write`
+（htab.cpp 1603/1558，`%s.uidx.bin`＝`'f'`+yak_ft khashl dump+`'h'`+ha_pt
+头（k/pre/tot/tot_pos）+每分区 yak_pt dump+`n`+`al` 数组）→
+`scall_ul_pipeline`（19992，按 `CHUNK_SIZE=1e9` 分块注册/比对/推送）→
+`gen_ul_vec_rid_t`）→ `update_ovlp_src`/`update_ovlp_src_bl` →
+`print_ovlp_src_bl_stat`（19527）。接线点：`pipeline.rs` clean_graph 头部
+C++ 39375/39384 位置（`drop_edges_by_trio` 后、`clean_weak_ma_hit_t` 前），
+后者 UL 模式传 `UL_COV_THRES=2`。`--ul` 仍在 parse 期拒绝（生产不可达），
+门禁为库级测试 `ul_load_golden`：日志锚点（`dedup_HiFis` 575/1910/4022、
+`ha_ft_ul_gen` 128、`ha_pt_ul_gen` 303018/1716900、`scall_ul_pipeline`
+739 reads、`print_ovlp_src_bl_stat` 5626/1184/1028 与 739/736/2/1）全部与
+`/tmp/ulref_run.log` 一致；`.uidx.bin` 与参考做**语义比对**（used 桶逐字节
++ `al` 数组逐字节，size/count/bitmap 相同）零差异——整文件不比对：参考
+`fwrite` 直写 malloc 数组，未使用桶含堆垃圾，属 `.ul.ovlp.bin` 同类豁免；
+`UL_INF` 快照逐字段一致。scall 的 `# bases` 恒为 0（参考只在 recorrect
+累计 `total_base`）。
+
 ## 仍未迁移的分支
 
 - `--ul`（超长读整合，ul 路径，parse 期显式拒绝）。合成数据门禁与完整

@@ -6,6 +6,7 @@
 //! the occurrences of a k-mer.
 
 use crate::container::khash::{hash_without_counter_bits, U64HashTable};
+use crate::counting::filter_table::flag_size;
 use crate::counting::kmer_counter::{KmerCountTable, COUNTER_BITS, MAXIMUM_COUNT, PARTITION_COUNT};
 
 /// One occurrence of a minimizer, `ha_idxpos_t`.
@@ -154,6 +155,145 @@ impl PositionIndex {
             .map(|partition| partition.table.len() as u64)
             .sum()
     }
+
+    /// The partition count, `1 << ha_pt_t::pre`.
+    fn partition_count(&self) -> u32 {
+        self.partitions.len() as u32
+    }
+
+    /// `uidx_write`'s position-index half (`htab.cpp` 1573): the header and
+    /// then, per partition, the `khashl` map dump plus the occurrence list.
+    pub fn write(&self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+        writer.write_all(&self.kmer_length.to_le_bytes())?;
+        writer.write_all(&self.partition_count().to_le_bytes())?;
+        writer.write_all(&self.distinct_count().to_le_bytes())?;
+        writer.write_all(&self.total_positions.to_le_bytes())?;
+        for partition in &self.partitions {
+            write_partition(partition, writer)?;
+        }
+        Ok(())
+    }
+
+    /// `uidx_load`'s position-index half.
+    pub fn read(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        let kmer_length = read_i32_le(reader)?;
+        let partition_count = read_i32_le(reader)?;
+        let _tot = read_u64_le(reader)?;
+        let total_positions = read_u64_le(reader)?;
+        let mut partitions = Vec::with_capacity(partition_count as usize);
+        for _ in 0..partition_count {
+            partitions.push(read_partition(reader)?);
+        }
+        Ok(Self {
+            kmer_length,
+            partitions,
+            total_positions,
+        })
+    }
+}
+
+fn read_i32_le(reader: &mut impl std::io::Read) -> std::io::Result<i32> {
+    let mut buffer = [0u8; 4];
+    reader.read_exact(&mut buffer)?;
+    Ok(i32::from_le_bytes(buffer))
+}
+
+fn read_u64_le(reader: &mut impl std::io::Read) -> std::io::Result<u64> {
+    let mut buffer = [0u8; 8];
+    reader.read_exact(&mut buffer)?;
+    Ok(u64::from_le_bytes(buffer))
+}
+
+/// One partition's `yak_pt_save` dump plus `g->n` and `g->al`.
+fn write_partition(
+    partition: &IndexPartition,
+    writer: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let bucket_count = partition.table.bucket_count();
+    writer.write_all(&bucket_count.to_le_bytes())?;
+    writer.write_all(&partition.table.bits().to_le_bytes())?;
+    writer.write_all(&(partition.table.len() as u32).to_le_bytes())?;
+    let allocated = bucket_count != 0;
+    writer.write_all(&[u8::from(allocated)])?;
+    if allocated {
+        for word in partition.table.used_words() {
+            writer.write_all(&word.to_le_bytes())?;
+        }
+        writer.write_all(&[1])?;
+        for bucket in 0..bucket_count {
+            writer.write_all(&partition.table.key_at(bucket).to_le_bytes())?;
+            writer.write_all(&partition.table.value_at(bucket).to_le_bytes())?;
+        }
+    } else {
+        writer.write_all(&[0])?;
+    }
+    // `g->n`: the occurrence array was allocated to the summed counts of the
+    // counting pass, which is exactly the vector length here.
+    writer.write_all(&(partition.occurrences.len() as u64).to_le_bytes())?;
+    for record in &partition.occurrences {
+        // `ha_idxposl_t`: `rid:31 | rev:1 | pos:32` packed into one `u64`,
+        // then the one-byte span and the seven zero padding bytes of the
+        // reference's `calloc`.
+        let packed = u64::from(record.read_identifier & 0x7fff_ffff)
+            | (u64::from(u8::from(record.reverse)) << 31)
+            | (u64::from(record.position) << 32);
+        writer.write_all(&packed.to_le_bytes())?;
+        writer.write_all(&[record.span as u8])?;
+        writer.write_all(&[0u8; 7])?;
+    }
+    Ok(())
+}
+
+fn read_partition(reader: &mut impl std::io::Read) -> std::io::Result<IndexPartition> {
+    let bucket_count = read_i32_le(reader)? as u32;
+    let bits = read_i32_le(reader)? as u32;
+    let _count = read_i32_le(reader)?;
+    let mut used_words = vec![0u32; flag_size(bucket_count)];
+    let mut flag = [0u8; 1];
+    reader.read_exact(&mut flag)?;
+    if flag[0] != 0 {
+        for word in used_words.iter_mut() {
+            *word = read_i32_le(reader)? as u32;
+        }
+    } else {
+        used_words.clear();
+    }
+    reader.read_exact(&mut flag)?;
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    if flag[0] != 0 {
+        keys.reserve(bucket_count as usize);
+        values.reserve(bucket_count as usize);
+        for _ in 0..bucket_count {
+            keys.push(read_u64_le(reader)?);
+            values.push(read_u64_le(reader)?);
+        }
+    }
+    let table = U64HashTable::from_raw_parts(
+        bits,
+        used_words,
+        keys,
+        values,
+        index_hash,
+        COUNTER_BITS,
+    );
+    let length = read_u64_le(reader)? as usize;
+    let mut occurrences = Vec::with_capacity(length);
+    let mut record = [0u8; 16];
+    for _ in 0..length {
+        reader.read_exact(&mut record)?;
+        let packed = u64::from_le_bytes(record[..8].try_into().unwrap());
+        occurrences.push(PositionRecord {
+            read_identifier: (packed & 0x7fff_ffff) as u32,
+            reverse: (packed >> 31) & 1 != 0,
+            position: (packed >> 32) as u32,
+            span: u32::from(record[8]),
+        });
+    }
+    Ok(IndexPartition {
+        table,
+        occurrences,
+    })
 }
 
 #[cfg(test)]

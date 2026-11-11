@@ -75,6 +75,111 @@ impl KmerFilterTable {
             Some(value) => value as i32,
         }
     }
+
+    /// `yak_ft_save` (`khashl.h` `__KHASHL_IMPL_S_L` on the packed
+    /// `{key, int16}` buckets): the byte-exact on-disk form.
+    pub fn write(&self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+        write_hash_table(&self.table, writer, |value| {
+            let value = i16::try_from(value).unwrap_or(i16::MAX);
+            value.to_le_bytes().to_vec()
+        })
+    }
+
+    /// `yak_ft_load`: the inverse of [`Self::write`].
+    pub fn read(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        let table = read_hash_table(reader, |bytes| {
+            i64::from(i16::from_le_bytes([bytes[8], bytes[9]])) as u64
+        })?;
+        Ok(Self { table })
+    }
+}
+
+/// `__kh_fsize(m)`: words of the used bitmap.
+pub(crate) fn flag_size(bucket_count: u32) -> usize {
+    if bucket_count < 32 {
+        1
+    } else {
+        (bucket_count >> 5) as usize
+    }
+}
+
+/// The `khashl` map dump both `uidx_write` tables share: counts, the used
+/// bitmap and then the packed `{key, value}` buckets in bucket order.
+fn write_hash_table(
+    table: &U64HashTable,
+    writer: &mut impl std::io::Write,
+    encode_value: impl Fn(u64) -> Vec<u8>,
+) -> std::io::Result<()> {
+    let bucket_count = table.bucket_count();
+    writer.write_all(&bucket_count.to_le_bytes())?;
+    writer.write_all(&table.bits().to_le_bytes())?;
+    writer.write_all(&(table.len() as u32).to_le_bytes())?;
+    // A never-allocated table writes neither array, exactly like the
+    // reference's NULL `used`/`keys` pointers.
+    let allocated = bucket_count != 0;
+    writer.write_all(&[u8::from(allocated)])?;
+    if allocated {
+        for word in table.used_words() {
+            writer.write_all(&word.to_le_bytes())?;
+        }
+        writer.write_all(&[1])?;
+        for bucket in 0..bucket_count {
+            let mut bucket_bytes = table.key_at(bucket).to_le_bytes().to_vec();
+            bucket_bytes.extend_from_slice(&encode_value(table.value_at(bucket)));
+            writer.write_all(&bucket_bytes)?;
+        }
+    } else {
+        writer.write_all(&[0])?;
+    }
+    Ok(())
+}
+
+fn read_u32_le(reader: &mut impl std::io::Read) -> std::io::Result<u32> {
+    let mut buffer = [0u8; 4];
+    reader.read_exact(&mut buffer)?;
+    Ok(u32::from_le_bytes(buffer))
+}
+
+/// The inverse of [`write_hash_table`]; `decode_value` reads the value part of
+/// one packed bucket.
+fn read_hash_table(
+    reader: &mut impl std::io::Read,
+    decode_value: impl Fn(&[u8]) -> u64,
+) -> std::io::Result<U64HashTable> {
+    let bucket_count = read_u32_le(reader)?;
+    let bits = read_u32_le(reader)?;
+    let _count = read_u32_le(reader)?;
+    let mut used_words = vec![0u32; flag_size(bucket_count)];
+    let mut flag = [0u8; 1];
+    reader.read_exact(&mut flag)?;
+    if flag[0] != 0 {
+        for word in used_words.iter_mut() {
+            *word = read_u32_le(reader)?;
+        }
+    } else {
+        used_words.clear();
+    }
+    reader.read_exact(&mut flag)?;
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    if flag[0] != 0 {
+        keys.reserve(bucket_count as usize);
+        values.reserve(bucket_count as usize);
+        let mut bucket = [0u8; 16];
+        for _ in 0..bucket_count {
+            reader.read_exact(&mut bucket[..10])?;
+            keys.push(u64::from_le_bytes(bucket[..8].try_into().unwrap()));
+            values.push(decode_value(&bucket));
+        }
+    }
+    Ok(U64HashTable::from_raw_parts(
+        bits,
+        used_words,
+        keys,
+        values,
+        identity_hash,
+        0,
+    ))
 }
 
 /// `ha_ft_gen`: counts every k-mer of the input reads, infers the homozygous

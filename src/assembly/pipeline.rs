@@ -229,10 +229,31 @@ pub fn build_string_graph_without_clean(
         &read_to_unitig,
         &trio_flags,
     );
+    // `if(asm_opt.ar) init_all_ul_t(&UL_INF, &R_INF)` plus `create_ul_info`
+    // (`Overlaps.cpp` 39375/39384): the first-pass UL integration builds the
+    // dedup unitig index, aligns the UL reads and labels the UL-supported
+    // overlaps with `bl`. The scall consumes the flagged-list view, so the
+    // sources are round-tripped through it.
+    let mut ultra_long = None;
+    if options.ultra_long_read_files.is_some() {
+        let mut lists = join_paf_lists(std::mem::take(&mut forward), forward_flags.clone());
+        ultra_long = Some(crate::assembly::ul_load::ul_load(options, reads, &mut lists));
+        forward = split_paf_lists(lists).0;
+    }
     // `if(!(asm_opt.is_ont)) clean_weak_ma_hit_t(...)`: the ONT chemical mask
-    // already replaced the weak-overlap filter.
+    // already replaced the weak-overlap filter; with UL the threshold is
+    // `UL_COV_THRES` instead of "drop everything weak".
     if !is_ont {
-        clean_weak_ma_hit_t(&mut forward, &reverse, &reads.read_lengths, u32::MAX);
+        clean_weak_ma_hit_t(
+            &mut forward,
+            &reverse,
+            &reads.read_lengths,
+            if ultra_long.is_some() {
+                crate::assembly::ul_load::UL_COV_THRES
+            } else {
+                u32::MAX
+            },
+        );
     }
     probe::try_dump_stage_raw(
         dump_directory.as_deref(),

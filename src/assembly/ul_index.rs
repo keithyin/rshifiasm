@@ -45,6 +45,7 @@ use crate::logging;
 use crate::overlap::paf::PafHit;
 use crate::reads::ReadStore;
 use crate::sequence::encoding::PackedSequence;
+use std::io::{Read, Write};
 
 /// `utg_ct_t` (`Overlaps.h` 278): one contained read inside a unitig.
 ///
@@ -1124,6 +1125,139 @@ pub fn build_unitig_minimizer_index(
         index,
         reads: unitig_reads,
     }
+}
+
+/// `write_dbug` (`Overlaps.cpp` 14735): the unitig-graph fingerprint that
+/// prefixes the caches which carry a `ma_ug_t`, so a stale cache is detected
+/// when the graph changed.
+pub fn write_unitig_fingerprint(
+    unitigs: &[MaUtg],
+    writer: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    writer.write_all(&(unitigs.len() as u64).to_le_bytes())?;
+    for unitig in unitigs {
+        writer.write_all(&unitig.length.to_le_bytes())?;
+        writer.write_all(&(unitig.circular as u32).to_le_bytes())?;
+        writer.write_all(&unitig.start.to_le_bytes())?;
+        writer.write_all(&unitig.end.to_le_bytes())?;
+        writer.write_all(&(unitig.reads.len() as u32).to_le_bytes())?;
+        for read in &unitig.reads {
+            writer.write_all(&read.to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// `test_dbug` (`Overlaps.cpp` 14700): `true` when the fingerprint on disk
+/// matches `unitigs`. On a mismatch the stream position is past the header,
+/// so the caller abandons the whole cache.
+pub fn test_unitig_fingerprint(
+    unitigs: &[MaUtg],
+    reader: &mut impl std::io::Read,
+) -> std::io::Result<bool> {
+    let mut buffer = [0u8; 8];
+    reader.read_exact(&mut buffer)?;
+    if u64::from_le_bytes(buffer) != unitigs.len() as u64 {
+        return Ok(false);
+    }
+    for unitig in unitigs {
+        let mut word = [0u8; 4];
+        reader.read_exact(&mut word)?;
+        if u32::from_le_bytes(word) != unitig.length {
+            return Ok(false);
+        }
+        reader.read_exact(&mut word)?;
+        if u32::from_le_bytes(word) != unitig.circular as u32 {
+            return Ok(false);
+        }
+        reader.read_exact(&mut word)?;
+        if u32::from_le_bytes(word) != unitig.start {
+            return Ok(false);
+        }
+        reader.read_exact(&mut word)?;
+        if u32::from_le_bytes(word) != unitig.end {
+            return Ok(false);
+        }
+        reader.read_exact(&mut word)?;
+        let read_count = u32::from_le_bytes(word) as usize;
+        if read_count != unitig.reads.len() {
+            return Ok(false);
+        }
+        let mut packed = vec![0u8; read_count * 8];
+        reader.read_exact(&mut packed)?;
+        for (index, value) in packed.chunks_exact(8).enumerate() {
+            if u64::from_le_bytes(value.try_into().unwrap()) != unitig.reads[index] {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `uidx_write` (`htab.cpp` 1558): the `%s.uidx.bin` cache, `ug`'s
+/// fingerprint when the index belongs to a unitig graph.
+pub fn uidx_write(
+    index: &UnitigMinimizerIndex,
+    file_name: &str,
+    unitigs: Option<&[MaUtg]>,
+) -> std::io::Result<()> {
+    let path = format!("{}.uidx.bin", file_name);
+    let file = std::fs::File::create(&path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    if let Some(unitigs) = unitigs {
+        write_unitig_fingerprint(unitigs, &mut writer)?;
+    }
+    writer.write_all(b"f")?;
+    index.filter.write(&mut writer)?;
+    writer.write_all(b"h")?;
+    index.index.write(&mut writer)?;
+    writer.flush()?;
+    eprintln!("[M::uidx_write] Index has been written.");
+    Ok(())
+}
+
+/// `uidx_load` (`htab.cpp` 1603): `None` when the cache is absent or stale.
+///
+/// The materialised unitig sequences are rebuilt from `unitigs`, which the
+/// caller owns; the index itself never serialises them.
+pub fn uidx_load(
+    file_name: &str,
+    unitigs: Option<&[MaUtg]>,
+    reads: &ReadStore,
+) -> std::io::Result<Option<UnitigMinimizerIndex>> {
+    let path = format!("{}.uidx.bin", file_name);
+    let Ok(file) = std::fs::File::open(&path) else {
+        return Ok(None);
+    };
+    let mut reader = std::io::BufReader::new(file);
+    if let Some(unitigs) = unitigs {
+        if !test_unitig_fingerprint(unitigs, &mut reader)? {
+            eprintln!("[M::uidx_load] Renew UL Index");
+            return Ok(None);
+        }
+    }
+    let mut mode = [0u8; 1];
+    reader.read_exact(&mut mode)?;
+    let filter = if mode[0] == b'f' {
+        let filter = KmerFilterTable::read(&mut reader)?;
+        reader.read_exact(&mut mode)?;
+        filter
+    } else {
+        return Ok(None);
+    };
+    if mode[0] != b'h' {
+        return Ok(None);
+    }
+    let index = match PositionIndex::read(&mut reader) {
+        Ok(index) => index,
+        Err(_) => return Ok(None),
+    };
+    eprintln!("[M::uidx_load] Index has been loaded.");
+    Ok(Some(UnitigMinimizerIndex {
+        filter,
+        index,
+        reads: materialize_unitig_reads(unitigs.unwrap_or(&[]), reads),
+    }))
 }
 
 #[cfg(test)]
