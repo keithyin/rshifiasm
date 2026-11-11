@@ -257,3 +257,65 @@ pub fn ma_sg_gen_ul(
     graph.read_sequence_count = graph.sequences.len() as u32;
     graph
 }
+
+/// `asg_arc_del_trans_ul` (`Overlaps.cpp` 5488): the UL transitive-arc
+/// reduction. Identical to `asg_arc_del_trans` except that it never prints and
+/// always re-derives the index and the symmetric arcs (the reference's UL
+/// driver does not log this step).
+pub fn asg_arc_del_trans_ul(graph: &mut Asg, fuzz: i32) -> u32 {
+    let vertex_count = graph.sequences.len() * 2;
+    let mut mark = vec![0u8; vertex_count];
+    let mut reduced = 0u32;
+
+    for v in 0..vertex_count as u32 {
+        let (start, count) = graph.arc_range(v);
+        if count == 0 {
+            continue;
+        }
+        if graph.sequences[(v >> 1) as usize].deleted {
+            for arc in &mut graph.arcs[start..start + count] {
+                arc.deleted = true;
+                reduced += 1;
+            }
+            continue;
+        }
+
+        for arc in &graph.arcs[start..start + count] {
+            mark[arc.v as usize] = 1;
+        }
+        let length_limit = graph.arcs[start + count - 1]
+            .node_length()
+            .wrapping_add(fuzz as u32);
+
+        for i in 0..count {
+            let target = graph.arcs[start + i].v;
+            if mark[target as usize] != 1 {
+                continue;
+            }
+            let (target_start, target_count) = graph.arc_range(target);
+            let first_length = graph.arcs[start + i].node_length();
+            for j in 0..target_count {
+                let second = graph.arcs[target_start + j];
+                if second.node_length().wrapping_add(first_length) > length_limit {
+                    break;
+                }
+                if mark[second.v as usize] != 0 {
+                    mark[second.v as usize] = 2;
+                }
+            }
+        }
+
+        for i in 0..count {
+            let target = graph.arcs[start + i].v as usize;
+            if mark[target] == 2 {
+                graph.arcs[start + i].deleted = true;
+                reduced += 1;
+            }
+            mark[target] = 0;
+        }
+    }
+
+    graph.cleanup();
+    graph.symmetrize();
+    reduced
+}
