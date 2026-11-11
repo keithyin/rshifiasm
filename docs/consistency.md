@@ -2747,6 +2747,25 @@ bub_links 之前、`asg_arc_cut_chimeric` 用 `UL_COV_THRES`、循环内
 1519/860；consensus 0/0；`clean_contain_g0` 47）。终态 GFA 待 U6
 （`gradually_renew_g`/`ul_realignment_gfa`）接线后启用。
 
+**U6 进行中（2026-11-12，`src/assembly/ul_renew.rs`）**：已移植
+`gen_polished_ug`（Overlaps.cpp 10429，复用 `polish_unitig_scaf`/
+`polish_unitig_advance_scaf` + 弧长重算）、`ugl_cover_check`（19600）、
+`filter_ul_ug`（19634/19764）、`update_ug_arch_ul`/`_mul`（19613/19645）、
+`clear_all_ul_t`（22004）。**尚未移植**（按依赖顺序）：rescall 链
+（`gen_UL_reovlps` 21537、`gen_ul_idx` 21261、`graph_ovlp_binning` 22789 +
+`ug_bin_t`/`emask` 引擎、`ul_v_recall`/`rescall_ul_pipeline`/
+`worker_for_ul_rescall_alignment` 9299、`gl_chain` 6605 及其簇
+`gl_chain_lin`/`ff_chain`/`l2g_res_chain_sc`/`update_ul_vec_t_ug`/
+`gl_chain_graph_adv`/`gl_chain_flter`/`filter_topN`/`update_sketch_trace`）；
+`ul_realignment`（22871）；`ul_realignment_gfa`（gfa_ut 17598）+ 
+`filter_sg_by_ug`/`gen_bubble_chain`/`init_ul_resolve_t`/`init_ulg_opt_t`；
+`ul_re_correct`（7892）+ integer 簇；`gen_ul2ul`（16827）全簇；
+`renew_ng`（15107）+ `realloc_rdb_adv`/`update_paf`/`convert_usg_t`/
+`fill_scaffolds`/`renew_R_to_U`；`gradually_renew_g`/`renew_g` 接线。
+门禁计划：`re.uidx.bin` 语义比对（gen_polished_ug+gen_ul_idx）、
+`re.ul.msk.bin` 逐字节（graph_ovlp_binning）、`.re.ul.ovlp.bin` 字段比对
+（rescall）、最终 GFA 逐字节（renewal 全链）。
+
 ## 仍未迁移的分支
 
 - `--ul`（超长读整合，ul 路径，parse 期显式拒绝）。合成数据门禁与完整
