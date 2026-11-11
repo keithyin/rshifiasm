@@ -1418,8 +1418,7 @@ pub fn cigar_gen_by_chain_adv(
     candidates: &mut CandidatesList,
     chain_index: i64,
     chain_count: i64,
-    overlaps: &mut Vec<UlOv>,
-    overlap_count: i64,
+    overlaps: &mut [UlOv],
     window_length: i64,
     targets: &TargetSource<'_>,
     query: &[u8],
@@ -1429,9 +1428,10 @@ pub fn cigar_gen_by_chain_adv(
     query_length: i64,
     h_kmer_hit: i64,
 ) {
-    if overlap_count <= 0 {
+    if overlaps.is_empty() {
         return;
     }
+    let overlap_count = overlaps.len() as i64;
     let target_total_length = targets.length(region.y_identifier as usize);
 
     auxiliary.window_cigar.windows.clear();
@@ -1446,13 +1446,7 @@ pub fn cigar_gen_by_chain_adv(
     let entry_count;
     {
         let hits = &candidates.list[chain_index as usize..];
-        entry_count = fusion_chain_ovlp(
-            hits,
-            chain_count,
-            &mut overlaps[..overlap_count as usize],
-            overlap_count,
-            query_length,
-        );
+        entry_count = fusion_chain_ovlp(hits, chain_count, overlaps, overlap_count, query_length);
         for index in 0..entry_count as usize {
             let bracket = ChainBracket {
                 qn: overlaps[index].qn,
@@ -1514,4 +1508,83 @@ pub fn cigar_gen_by_chain_adv(
     }
 
     update_overlap_region(region, auxiliary, query_length, target_total_length);
+}
+
+/// `ul_gap_filling_adv` (`Correct.cpp` 22139): the UL second-pass consensus
+/// driver. Recomputes the anchor support, then for each overlap (group of
+/// `cigar` entries sharing one `qn`) rebuilds the consensus chain and aligns
+/// it through [`cigar_gen_by_chain_adv`].
+#[allow(clippy::too_many_arguments)]
+pub fn ul_gap_filling_adv(
+    regions: &mut [OverlapRegion],
+    candidates: &mut CandidatesList,
+    cigar: &mut [UlOv],
+    window_length: i64,
+    targets: &TargetSource<'_>,
+    query: &[u8],
+    extz: &mut BitExtz,
+    auxiliary: &mut OverlapRegion,
+    buffer: &mut Vec<u64>,
+    iidx: &[u64],
+    error_rate: f64,
+    query_length: i64,
+    khit: u64,
+    base_check: i64,
+    max_length_gap: i64,
+) {
+    count_k_hits_adv(
+        targets,
+        regions,
+        candidates,
+        buffer,
+        error_rate,
+        khit,
+        base_check != 0,
+    );
+
+    let entry_count = cigar.len();
+    let mut group_start = 0usize;
+    let mut cleared = 0usize;
+    let mut k = 1usize;
+    while k <= entry_count {
+        if k == entry_count || cigar[group_start].qn != cigar[k].qn {
+            let qn = cigar[group_start].qn as usize;
+            for pk in cleared..qn {
+                regions[pk].window_cigar.windows.clear();
+            }
+            cleared = qn + 1;
+            let chain_count = gen_cns_chain(
+                regions,
+                qn,
+                candidates,
+                Some(iidx),
+                max_length_gap,
+                error_rate,
+                false,
+            );
+            if chain_count != 0 {
+                let chain_index = candidates.length;
+                cigar_gen_by_chain_adv(
+                    &mut regions[qn],
+                    candidates,
+                    chain_index,
+                    chain_count,
+                    &mut cigar[group_start..k],
+                    window_length,
+                    targets,
+                    query,
+                    extz,
+                    auxiliary,
+                    error_rate,
+                    query_length,
+                    khit as i64,
+                );
+            }
+            group_start = k;
+        }
+        k += 1;
+    }
+    for pk in cleared..regions.len() {
+        regions[pk].window_cigar.windows.clear();
+    }
 }
