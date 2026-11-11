@@ -36,6 +36,7 @@ pub mod ul_raw_chain;
 pub mod ul_scall;
 pub mod ul_index;
 pub mod ul_consensus;
+pub mod ul_flex;
 pub mod ul_gchain;
 pub mod ul_load;
 pub mod ul_store;

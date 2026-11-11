@@ -2727,6 +2727,26 @@ try:74/done:74、refine 后 `UL_INF` 与 C++ 探针 dump 逐读逐块一致
 （`/tmp/ul_consensus_probe.cpp` 拷入 inter.cpp 局部类型以链接
 `gl_chain_graph`/`select_max_gchain`/`update_ul_vec_t`）。
 
+**`ul_clean_gfa` is_ou 分支（2026-11-12，已移植 `src/assembly/ul_flex.rs` 并接线
+`pipeline.rs::ul_clean_gfa`）**：`flex_asg_t` 覆盖层（`init_flex_asg_t`/
+`get_flex_arcs`/`flex_arcs0`/`iter_flex_asg`/`push_flex_asg_t`）、
+`detect_tip2`/`trans_check`/`append_trans_check`/`iter_contain_g`/
+`flex_asg_t_cleanup`/`asg_arc_cut_contain`（`append_notrans_e` 在参考中为空，
+不移植）。is_ou 接线：每轮 `min_diff`（drop≤0.5 → step_diff/2 否则
+step_diff）、`asg_arc_cut_contain(ou_drop_rate,0)` 插在 cut_length 之后
+bub_links 之前、`asg_arc_cut_chimeric` 用 `UL_COV_THRES`、循环内
+`asg_iterative_semi_circ` 仅 `!is_ou`、循环末 `ul_refine_alignment` +
+`clean_contain_g(push_trans=1)`、循环后两次 `asg_arc_cut_contain`
+（`ou_drop_rate,0` 与 `-1,1`）+ `clean_contain_g(1)`、`asg_cut_large_indel`
+与 `asg_arc_cut_length` 的 is_ou 参数、is_ou 专用 `(0.3,0.9,...,min_diff,8)`
+长度裁剪分支（`l_drop=6000`）、`asg_cut_semi_circ` 仅 `!is_ou`、末尾
+`update_sg_uo`。`--ul` 的 `sources` 以 `Vec<PafHit>` 快照贯穿 refine/flex，
+每次标注后把 `bl` 同步回 `PafList`。门禁：`ul_clean_gfa_smoke`
+（ignored）跑完整 `build_string_graph_without_clean`，日志锚点与 C++ 探针
+`PROBE_FULL=1` 完全一致（refine 81/81 → 1/1 → 0/0 → 0/0；update_sg_uo
+1519/860；consensus 0/0；`clean_contain_g0` 47）。终态 GFA 待 U6
+（`gradually_renew_g`/`ul_realignment_gfa`）接线后启用。
+
 ## 仍未迁移的分支
 
 - `--ul`（超长读整合，ul 路径，parse 期显式拒绝）。合成数据门禁与完整

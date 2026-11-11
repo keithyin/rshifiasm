@@ -283,7 +283,7 @@ pub fn build_string_graph_without_clean(
 
     // The cast of the corrected overlaps is over; the later stages only read
     // the lists, so they go back to the flagged representation.
-    let sources = join_paf_lists(forward, forward_flags);
+    let mut sources = join_paf_lists(forward, forward_flags);
     let reverse_sources = join_paf_lists(reverse, reverse_flags);
 
     let mut graph = initial.graph;
@@ -318,7 +318,7 @@ pub fn build_string_graph_without_clean(
         reads,
         &mut trio_flags,
         &mut graph,
-        &sources,
+        &mut sources,
         &reverse_sources,
         &mut read_to_unitig,
         &mut coverage_cut,
@@ -328,6 +328,8 @@ pub fn build_string_graph_without_clean(
         chemical_mask.as_deref(),
         telo_end.as_ref(),
         dump_directory.as_deref(),
+        ultra_long.is_some(),
+        ultra_long.as_mut().expect("the --ul flag implies a UL store"),
     )?;
 
     // `clean_graph`, non-`ar` tail.
@@ -531,6 +533,16 @@ pub fn build_string_graph_without_clean(
     Ok(())
 }
 
+/// Copies the `bl` labels of the raw-list snapshot back into the joined
+/// sources (the reference mutates the single global list in place).
+fn sync_block_lengths(sources: &mut [PafList], hit_lists: &[Vec<PafHit>]) {
+    for (list, raw) in sources.iter_mut().zip(hit_lists.iter()) {
+        for (hit, raw_hit) in list.hits.iter_mut().zip(raw.iter()) {
+            hit.block_length = raw_hit.block_length;
+        }
+    }
+}
+
 /// `ul_clean_gfa`: the cleaning loop, the post-rescue pass and the read
 /// unitig output.
 #[allow(clippy::too_many_arguments)]
@@ -539,7 +551,7 @@ fn ul_clean_gfa(
     reads: &ReadStore,
     trio_flags: &mut Vec<u8>,
     graph: &mut Asg,
-    sources: &[PafList],
+    sources: &mut [PafList],
     reverse_sources: &[PafList],
     read_to_unitig: &mut ReadToUnitig,
     coverage_cut: &mut [CoverageCut],
@@ -549,6 +561,8 @@ fn ul_clean_gfa(
     chemical_mask: Option<&[u8]>,
     telo_end: Option<&TeloEnd>,
     dump_directory: Option<&std::path::Path>,
+    is_ou: bool,
+    ultra_long: &mut crate::assembly::ul_store::AllUl,
 ) -> Result<(), String> {
     let maximum_hang = options.maximum_hang_length;
     let minimum_overlap = options.minimum_overlap_length;
@@ -566,6 +580,28 @@ fn ul_clean_gfa(
     // `clean_graph` passes `ha_opt_triobin(&asm_opt)` into `ul_clean_gfa`
     // (`Overlaps.cpp` 39447); the round-loop cutters consume it.
     let is_trio = options.trio_binning_requested();
+    // `if(is_ou) fg = init_flex_asg_t(sg, uopt->sources, ...)`
+    let mut flex = if is_ou {
+        Some(crate::assembly::ul_flex::init_flex_asg_t(
+            i64::from(minimum_overlap),
+            i64::from(maximum_hang),
+            maximum_hang_rate as i64,
+            i64::from(options.gap_fuzz),
+            graph.sequences.len() * 2,
+        ))
+    } else {
+        None
+    };
+    let mut min_diff: u32 = 0;
+    let step_diff: u32 = 2000;
+    // The UL refinement and the flex cutter walk raw `Vec<PafHit>` lists; on
+    // the `--ul` path the caller hands over the joined form, so a snapshot is
+    // kept and `bl` is synced back after every call that relabels it.
+    let mut hit_lists: Vec<Vec<crate::overlap::paf::PafHit>> = if is_ou {
+        sources.iter().map(|list| list.hits.clone()).collect()
+    } else {
+        Vec::new()
+    };
 
     let step = if clean_round == 1 {
         max_drop
@@ -575,6 +611,7 @@ fn ul_clean_gfa(
     let mut drop = min_drop;
 
     let mut buffer: Vec<u64> = Vec::new();
+    let mut buffer0: Vec<u64> = Vec::new();
     let vertex_count = graph.sequences.len() * 2;
 
     // `asg_arc_cut_tips(sg, max_tip, &bu, is_ou, is_ou?rI:NULL, uopt->te)`.
@@ -597,7 +634,18 @@ fn ul_clean_gfa(
             trio_flags,
         );
     }
-    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
+    asg_arc_cut_tips(
+        graph,
+        max_tip,
+        &mut buffer,
+        is_ou,
+        if is_ou {
+            Some(&*read_to_unitig)
+        } else {
+            None
+        },
+        telo_end,
+    );
     probe::try_dump_stage(
         dump_directory,
         "d03_after_cut_tips",
@@ -612,6 +660,13 @@ fn ul_clean_gfa(
     for round in 0..clean_round {
         if drop > max_drop {
             drop = max_drop;
+        }
+        if is_ou {
+            min_diff = if drop <= 0.500_001 {
+                step_diff >> 1
+            } else {
+                step_diff
+            };
         }
 
         if is_ont {
@@ -634,24 +689,51 @@ fn ul_clean_gfa(
             asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
         }
 
-        asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, telo_end);
+        if !is_ou {
+            asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, telo_end);
+        }
         asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, true, min_thres);
-        asg_arc_cut_chimeric(graph, sources, &mut buffer, u32::MAX, telo_end);
+        asg_arc_cut_chimeric(
+            graph,
+            sources,
+            &mut buffer,
+            if is_ou {
+                crate::assembly::ul_load::UL_COV_THRES
+            } else {
+                u32::MAX
+            },
+            telo_end,
+        );
 
-        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
+        let ul_tips = |graph: &mut Asg, buffer: &mut Vec<u64>| {
+            asg_arc_cut_tips(
+                graph,
+                max_tip,
+                buffer,
+                is_ou,
+                if is_ou {
+                    Some(&*read_to_unitig)
+                } else {
+                    None
+                },
+                telo_end,
+            )
+        };
+
+        ul_tips(graph, &mut buffer);
         asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
         asg_arc_cut_inexact(
             graph,
             sources,
             &mut buffer,
             max_tip_i32,
-            false,
+            is_ou,
             is_trio,
-            0,
+            min_diff,
             ou_drop_rate,
             &trio_flags,
         );
-        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
+        ul_tips(graph, &mut buffer);
 
         asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, true, min_thres);
         asg_arc_cut_length(
@@ -660,17 +742,34 @@ fn ul_clean_gfa(
             max_tip_i32,
             drop as f32,
             ou_drop_rate,
-            false,
+            is_ou,
             is_trio,
             true,
-            0,
+            min_diff,
             1,
             None,
             None,
             None,
             &trio_flags,
         );
-        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
+        ul_tips(graph, &mut buffer);
+
+        // `if(is_ou) asg_arc_cut_contain(fg, &bu, &ba, rI, ou_drop_rate, 0)`
+        if is_ou {
+            if let Some(flex_state) = flex.as_mut() {
+                crate::assembly::ul_flex::asg_arc_cut_contain(
+                    graph,
+                    flex_state,
+                    &hit_lists,
+                    reads,
+                    read_to_unitig,
+                    &mut buffer,
+                    &mut buffer0,
+                    ou_drop_rate,
+                    false,
+                );
+            }
+        }
 
         asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, true, min_thres);
         // The reference allocates a fresh `buf_t` per call, so the workspace
@@ -685,7 +784,7 @@ fn ul_clean_gfa(
             HARD_OL_DROP,
             HARD_OL_SEC_DROP,
             HARD_OU_DROP,
-            false,
+            is_ou,
             large_bubble_population_size,
             Some(reverse_sources),
             Some(read_to_unitig),
@@ -699,10 +798,51 @@ fn ul_clean_gfa(
             &mut buffer,
             HARD_OL_DROP,
             HARD_OU_DROP,
-            false,
+            is_ou,
             bubble_labels,
         );
-        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
+        asg_arc_cut_tips(
+            graph,
+            max_tip,
+            &mut buffer,
+            is_ou,
+            if is_ou {
+                Some(&*read_to_unitig)
+            } else {
+                None
+            },
+            telo_end,
+        );
+
+        // `if(is_ou) { if(ul_refine_alignment(uopt, sg)) update_sg_uo(sg, src);
+        //           if(clean_contain_g(uopt, sg, 1)) update_sg_uo(sg, src); }`
+        if is_ou {
+            if crate::assembly::ul_gchain::ul_refine_alignment(
+                options,
+                reads,
+                &mut hit_lists,
+                read_to_unitig,
+                ultra_long,
+                graph,
+            ) {
+                sync_block_lengths(sources, &hit_lists);
+                crate::assembly::ul_graph::update_sg_uo(graph, &hit_lists);
+            }
+            if crate::assembly::ul_consensus::clean_contain_g(
+                options,
+                reads,
+                &mut hit_lists,
+                read_to_unitig,
+                ultra_long,
+                graph,
+                true,
+            )
+            .changed
+            {
+                sync_block_lengths(sources, &hit_lists);
+                crate::assembly::ul_graph::update_sg_uo(graph, &hit_lists);
+            }
+        }
 
         probe::try_dump_stage(
             dump_directory,
@@ -738,17 +878,71 @@ fn ul_clean_gfa(
         asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
     }
 
-    asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, telo_end);
+    if is_ou {
+        min_diff = step_diff;
+        if let Some(flex_state) = flex.as_mut() {
+            crate::assembly::ul_flex::asg_arc_cut_contain(
+                graph,
+                flex_state,
+                &hit_lists,
+                reads,
+                read_to_unitig,
+                &mut buffer,
+                &mut buffer0,
+                ou_drop_rate,
+                false,
+            );
+            crate::assembly::ul_flex::asg_arc_cut_contain(
+                graph,
+                flex_state,
+                &hit_lists,
+                reads,
+                read_to_unitig,
+                &mut buffer,
+                &mut buffer0,
+                -1.0,
+                true,
+            );
+        }
+        if crate::assembly::ul_consensus::clean_contain_g(
+            options,
+            reads,
+            &mut hit_lists,
+            read_to_unitig,
+            ultra_long,
+            graph,
+            true,
+        )
+        .changed
+        {
+            sync_block_lengths(sources, &hit_lists);
+            crate::assembly::ul_graph::update_sg_uo(graph, &hit_lists);
+        }
+    }
+    if !is_ou {
+        asg_iterative_semi_circ(graph, sources, &mut buffer, max_tip, true, telo_end);
+    }
     asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
     asg_cut_large_indel(
         graph,
         &mut buffer,
         max_tip_i32,
         HARD_OU_DROP,
-        false,
-        0,
+        is_ou,
+        min_diff,
     );
-    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
+    asg_arc_cut_tips(
+        graph,
+        max_tip,
+        &mut buffer,
+        is_ou,
+        if is_ou {
+            Some(&*read_to_unitig)
+        } else {
+            None
+        },
+        telo_end,
+    );
 
     probe::try_dump_stage(
         dump_directory,
@@ -762,44 +956,74 @@ fn ul_clean_gfa(
     );
 
     asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
-    // The two post-loop passes pass `0/**is_trio**/` in the reference
-    // (`gfa_ut.cpp` 3157/3163); only the round loop is trio aware.
-    asg_arc_cut_length(
-        graph,
-        &mut buffer,
-        max_tip_i32,
-        HARD_ORTHOLOGY_DROP,
-        ou_drop_rate,
-        false,
-        false,
-        false,
-        0,
-        1,
-        Some(reverse_sources),
-        Some(read_to_unitig),
-        None,
-        &trio_flags,
-    );
-    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
+    if !is_ou {
+        // The two post-loop passes pass `0/**is_trio**/` in the reference
+        // (`gfa_ut.cpp` 3157/3163); only the round loop is trio aware.
+        asg_arc_cut_length(
+            graph,
+            &mut buffer,
+            max_tip_i32,
+            HARD_ORTHOLOGY_DROP,
+            ou_drop_rate,
+            false,
+            false,
+            false,
+            0,
+            1,
+            Some(reverse_sources),
+            Some(read_to_unitig),
+            None,
+            &trio_flags,
+        );
+        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
 
-    asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
-    asg_arc_cut_length(
-        graph,
-        &mut buffer,
-        max_tip_i32,
-        options.minimum_drop_rate,
-        ou_drop_rate,
-        false,
-        false,
-        false,
-        0,
-        1,
-        Some(reverse_sources),
-        Some(read_to_unitig),
-        Some(2000),
-        &trio_flags,
-    );
-    asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
+        asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
+        asg_arc_cut_length(
+            graph,
+            &mut buffer,
+            max_tip_i32,
+            options.minimum_drop_rate,
+            ou_drop_rate,
+            false,
+            false,
+            false,
+            0,
+            1,
+            Some(reverse_sources),
+            Some(read_to_unitig),
+            Some(2000),
+            &trio_flags,
+        );
+        asg_arc_cut_tips(graph, max_tip, &mut buffer, false, None, telo_end);
+    } else {
+        min_diff = step_diff;
+        let mut l_drop: u32 = 6000;
+        asg_arc_identify_simple_bubbles_multi(graph, bubble_labels, false, min_thres);
+        asg_arc_cut_length(
+            graph,
+            &mut buffer,
+            max_tip_i32,
+            0.3,
+            0.9,
+            is_ou,
+            is_trio,
+            true,
+            min_diff,
+            8,
+            None,
+            None,
+            Some(l_drop),
+            &trio_flags,
+        );
+        asg_arc_cut_tips(
+            graph,
+            max_tip,
+            &mut buffer,
+            is_ou,
+            Some(&*read_to_unitig),
+            telo_end,
+        );
+    }
 
     probe::try_dump_stage(
         dump_directory,
@@ -812,7 +1036,9 @@ fn ul_clean_gfa(
         &trio_flags,
     );
 
-    asg_cut_semi_circ(graph, LIM_LEN, true);
+    if !is_ou {
+        asg_cut_semi_circ(graph, LIM_LEN, true);
+    }
     probe::try_dump_stage(
         dump_directory,
         "d10_after_semi_circ",
@@ -899,6 +1125,11 @@ fn ul_clean_gfa(
         read_to_unitig,
         &trio_flags,
     );
+
+    // `if(is_ou) update_sg_uo(sg, src);` then `des_flex_asg_t(fg)`.
+    if is_ou {
+        crate::assembly::ul_graph::update_sg_uo(graph, &hit_lists);
+    }
 
     Ok(())
 }
