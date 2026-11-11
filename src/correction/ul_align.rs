@@ -2044,8 +2044,8 @@ pub(crate) fn gen_raln(
                     k,
                     bounds.cigar_start,
                     bounds.cigar_end,
-                    query[0],
-                    query[1],
+                    bounds.text_start,
+                    bounds.text_end,
                     bounds.pattern_start,
                     bounds.pattern_end,
                 );

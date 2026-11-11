@@ -2632,46 +2632,26 @@ Rust 侧已具备大部分底层原语：`align_ul_ed_post_extz`
 | read 0 链化链数（after loop / after type / final） | 614 / 437 / 243 | 753 / 566 / 302 | 753 / 566 / 302 |
 | read 0 clist / olist | 15019 / 259 | 15416 / 302 | 15416 / 302 |
 | read 0 第二遍 tk 条目 | 192（sec 差 4–5） | 192（**逐字段一致**） | 192 |
-| `ul_scall_golden` 匹配读段 | 557/739 | 572/739 | 739 |
+| `ul_scall_golden` 匹配读段 | 557/739 | **739/739** | 739 |
+| `ul_scall_golden` blocks / ridx CSR | 14609/17228、空 | **17228/17228、逐项一致** | 17228 |
 
 `-t1` 默认 HiFi 端到端（`bp.p_ctg`/`p_utg`/`hap1`/`hap2`）与
 `reference.bp.*` 仍逐字节一致、`cargo test --release --lib` 全绿。
 
-**剩余差异**：167 条 UL 读段仍不同。已逐层收窄到 `gl_rchain_lin_contain_adv`
-的 DP 打分（read 5 为例）：
+**最后一处修复（2026-11-11）**：`gen_raln` 处理部分窗口（被 `te` 右侧裁剪）
+时，C++ 的 `update_trace_idx` 用的是 `hc_aln_exz_by_exist_cigar_with_p` 返回的
+**cigar 查询端点**（`cq[0]/cq[1]`，即 run 的 `text_start/text_end`），Rust 却用
+了就地更新的 `query[0]/query[1]`（`text_bounds`）。二者在部分窗口上不同（如
+C `c_qe`=5841 vs Rust 5838），使第二遍 trace 的 `c_qe` 普遍偏小，进而
+`gen_rid_raw_chain` 的 `get_rid_backward_cigar_err` 游标 `qoff` 偏小、少算 1
+个错误、DP 选到不同 primary、最终少 1 条 body。改为 `bounds.text_start/
+bounds.text_end` 后 739 条读段、17228 个 block、ridx CSR 全部与参考一致。
+`ul_scall_golden` 测试同时补上 `gen_ul_vec_rid_t`（`scall_ul_pipeline` 在
+`push_uc_block_t` 之后构建读索引，此前测试漏调导致 ridx 为空）。
 
-- gl_rchain 的输入（199 条 tk，tn/qs/qe/sec 全同）、第一遍 olist（27 条
-  P1REG/P1WIN 坐标/err/clen 全同，含唯一的 clen=17 gap 窗口）、第二遍 tk 均
-  与参考逐字段一致。DP 分歧从 i=3 起：`f[3]` C=926 / Rust=931，差
-  `trans_sc`=5 的倍数。
-- `connect_detect(3,2)` 两边都是 926（`get_rid_backward_cigar_err` err=19,
-  qs=739）一致；`connect_detect(3,0)` 两边 sc 均 926 但 err C=35 / Rust=34
-  （qs=382，窗口 `[310,464]` 内部）。即 Rust 在一个窗口内部边界少算 1 个错误。
-- 现象指向 `get_rid_backward_cigar_err` 的**有状态迭代**：`b->exz` 与
-  `rtrace_iter tc` 在同一次 gl_rchain 的 j 循环里跨 (i,j) 调用延续（`tc.k`
-  每个 i 只复位一次，j 之间不清）。C/Rust 对 (3,2) 都算得 err=19 并都跳过
-  (3,1)（`get_ecov_contain_adv` 返回 false，dt=-1），随后调用 (3,0)：C 的
-  `get_rid_backward_cigar_err(qs=382)` 返回 35、Rust 返回 34，即扫描到
-  qs=382 所在窗口 `[310,464]` 内部时少计 1 个错误。
-- 已排除：输入 tk、第一遍 P1REG/P1WIN（含唯一 clen=17 gap 窗口）、cells、
-  第二遍 tk（199 条）、connect(3,2) 的返回 err、`infer_rovlp`/
-  `get_ecov_contain_adv`/`gen_clip_win_err`/`extract_sub_werr`/`pop_trace_back`
-  结构，均一致。
-- 继续下钻到第二遍 trace（`bl->tc`，277 条）发现：`c_qe` 与参考普遍不同
-  （如 C 6245 / Rust 6214、C 624 / Rust 551），而 `c_qs/c_ts/c_te/c_wsid/
-  c_weid/c_wsii/c_weii/pfx/sfx/mid` 全同。这使 `get_rid_backward_cigar_err`
-  的游标 `iterator.qoff` 在 `connect(3,0)` 入口为 C=777 / Rust=760（差 17，
-  恰为一个 gap 窗口 span），进而 post-loop 补足少算 1。`c_qe` = gen_raln
-  窗口段（不含尾部延伸）的 max `q[1]`，说明 **`extract_subov_cigar` 的
-  窗口范围（first/last）或 `gen_raln` 部分窗口的 `hc_aln_exz_by_exist_cigar_with_p`
-  文本端**在 Rust 上偏小；tk.qe 因尾部延伸到 query_length 仍是同值而掩盖了它。
-- 已确认这不是 trace 条数问题：`gen_sub_ov_adv_cigar` 先推 tk+trace，
-  `dedup_ul_ov_t` 只删 tk 不删 trace，故 trace(277) > tk(199)；tk.qn 仍指向
-  正确 trace。
-- 下一步：对 read 5 某条子 overlap，打印 C/Rust 的 `extract_subov_cigar`
-  的 `first/last/k` 与 `win_boundary_offset` 的 `q[0]/q[1]`，以及部分窗口
-  `hc_aln_exz_by_exist_cigar_with_p` 返回的 `text_start/text_end`，定位
-  `c_qe` 首次分叉的窗口。
+UL scall 对齐门禁至此通过。后续按执行顺序移植 `update_ovlp_src` →
+`create_ul_info` → `gen_init_sg` UL 分支 → `ul_clean_gfa` 的 `is_ou` 分支 →
+`gradually_renew_g`/`ul_realignment_gfa`。
 
 ## 仍未迁移的分支
 

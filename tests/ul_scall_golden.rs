@@ -143,6 +143,8 @@ fn scall_pass_reproduces_the_reference_ul_overlaps() {
         &lengths,
         0,
     );
+    // `scall_ul_pipeline` builds the read index right after `push_uc_block_t`
+    rshifiasm::assembly::ul_store::gen_ul_vec_rid_t(&mut store, reads.total_reads as usize);
     eprintln!(
         "reads={} fully_covered={} chain_entries={}",
         store.reads.len(),
