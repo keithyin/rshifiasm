@@ -14,8 +14,14 @@ use crate::assembly::ul::{infer_rovlp_unitigs, UlOv};
 use crate::assembly::unitig::UnitigGraph;
 use crate::container::ksort::{radix_sort_by_key_32, radix_sort_u64};
 use crate::correction::ec_driver::PafList;
-use crate::correction::hc_align::window_se_by_normalized_start;
+use crate::correction::hc_align::{
+    align_ul_ed_post_extz, gen_extend_err_exz, window_se_by_normalized_start, BitExtz,
+    HcAlignParameters,
+};
 use crate::correction::interval::{get_interval, IntervalBuffer, WindowPool};
+use crate::correction::recalculate::similarity_pass;
+use crate::correction::region::THRESHOLD_MAXIMUM;
+use crate::correction::target::TargetSource;
 use crate::correction::window::number_of_windows;
 use crate::overlap::region::OverlapRegion;
 use crate::reads::read_store::ReadStore;
@@ -490,4 +496,93 @@ pub fn set_herror_win(
             }
         }
     }
+}
+
+/// `ul_lalign` first pass (`Correct.cpp` 22443, the `aln == NULL` branch):
+/// base-aligns every overlap against the unitig index, marks the ones whose
+/// windowed alignment passes the similarity check, charges the coverage gaps
+/// via `set_herror_win`/`gen_extend_err_exz`, then compacts the survivors to
+/// the front (`is_match = 1`, `non_homopolymer_errors` = extension error).
+///
+/// Returns the number of surviving overlaps; `regions` is compacted in place.
+#[allow(clippy::too_many_arguments)]
+pub fn ul_lalign_base(
+    regions: &mut [OverlapRegion],
+    targets: &TargetSource<'_>,
+    query: &[u8],
+    extz: &mut BitExtz,
+    dummy: &mut IntervalBuffer,
+    v_idx: &mut Vec<u64>,
+    error_rate: f64,
+    window_length: i64,
+    query_length: i64,
+) -> usize {
+    let overlap_count = regions.len();
+    let parameters = HcAlignParameters {
+        error_rate,
+        window_length,
+        overlap_cutoff: -1.0,
+        force_alignment: false,
+    };
+
+    let mut mapped_overlaps_length = 0i64;
+    for index in 0..overlap_count {
+        let overlap_length =
+            regions[index].x_position_end as i64 + 1 - regions[index].x_position_start as i64;
+        regions[index].shared_seed = regions[index].non_homopolymer_errors as i32;
+        if !align_ul_ed_post_extz(&mut regions[index], extz, targets, query, &parameters) {
+            continue;
+        }
+        if similarity_pass(
+            overlap_length,
+            regions[index].alignment_length as i64,
+            true,
+            -1.0,
+            None,
+        ) {
+            regions[index].is_match = 3;
+            mapped_overlaps_length += regions[index].alignment_length as i64;
+        }
+    }
+
+    if mapped_overlaps_length > 0 {
+        set_herror_win(
+            regions,
+            dummy,
+            v_idx,
+            error_rate,
+            query_length,
+            window_length,
+        );
+    }
+
+    let maximum_error_rate = error_rate * 1.5;
+    let mut kept = 0usize;
+    for index in 0..overlap_count {
+        let extension = gen_extend_err_exz(
+            &mut regions[index],
+            targets,
+            query,
+            extz,
+            window_length,
+            -1.0,
+            error_rate,
+            maximum_error_rate + 0.000001,
+            THRESHOLD_MAXIMUM,
+            true,
+            Some(v_idx),
+        );
+        let error_rate_result = extension.error_rate;
+        let error_bases = extension.error_bases;
+        regions[index].is_match = 0;
+        if error_rate_result <= error_rate {
+            if kept != index {
+                regions.swap(kept, index);
+            }
+            regions[kept].is_match = 1;
+            regions[kept].non_homopolymer_errors = error_bases as u32;
+            kept += 1;
+        }
+    }
+    kept
 }
