@@ -998,3 +998,123 @@ pub fn gen_cns_chain(
     cl.length = chain_start;
     hit_count
 }
+
+/// `khit_long_gap` (`Correct.cpp` 14966): whether two anchors stay inside the
+/// small-gap band. Returns `true` when the gap is acceptable.
+#[allow(dead_code)]
+fn khit_long_gap(a: &KmerHit, b: &KmerHit, small_bw_rate: f64, min_small_bw: i64) -> bool {
+    let dq = b.self_offset as i64 - a.self_offset as i64;
+    let dr = b.offset as i64 - a.offset as i64;
+    let dd = if dq >= dr { dq - dr } else { dr - dq };
+    let dm = if dq >= dr { dr } else { dq };
+    !((dd as f64) > dm as f64 * small_bw_rate && dd > min_small_bw)
+}
+
+/// `filter_bad_khits` (`Correct.cpp` 14978): drop the leading/trailing anchors
+/// that sit too far from the neighbouring bracket and compact the survivors.
+/// `hits` is exactly the `a_n` entries of the reference.
+#[allow(dead_code)]
+fn filter_bad_khits(
+    start: Option<&KmerHit>,
+    end: Option<&KmerHit>,
+    hits: &mut [KmerHit],
+    small_bw_rate: f64,
+    min_small_bw: i64,
+) -> usize {
+    let count = hits.len();
+    let mut k = 0usize;
+    let mut removed = 0usize;
+    if let Some(start) = start {
+        while k < count {
+            let hit = hits[k];
+            let bad = !khit_long_gap(start, &hit, small_bw_rate, min_small_bw)
+                || end
+                    .map(|end| !khit_long_gap(&hit, end, small_bw_rate, min_small_bw))
+                    .unwrap_or(false);
+            if !bad {
+                break;
+            }
+            hits[k].offset = u32::MAX;
+            hits[k].self_offset = u32::MAX;
+            removed += 1;
+            k += 1;
+        }
+    }
+    if end.is_some() && k < count {
+        let mut j = count as i64 - 1;
+        while j >= 0 {
+            let hit = hits[j as usize];
+            if hit.count < hit.read_identifier {
+                j -= 1;
+                continue;
+            }
+            let bad = start
+                .map(|start| !khit_long_gap(start, &hit, small_bw_rate, min_small_bw))
+                .unwrap_or(false)
+                || !khit_long_gap(&hit, end.unwrap(), small_bw_rate, min_small_bw);
+            if !bad {
+                break;
+            }
+            hits[j as usize].offset = u32::MAX;
+            hits[j as usize].self_offset = u32::MAX;
+            removed += 1;
+            j -= 1;
+        }
+    }
+    if removed != 0 {
+        let mut write = 0usize;
+        for read in 0..count {
+            if hits[read].offset == u32::MAX {
+                continue;
+            }
+            hits[write] = hits[read];
+            write += 1;
+        }
+        return write;
+    }
+    count
+}
+
+/// `k_hits_bcheck` (`Correct.cpp` 14937): verify that the anchors of one run
+/// share the same `khit`-base target prefix.
+#[allow(dead_code)]
+fn k_hits_bcheck(
+    targets: &TargetSource<'_>,
+    regions: &[OverlapRegion],
+    candidates: &CandidatesList,
+    khit: u64,
+    a: &[u64],
+    a_n: i64,
+) -> bool {
+    if a_n < 2 {
+        return true;
+    }
+    let first = candidates.list[a[0] as u32 as usize];
+    let Some(e) = (first.offset as u64).checked_sub(khit) else {
+        return false;
+    };
+    let region0 = &regions[first.read_identifier as usize];
+    let reference0 = targets.sub_region(
+        region0.y_identifier as usize,
+        e as i64,
+        khit as i64,
+        region0.y_strand as u8,
+    );
+    for k in 1..a_n as usize {
+        let hit = candidates.list[a[k] as u32 as usize];
+        let Some(e) = (hit.offset as u64).checked_sub(khit) else {
+            return false;
+        };
+        let region = &regions[hit.read_identifier as usize];
+        let reference = targets.sub_region(
+            region.y_identifier as usize,
+            e as i64,
+            khit as i64,
+            region.y_strand as u8,
+        );
+        if reference0 != reference {
+            return false;
+        }
+    }
+    true
+}
