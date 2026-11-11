@@ -1127,6 +1127,39 @@ pub fn build_unitig_minimizer_index(
     }
 }
 
+/// `gen_ul_idx_t` (`inter.cpp` 21387) with `is_scaf = 0`: the unitig graph of
+/// `sg` plus the containment and coverage indices the gchain DP consumes.
+pub fn gen_ul_index_t(
+    options: &AssemblyOptions,
+    reads: &ReadStore,
+    sources: &[Vec<PafHit>],
+    sg: &mut Asg,
+    is_el: bool,
+    is_del: bool,
+) -> UlIndex {
+    let mut unitig = ma_ug_gen(sg);
+    let ctx = IndexContext::new(options, &reads.read_lengths, sources);
+    let contain = ul_contain_gen(&unitig.unitigs, sg, &ctx, is_el, is_del);
+    let coverage = gen_cov_track(&unitig.unitigs, &contain, &ctx);
+    let read_contain = gen_r_contain(
+        &mut unitig,
+        sg,
+        &ctx,
+        reads.total_reads as usize,
+        is_el,
+        is_del,
+    );
+    let read_unitig =
+        gen_r_ug_idx_with_contain(&unitig.unitigs, &contain, reads.total_reads as usize, false);
+    UlIndex {
+        unitig,
+        contain,
+        coverage,
+        read_contain,
+        read_unitig,
+    }
+}
+
 /// `write_dbug` (`Overlaps.cpp` 14735): the unitig-graph fingerprint that
 /// prefixes the caches which carry a `ma_ug_t`, so a stale cache is detected
 /// when the graph changed.

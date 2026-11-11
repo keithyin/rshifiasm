@@ -171,6 +171,15 @@ fn ul_load_reproduces_the_reference_first_pass() {
     let _ = forward_flags;
     let mut store = ul_load(&mut options, &reads, &mut lists);
 
+    // `clean_weak_ma_hit_t(sources, reverse_sources, n_read, UL_COV_THRES)`
+    // (`Overlaps.cpp` 39390): the UL-supported weak overlaps survive.
+    rshifiasm::assembly::hit::clean_weak_ma_hit_t(
+        &mut lists,
+        &reverse,
+        &reads.read_lengths,
+        UL_COV_THRES,
+    );
+
     // `print_ovlp_src_bl_stat`'s two lines, recomputed from the labelled
     // sources: 5626/1184/1028 and 739/736/2/1 in the reference run.
     let mut covered = 0u64;
@@ -238,6 +247,7 @@ fn ul_load_reproduces_the_reference_first_pass() {
         }
     }
 
+
     // `gen_init_sg`'s UL branch (`Overlaps.cpp` 39394): the whole first graph
     // pass, whose contained cleanup must match the reference log anchors
     // (try:152/done:122 and discard:47) and the C++ probe's post-consensus
@@ -263,6 +273,21 @@ fn ul_load_reproduces_the_reference_first_pass() {
     assert_eq!(outcome.corrected, 122, "work_ul_gchains_consensus # done");
     assert_eq!(outcome.discarded, 47, "clean_contain_g0 # discard cread");
     assert_matches_dump(&store, "/tmp/ul_consensus_after.txt");
+
+    // `ul_refine_alignment` (`inter.cpp` 21892), the first refinement the
+    // reference's `ul_clean_gfa` rounds perform: try:74/done:74 and the
+    // post-refinement dump from the C++ probe.
+    let mut graph = initial.graph;
+    let refined = rshifiasm::assembly::ul_gchain::ul_refine_alignment(
+        &mut options,
+        &reads,
+        &mut lists,
+        &read_to_unitig,
+        &mut store,
+        &mut graph,
+    );
+    assert!(refined, "the first refinement must change the chains");
+    assert_matches_dump(&store, "/tmp/ul_refine_after.txt");
     let _ = UL_COV_THRES;
 
     for suffix in [".uidx.bin", ".ul.ovlp.bin"] {

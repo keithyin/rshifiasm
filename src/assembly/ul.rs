@@ -950,7 +950,7 @@ pub fn get_ecov_adv(g: &Asg, v: u32, w: u32, bw: i64, diff_ec_ul: f64, dq: i64) 
 }
 
 /// `find_mg_lchain_max` (`inter.cpp` 5578).
-fn find_mg_lchain_max(a: &[MgLchain], x: i32) -> i64 {
+pub fn find_mg_lchain_max(a: &[MgLchain], x: i32) -> i64 {
     let n = a.len();
     if n == 0 {
         return -1;

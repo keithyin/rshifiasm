@@ -2706,6 +2706,27 @@ C++ 39375/39384 位置（`drop_edges_by_trio` 后、`clean_weak_ma_hit_t` 前）
 discard:47、共识后 `UL_INF` 与 C++ 探针 dump（`/tmp/ul_consensus_probe.cpp`
 globalize 静态符号后链接）逐读逐块一致。
 
+**`ul_refine_alignment`/gchain 簇（2026-11-12，已移植 `src/assembly/ul_gchain.rs`）**：
+`gen_init_sg` 的 UL 分支之后的第一轮 gchain 重建：`refine_rid_chain`
+（17420，单链/端点包含判定 → ff=0/1/2）→ `direct_gchain`（16151）→
+`gl_rg2ug_gen`（13312，`rov2uov` 投影 + `update_existing_anchors` 锚点回填）→
+`gen_linear_chains`（13571，`linear_chain_dp_adv` 前向 DP）→
+`dump_linear_chain` → `gl_chain_graph`（5785，含 `gl_chain_linear` 预检 +
+`primary_chain_check` + 全图 DP + `hc_shortest_k`）→ `select_max_gchain`（6310）→
+`update_ul_vec_t`（16028）→ `gen_rovlp_chain_by_ul`（15675，`flat_rovlp_chain` +
+`update_rovlp_chain_qse`）→ `dd_ul_vec_t`（15812，`renew_mg_lchains` +
+`convert_mg_lchain_t` 重排）。`ul_refine_alignment`（21892）以
+`gen_ul_idx_t` 建单位图索引后逐读重跑并刷新 `ridx`/`bl`。跳过死代码
+`gen_linear_chains_backup`/`dd_ul_vec_t` 的调试分支。四个关键语义陷阱
+（均由 C++ 探针逐阶段 dump 定位）：① `get_r_offset` 用**单位图**顶点长度
+（`ug->g->seq`），不是读图；② `convert_mg_lchain_t` 反向分支 `o->re =
+p->e - o->rs_原值`（Rust 顺序求值会误用已改写的 rs）；③ `dd_ul_vec_t` 的
+`novlp > tt*0.01` 是 double 比较，不能截断成整数；④ `update_existing_anchors`
+的共线性窗口用单位图坐标。门禁：`ul_load_golden` 扩展——`work_ul_gchains`
+try:74/done:74、refine 后 `UL_INF` 与 C++ 探针 dump 逐读逐块一致
+（`/tmp/ul_consensus_probe.cpp` 拷入 inter.cpp 局部类型以链接
+`gl_chain_graph`/`select_max_gchain`/`update_ul_vec_t`）。
+
 ## 仍未迁移的分支
 
 - `--ul`（超长读整合，ul 路径，parse 期显式拒绝）。合成数据门禁与完整
