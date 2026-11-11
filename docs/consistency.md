@@ -3,6 +3,13 @@
 本文件记录与 C++ 版 hifiasm 的逐字节比对基线、各阶段门禁状态与已知差异。
 每次阶段推进都需要更新本文件。
 
+> **最新状态（2026-11-12）**：默认 HiFi、trio 全分支、ONT、`--sec-in` 已完成
+> 并门禁通过；`--ul` 已完成 U1–U5 与 U6 基础件（`ul_load`/共识簇/gchain 簇/
+> `ul_clean_gfa` is_ou 均已接线并有探针门禁），U6 renewal 链主体与 U7 解锁、
+> Hi-C（`--h1`/`--h2`）尚未完成。详见文末「迁移状态总览」。
+> 本文件其余章节为按时间顺序的迁移记录，其中的「尚未实现 / 待移植」表述
+> 反映**当时**的状态，可能已被后续提交实现。
+
 ## 基准环境
 
 | 项目 | 值 |
@@ -1218,7 +1225,7 @@ RSHIFIASM_EC_STOP_AT=<n>   只纠前 n 条读段
   对 `p_ctg`/`p_utg`/`r_utg` 的 gfa、noseq.gfa、lowQ.bed 共 9 个文件
   `cmp` 无差异。
 - 运行在预期断点停下：`output_bp_graph` 写完 `bp.p_ctg.*` 后返回
-  `output_trio_graph_joint is not implemented yet`（P6 待移植）。
+  `output_trio_graph_joint is not implemented yet`（P6 待移植；现已移植，见文末状态总览）。
 - Rust 版当时不写 `*.ovlp.source.bin` / `*.ovlp.reverse.bin` / `*.ec.bin`
   重跑缓存索引；重启缓存现已在选项空间轮次实现（见下文），`compare_outputs.sh`
   对 `ovlp` 两个 bin 报 identical，对 `ec.bin` 报 DIFFERS 属预期
@@ -2321,7 +2328,8 @@ GFA 与 C++ 不一致（实测 18 个产物不同）。
 - `write_requested_outputs` 在 `is_sc` 时自动选择 fastq。
 - 单测：打包/还原、反向区间、`flt_quals`、fastq 质量展开。
 
-尚未实现（`--ont`/`--fast` 仍被 parse 期拒绝）：ONT worker 参数分支
+当时尚未实现（`--ont`/`--fast` 当时仍被 parse 期拒绝；现已完成）：
+ONT worker 参数分支
 （`bw_thres=0.05`、`WINDOW_OHC`、`align_gap_rate=0.006/max=64`）、
 `q8/t8` 质量回写、chemical 掩码
 （`gen_chemical_arc_rf`/`try_rescue_overlaps`）、图清理的 ONT 分支、
@@ -2352,7 +2360,7 @@ GFA 与 C++ 不一致（实测 18 个产物不同）。
   注意复刻了参考的两处死代码：`rphase_lidel` 的二级 `qe` 排序条件
   `k > i + k` 恒假；`rcall_lidel_variant` 的 `bn0` 恒 0。
 
-`cargo test --release`：338 passed。
+`cargo test --release`：338 passed（当时统计；2026-11-12 为 345 passed）。
 
 
 ## ONT 分支完成（2026-11-10）
@@ -2747,33 +2755,98 @@ bub_links 之前、`asg_arc_cut_chimeric` 用 `UL_COV_THRES`、循环内
 1519/860；consensus 0/0；`clean_contain_g0` 47）。终态 GFA 待 U6
 （`gradually_renew_g`/`ul_realignment_gfa`）接线后启用。
 
-**U6 进行中（2026-11-12，`src/assembly/ul_renew.rs`）**：已移植
+**U6 基础件（2026-11-12，`src/assembly/ul_renew.rs`，commit `9a1558e`）**：
 `gen_polished_ug`（Overlaps.cpp 10429，复用 `polish_unitig_scaf`/
 `polish_unitig_advance_scaf` + 弧长重算）、`ugl_cover_check`（19600）、
 `filter_ul_ug`（19634/19764）、`update_ug_arch_ul`/`_mul`（19613/19645）、
-`clear_all_ul_t`（22004）。**尚未移植**（按依赖顺序）：rescall 链
-（`gen_UL_reovlps` 21537、`gen_ul_idx` 21261、`graph_ovlp_binning` 22789 +
-`ug_bin_t`/`emask` 引擎、`ul_v_recall`/`rescall_ul_pipeline`/
-`worker_for_ul_rescall_alignment` 9299、`gl_chain` 6605 及其簇
-`gl_chain_lin`/`ff_chain`/`l2g_res_chain_sc`/`update_ul_vec_t_ug`/
-`gl_chain_graph_adv`/`gl_chain_flter`/`filter_topN`/`update_sketch_trace`）；
-`ul_realignment`（22871）；`ul_realignment_gfa`（gfa_ut 17598）+ 
-`filter_sg_by_ug`/`gen_bubble_chain`/`init_ul_resolve_t`/`init_ulg_opt_t`；
-`ul_re_correct`（7892）+ integer 簇；`gen_ul2ul`（16827）全簇；
-`renew_ng`（15107）+ `realloc_rdb_adv`/`update_paf`/`convert_usg_t`/
-`fill_scaffolds`/`renew_R_to_U`；`gradually_renew_g`/`renew_g` 接线。
-门禁计划：`re.uidx.bin` 语义比对（gen_polished_ug+gen_ul_idx）、
-`re.ul.msk.bin` 逐字节（graph_ovlp_binning）、`.re.ul.ovlp.bin` 字段比对
-（rescall）、最终 GFA 逐字节（renewal 全链）。
+`clear_all_ul_t`（22004）。同日修正 `G_CHAIN_INDEL` 为 128（`73aa0ab`，
+`inter.h` 27）。U6 剩余的 rescall/`gl_chain`/`ul_realignment_gfa`/
+`gen_ul2ul`/`renew_ng` 清单与门禁计划见下一节「迁移状态总览」的 U6 小节。
 
-## 仍未迁移的分支
 
-- `--ul`（超长读整合，ul 路径，parse 期显式拒绝）。合成数据门禁与完整
-  缺口清单见上一节；仍需移植 `ul_load`/`ul_realignment_gfa` 两条链路。
-- Hi-C（`--h1/--h2/--enzyme`，parse 期显式拒绝）。缺口是 `hic.cpp` 的
-  短读比对索引（`hc_pt`）、`hic_short_align`/`hic_analysis` 与
-  `output_hic_graph` 链路，需要 Hi-C 测试数据才能建立门禁。
+## 迁移状态总览（2026-11-12 更新）
+
+### 已完成并门禁通过（默认路径）
+
+默认 HiFi 流水线（P0–P8）、trio 全部分支（名单/yak `--trio-dual`/`-5`/
+`--dual-scaf`）、ONT（`--ont`/`--fast`）、`--sec-in` 主体（残留差异源于参考
+越界写 UB，已记录为不可移植目标）、`-b`/`--write-paf`/`--write-ec`/
+`--primary`/`--dbg-ovec`/`--prt-raw`/`--dbg-het-cnt`/`--ex-list`/
+`--b-cov`/`--h-cov`/`--m-rate`/`--telo-*` 等，均与 C++ 二进制逐字节一致。
+
+### `--ul`（超长读整合）——已完成 U1–U5 + U6 基础件
+
+| 阶段 | 内容 | 状态 | 门禁 |
+| --- | --- | --- | --- |
+| U1 | 二轮比对簇（`ul_rid_lalign_adv`/`gen_raln`/`ul_local_aln` 等） | 完成 | `ul_scall_golden` 739/739、17228 blocks |
+| U2 | 原始链簇（`gen_rid_raw_chain`/`gl_rchain_lin_contain_adv`） | 完成 | `ul_raw_chain_golden` |
+| U3 | scall 流水线 + `ul_load` 编排 + `.uidx.bin` 缓存 | 完成 | `ul_load_golden`：日志锚点全中、uidx 语义比对零差异、`UL_INF` 逐字段一致 |
+| U4 | `gen_init_sg` UL 分支 + contained 共识簇 + `ul_refine_alignment` gchain 簇 | 完成 | 152/122/47、refine 74/74、前后 dump 逐读逐块一致 |
+| U5 | `ul_clean_gfa` 的 is_ou 分支（`flex_asg_t`/`asg_arc_cut_contain`） | 完成 | `ul_clean_gfa_smoke` 与 C++ `PROBE_FULL=1` 日志逐行一致（81/81、1/1、0/0、0/0） |
+| U6 | renewal 链 | **进行中**（基础件已移植，主体待做） | 见下 |
+| U7 | 移除 `--ul` parse 期拒绝 + 全量 e2e 逐字节 | 待做 | 依赖 U6 |
+
+U6 已移植并提交（`src/assembly/ul_renew.rs`，commit `9a1558e`）：
+`gen_polished_ug`（Overlaps.cpp 10429）、`ugl_cover_check`（19600）、
+`filter_ul_ug`（19634/19764）、`update_ug_arch_ul`/`_mul`（19613/19645）、
+`clear_all_ul_t`（22004）。另修正 `G_CHAIN_INDEL` 为 128（`73aa0ab`）。
+
+U6 仍缺（按依赖顺序，均为 `--ul` 最终 GFA 逐字节一致的必要条件）：
+
+1. **rescall 链**：`gen_UL_reovlps`（inter.cpp 21537）、`gen_ul_idx`
+   （21261）、`graph_ovlp_binning`（22789）+ `ug_bin_t`/`idx_emask_t`/
+   `mask_ul_ov_t` 引擎与 `.ul.msk.bin` 读写、`ul_v_recall`/`rescall_ul_pipeline`
+   （20583/20018）、`worker_ul_rescall_pipeline`（13031）、
+   `worker_for_ul_rescall_alignment`（9299）。
+2. **`gl_chain` 簇**（6605）：`gen_gl_aln`（5223）、`gl_chain_lin`（5431）、
+   `ff_chain`（4004）、`l2g_res_chain_sc`（4580）、`gen_gg_aln`（5246）、
+   `gl_chain_graph_adv`（6086）、`update_ul_vec_t_ug`（4974）、
+   `gl_chain_flter`（7054）、`filter_topN`（7223）、`update_sketch_trace`
+   （Correct.cpp 22372），及其叶子 `aln_sc`、`get_ecov_el`（5341）、
+   `get_overlap_region_sub_err`（5295）、`check_trans_rate`（3981）、
+   `fill_unaligned_alignments`、`update_ava_het_site`（2412）、
+   `rescue_trans_ul_chains`（2936）、`pop_sc`/`push_sc_pre`。
+3. **`ul_realignment`**（22871：`gen_polished_ug` → 缓存 → `gen_UL_reovlps`
+   → `filter_ul_ug` → `gen_ul_vec_rid_t` → `update_ug_arch_ul_mul`）。
+4. **`ul_realignment_gfa`**（gfa_ut 17598）+ `filter_sg_by_ug`、
+   `gen_bubble_chain`、`init_ul_resolve_t`/`init_integer_ml_t`/
+   `init_ul_str_idx_t`、`init_ulg_opt_t`（16906）。
+5. **`ul_re_correct`**（7892）+ integer 簇（`worker_integer_correction`/
+   `clean_ul_re_correct_buf`/`worker_integer_update`/`rebuid_idx`/`shrink_uls`；
+   `--integer-correct` 默认 0 轮）。
+6. **`gen_ul2ul`**（16827）全簇 + `renew_ng`（15107）+
+   `realloc_rdb_adv`（14663）/`update_paf`（17164）/`convert_usg_t`/
+   `fill_scaffolds`/`renew_R_to_U`/`post_rescue` 接线。
+7. **`gradually_renew_g`（39297）/`renew_g`（39271）** 接入
+   `pipeline.rs::clean_graph` 的 UL 尾部（C++ 39444）。
+
+U6 门禁计划（资产已就绪）：`re.uidx.bin` 语义比对（`gen_polished_ug`+
+`gen_ul_idx`）、`re.ul.msk.bin` 逐字节（`graph_ovlp_binning`）、
+`.re.ul.ovlp.bin` 字段比对（rescall 结果）、最终 8 个 GFA/BED 逐字节
+（`renew_ng` 全链）。
+
+### 仍未迁移的分支
+
+- `--ul` 的 U6 主体与 U7 解锁（parse 期显式拒绝；缺口清单见上）。
+- Hi-C（`--h1`/`--h2`/`--enzyme`，parse 期显式拒绝，完全未开始）。缺口是
+  `hic.cpp` 的短读比对索引（`hc_pt`）、`hic_short_align`/`hic_analysis`、
+  `output_hic_graph`/`output_hic_graph_mmhap` 与 horder.cpp misjoin/scaffolding
+  链路；需要 H0 合成 Hi-C 语料建立门禁。
 - `--dbg-gfa`（`.pt_flt`/图 checkpoint 与 verbose GFA，parse 期显式拒绝；
-  原因见上一节：参考实现的 checkpoint 非确定性）。
+  原因见上：参考实现的 checkpoint 非确定性）。
 
-`cargo test --release`：338 passed。
+### 门禁资产与复现命令
+
+- UL 语料/参考：`/tmp/ul.fq`（739 条合成 UL 读）、`/tmp/ulref.*`
+  （`ec.bin`/`ovlp.*.bin`/`uidx.bin`/`ul.ovlp.bin`/`re.uidx.bin`/
+  `re.ul.msk.bin`/`re.ul.ovlp.bin`/8 个 GFA/BED/`ulref_run.log`）。
+- C++ 探针：`/tmp/ul_consensus_probe.cpp`（链接命令：`g++ -O1 -I
+  /home/keith/projects/hifiasm ul_consensus_probe.cpp $(ls
+  /home/keith/projects/hifiasm/*.o | grep -v '/main.o$' | sed
+  's|^/home/keith/projects/hifiasm/inter.o$|/tmp/inter_pub.o|') -lz -lpthread
+  -lm`；`inter_pub.o` 由 `objcopy --globalize-symbol` 生成）。
+- 门禁测试：`tests/ul_load_golden.rs`（`--ignored`：`ul_load_golden` +
+  `ul_clean_gfa_smoke`）。
+
+`cargo test --release`：345 passed（lib 312 + 集成 33；13 个 `--ignored`
+黄金回放不计）。

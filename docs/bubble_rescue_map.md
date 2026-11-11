@@ -4,6 +4,9 @@
 使 trio 门 A（`-3/-4` hap1/hap2 逐字节）通过。全部机械随后被 Hi-C Phase 3
 复用（hic.cpp 气泡半区）。
 
+> **状态（2026-11-12 更新）：门 A 已通过；文末「Hi-C Phase 3 复用」尚待
+> Hi-C 迁移启动（`--h1`/`--h2` 目前仍为 parse 期拒绝）。**
+>
 > **状态（2026-11-08）：门 A 已通过。** trio 的 12 个 GFA/bed 产物与 C++
 > `reference_trio.dip.*` 逐字节一致，9-profile 默认回归无变化。收尾修复
 > （索引失效 ×2、backward `beg_idx`、缺失的 `flat_soma_v`）见
