@@ -2637,13 +2637,29 @@ Rust 侧已具备大部分底层原语：`align_ul_ed_post_extz`
 `-t1` 默认 HiFi 端到端（`bp.p_ctg`/`p_utg`/`hap1`/`hap2`）与
 `reference.bp.*` 仍逐字节一致、`cargo test --release --lib` 全绿。
 
-**剩余差异**：167 条 UL 读段仍不同。已定位到 `gen_rid_raw_chain` 的
-`gl_rchain_lin_contain_adv` / `select_clean_chain` 在 read 5' 端的链体选择：
-同一读段的原始 tk（199 条）、第一遍 olist（27 条 P1REG）均与参考逐字段一致，
-但最终 bodies 中 C++ 选出 primary `tn=0x800007F9`（seq 0,1=0x…7EC,0x…7F5），
-Rust 选出 `tn=0x800007FA` 且少了 C++ 的那条，净少 1 条 body。该函数此前只
-经 read 0 黄金用例覆盖（`ul_raw_chain_golden`），尚未覆盖到这种 5' 端
-多链合并的场景，需继续对拍。
+**剩余差异**：167 条 UL 读段仍不同。已逐层收窄到 `gl_rchain_lin_contain_adv`
+的 DP 打分（read 5 为例）：
+
+- gl_rchain 的输入（199 条 tk，tn/qs/qe/sec 全同）、第一遍 olist（27 条
+  P1REG/P1WIN 坐标/err/clen 全同，含唯一的 clen=17 gap 窗口）、第二遍 tk 均
+  与参考逐字段一致。DP 分歧从 i=3 起：`f[3]` C=926 / Rust=931，差
+  `trans_sc`=5 的倍数。
+- `connect_detect(3,2)` 两边都是 926（`get_rid_backward_cigar_err` err=19,
+  qs=739）一致；`connect_detect(3,0)` 两边 sc 均 926 但 err C=35 / Rust=34
+  （qs=382，窗口 `[310,464]` 内部）。即 Rust 在一个窗口内部边界少算 1 个错误。
+- 现象指向 `get_rid_backward_cigar_err` 的**有状态迭代**：`b->exz` 与
+  `rtrace_iter tc` 在同一次 gl_rchain 的 j 循环里跨 (i,j) 调用延续（`tc.k`
+  每个 i 只复位一次，j 之间不清）。C/Rust 对 (3,2) 都算得 err=19 并都跳过
+  (3,1)（`get_ecov_contain_adv` 返回 false，dt=-1），随后调用 (3,0)：C 的
+  `get_rid_backward_cigar_err(qs=382)` 返回 35、Rust 返回 34，即扫描到
+  qs=382 所在窗口 `[310,464]` 内部时少计 1 个错误。
+- 已排除：输入 tk、第一遍 P1REG/P1WIN（含唯一 clen=17 gap 窗口）、cells、
+  第二遍 tk、connect(3,2) 结果均与参考一致；`infer_rovlp`/`get_ecov_contain_adv`
+  结构一致。剩余差异在 `get_rid_backward_cigar_err` 对 `exz` 复用状态
+  （`exz.ps/pe/ts/te` 的惰性 gen_clip 判定）或 `rtrace_iter` 游标的处理上。
+- 下一步：用 `-O0` 重编 Correct.o 的 `get_rid_backward_cigar_err`，对 read 5
+  的 `(ai=3, qs=382)` 调用逐窗口打印 `k/q[0]/q[1]/f/werr/exz.*`，与 Rust 的
+  `iterator`/`extz` 状态逐字段对拍，定位第一次分叉的窗口。
 
 ## 仍未迁移的分支
 
