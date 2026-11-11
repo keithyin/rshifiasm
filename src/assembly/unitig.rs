@@ -1070,7 +1070,7 @@ fn link_length_between(
 }
 
 /// `polish_unitig_scaf`: removes elements whose links are poorly supported.
-fn polish_unitig_scaf(
+pub(crate) fn polish_unitig_scaf(
     unitig: &mut MaUtg,
     read_graph: &Asg,
     sources: &[PafList],
@@ -1210,7 +1210,7 @@ fn polish_unitig_scaf(
 
 /// `polish_unitig_advance_scaf`: drops the prefix elements that the following
 /// reads do not support.
-fn polish_unitig_advance_scaf(
+pub(crate) fn polish_unitig_advance_scaf(
     unitig: &mut MaUtg,
     read_graph: &Asg,
     sources: &[PafList],
