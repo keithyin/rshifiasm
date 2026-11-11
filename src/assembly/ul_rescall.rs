@@ -586,3 +586,201 @@ pub fn ul_lalign_base(
     }
     kept
 }
+
+/// `get_win_aln` (`Correct.cpp` 14917): the target coordinates and error of an
+/// aligned window, only when it is adjacent (in target space) to the previous
+/// window.
+fn get_win_aln(region: &OverlapRegion, wid: usize) -> Option<(i64, i64, i64)> {
+    let windows = &region.window_cigar.windows;
+    if wid > 0
+        && windows[wid].y_end != -1
+        && windows[wid - 1].y_end != -1
+        && windows[wid].y_end > windows[wid - 1].y_end
+    {
+        return Some((
+            windows[wid - 1].y_end as i64 + 1,
+            windows[wid].y_end as i64 + 1,
+            windows[wid].error as i64,
+        ));
+    }
+    None
+}
+
+/// `ovlp_win_check` (`Correct.cpp` 22190): whether two windows of the same
+/// overlap are collinear enough to belong to one consensus chain.
+fn ovlp_win_check(
+    region: &OverlapRegion,
+    id0: u32,
+    id1: u32,
+    max_lgap: i64,
+    small_bw_rate: f64,
+    min_small_bw: i64,
+) -> bool {
+    if id0 == u32::MAX || id1 == u32::MAX {
+        return true;
+    }
+    let Some((ts0, te0, _)) = get_win_aln(region, id0 as usize) else {
+        return true;
+    };
+    let windows = &region.window_cigar.windows;
+    let qs0 = windows[id0 as usize].x_start as i64;
+    let qe0 = windows[id0 as usize].x_end as i64 + 1;
+    let Some((ts1, te1, _)) = get_win_aln(region, id1 as usize) else {
+        return true;
+    };
+    let qs1 = windows[id1 as usize].x_start as i64;
+    let qe1 = windows[id1 as usize].x_end as i64 + 1;
+
+    if qs1 < qs0 || qe1 < qe0 {
+        return false;
+    }
+    if ts1 < ts0 || te1 < te0 {
+        return false;
+    }
+    let dq = qe1 - qs0;
+    let dr = te1 - ts0;
+    let dd = if dq >= dr { dq - dr } else { dr - dq };
+    if ts1 < te0 && qe0 == qs1 {
+        let dm = dq.min(dr) as f64;
+        if (dd as f64) > dm * small_bw_rate && dd > min_small_bw {
+            return false;
+        }
+    } else if dd > max_lgap {
+        return false;
+    }
+    true
+}
+
+/// `dp_commen_sketch` (`Correct.cpp` 22211): longest chain of the shared query
+/// windows `win_a` under the `ovlp_win_check` collinearity, then marks the
+/// chain windows' `extra_end`.
+#[allow(clippy::too_many_arguments)]
+pub fn dp_commen_sketch(
+    aln: &[UlOv],
+    regions: &mut [OverlapRegion],
+    id_a: &[u64],
+    id_n: i64,
+    win_a: &mut [u64],
+    mut win_n: i64,
+    dp: &mut [u64],
+    n_skip: i64,
+    wl: i64,
+    cov: i64,
+    max_lgap: i64,
+    sgap_rate: f64,
+    sgap: i64,
+) -> u64 {
+    if win_n == 0 {
+        return 0;
+    }
+    let high_bit = 0x8000_0000_0000_0000u64;
+    if n_skip < win_n {
+        let mut long_sc: i64 = -1;
+        let mut long_idx: i64 = -1;
+        let mut k = 0i64;
+        while k < n_skip {
+            let parent = if k > 0 { (k - 1) as u64 } else { 0xffff_ffffu64 };
+            dp[k as usize] = (parent << 32) | (k + 1) as u64;
+            let max_sc = k + 1;
+            if long_sc < max_sc {
+                long_sc = max_sc;
+                long_idx = k;
+            }
+            k += 1;
+        }
+        while k < win_n {
+            let ws = win_a[k as usize];
+            let sc: i64 = 1;
+            let mut p: i64 = -1;
+            let mut max_sc: i64 = sc;
+            let mut m = k - 1;
+            while m >= 0 {
+                let ws0 = win_a[m as usize];
+                let mut i = 0i64;
+                while i < id_n {
+                    let region = &regions[aln[id_a[i as usize] as usize].qn as usize];
+                    let wid = crate::correction::window::window_id_by_start(
+                        region.x_position_start as i32,
+                        region.x_position_end as i32,
+                        ws as i64,
+                        wl,
+                    )
+                    .0;
+                    let wid0 = crate::correction::window::window_id_by_start(
+                        region.x_position_start as i32,
+                        region.x_position_end as i32,
+                        ws0 as i64,
+                        wl,
+                    )
+                    .0;
+                    if !ovlp_win_check(
+                        region,
+                        wid0 as u32,
+                        wid as u32,
+                        max_lgap,
+                        sgap_rate,
+                        sgap,
+                    ) {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= id_n && sc + (dp[m as usize] as u32 as i64) > max_sc {
+                    max_sc = sc + (dp[m as usize] as u32 as i64);
+                    p = m;
+                }
+                m -= 1;
+            }
+            let parent = if p >= 0 { p as u64 } else { 0xffff_ffffu64 };
+            dp[k as usize] = (parent << 32) | (max_sc as u32 as u64);
+            if long_sc < max_sc {
+                long_sc = max_sc;
+                long_idx = k;
+            }
+            k += 1;
+        }
+
+        let mut k = long_idx;
+        while k >= 0 {
+            win_a[k as usize] |= high_bit;
+            let parent = dp[k as usize] >> 32;
+            k = if parent != 0xffff_ffff {
+                parent as i64
+            } else {
+                -1
+            };
+        }
+        let mut write = 0usize;
+        for read in 0..win_n as usize {
+            if win_a[read] & high_bit == 0 {
+                continue;
+            }
+            win_a[write] = (win_a[read] << 1) >> 1;
+            write += 1;
+        }
+        win_n = write as i64;
+    }
+
+    let cov = -cov;
+    for k in 0..win_n as usize {
+        let ws = win_a[k];
+        for i in 0..id_n as usize {
+            let qn = aln[id_a[i] as usize].qn as usize;
+            let wid = crate::correction::window::window_id_by_start(
+                regions[qn].x_position_start as i32,
+                regions[qn].x_position_end as i32,
+                ws as i64,
+                wl,
+            )
+            .0;
+            let value = if cov > i64::from(i16::MIN) {
+                cov
+            } else {
+                i64::from(i16::MIN)
+            };
+            regions[qn].window_cigar.windows[wid as usize].extra_end = value as i16;
+            regions[qn].alignment_length = wid as u32;
+        }
+    }
+    win_n as u64
+}
