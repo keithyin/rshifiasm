@@ -193,8 +193,8 @@ fn final_overlap_for_read(
         &sketch_result.minimizers,
         index,
         &reads.read_lengths,
-        high_occurrence,
-        low_occurrence,
+        Some(high_occurrence),
+        Some(low_occurrence),
     );
     let chained = lchain_qgen_mcopy_fast(
         seeds,

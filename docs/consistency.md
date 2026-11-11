@@ -2602,6 +2602,49 @@ Rust 侧已具备大部分底层原语：`align_ul_ed_post_extz`
 `create_ul_info`、`gen_init_sg`/`ul_clean_gfa` 的 `is_ou` 分支与
 `gradually_renew_g`/`ul_realignment_gfa`。
 
+### UL scall 链化修复（2026-11-11）
+
+本轮定位并修复了三处使 `ul_scall_golden` 与参考不完全一致的移植 bug，均
+与 UL 专用的非 fast 链化路径有关（HiFi 走 fast 路径，不受影响）：
+
+1. **`qgen_seed_weight` 的 `low_occ = NULL` 语义**（`overlap::qgen_seeds`）。
+   参考 `minimizers_qgen` 只在 `low_occ` 非空时把 `min_cnt` 钳到 2；UL 的
+   worker 传 `low_occ = NULL`，因此 `min_cnt = 0`。原 Rust 无条件
+   `min_occurrence.max(2)`，把 occ==1 的 anchor 权重从 1 错算成 2。改为用
+   `Option<u32>` 表达可空性（`None` → `max_cnt = UINT32_MAX` / `min_cnt = 0`）。
+2. **UL 用的是非 fast 的 `lchain_qgen_mcopy`**（`anchor.cpp` 1771 →
+   `Hash_Table.cpp` 1841 `lchain_qdp_mcopy`，`enable_mcopy = 1`、`khit_n = 1`），
+   而不是 `lchain_qgen_mcopy_fast`。此前的移植用 fast 版 + `copy_number = 1`
+   模拟，二者不等价：非 fast 版在 `movl < xl && cL >= mcopy_khit_cutoff` 时
+   会从未被更重链覆盖的 anchor 出发发出**多条**近似最优链，且没有 fast 版的
+   coverage-window 过滤。新增 `lchain_qgen_mcopy`（无 coverage-window），并
+   给 `chain_candidate_read_ch` 补上 `enable_mcopy` 多链分出分支（
+   `filter_non_ovlp_xchains` 同步移植）；`--dual-scaf` 的 `qgen_input` 仍传
+   `enable_mcopy = false`，行为不变。
+3. **mcopy 多链的端点锚点索引**：`push_chain_overlap` 的第二个 anchor 必须取
+   `anchors[chain_anchors[offset]]`（ii 缓冲里存的 anchor 下标），写成
+   `anchors[offset]`（ii 缓冲下标）会让链端点严重错位、x 区间颠倒。
+
+修复后：
+
+| 指标 | 修复前 | 修复后 | 参考（C++） |
+| --- | --- | --- | --- |
+| read 0 链化链数（after loop / after type / final） | 614 / 437 / 243 | 753 / 566 / 302 | 753 / 566 / 302 |
+| read 0 clist / olist | 15019 / 259 | 15416 / 302 | 15416 / 302 |
+| read 0 第二遍 tk 条目 | 192（sec 差 4–5） | 192（**逐字段一致**） | 192 |
+| `ul_scall_golden` 匹配读段 | 557/739 | 572/739 | 739 |
+
+`-t1` 默认 HiFi 端到端（`bp.p_ctg`/`p_utg`/`hap1`/`hap2`）与
+`reference.bp.*` 仍逐字节一致、`cargo test --release --lib` 全绿。
+
+**剩余差异**：167 条 UL 读段仍不同。已定位到 `gen_rid_raw_chain` 的
+`gl_rchain_lin_contain_adv` / `select_clean_chain` 在 read 5' 端的链体选择：
+同一读段的原始 tk（199 条）、第一遍 olist（27 条 P1REG）均与参考逐字段一致，
+但最终 bodies 中 C++ 选出 primary `tn=0x800007F9`（seq 0,1=0x…7EC,0x…7F5），
+Rust 选出 `tn=0x800007FA` 且少了 C++ 的那条，净少 1 条 body。该函数此前只
+经 read 0 黄金用例覆盖（`ul_raw_chain_golden`），尚未覆盖到这种 5' 端
+多链合并的场景，需继续对拍。
+
 ## 仍未迁移的分支
 
 - `--ul`（超长读整合，ul 路径，parse 期显式拒绝）。合成数据门禁与完整

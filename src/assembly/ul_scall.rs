@@ -71,6 +71,10 @@ pub struct ScallContext<'a> {
     pub reads: &'a ReadStore,
     /// `uopt->sources`.
     pub sources: &'a [PafList],
+    /// `asm_opt.mz_sample_dist`.
+    pub sample_distance: i32,
+    /// `asm_opt.mz_rewin`.
+    pub rewindow_size: i32,
 }
 
 /// The per-run buffers: the reference's `ha_ovec_buf_t` plus `glchain_t`.
@@ -153,8 +157,8 @@ pub fn process_read(
         band_width_threshold: parameters.error_rate,
         maximum_chain_count: parameters.maximum_chain_count,
         homopolymer_compression: parameters.homopolymer_compression,
-        sample_distance: 0,
-        rewindow_size: 0,
+        sample_distance: context.sample_distance as u32,
+        rewindow_size: context.rewindow_size as u32,
     };
 
     let targets = TargetSource::Unitigs {
@@ -168,6 +172,7 @@ pub fn process_read(
         &context.unitig_index.index,
         &targets,
         &align_parameters,
+        Some(&context.unitig_index.filter),
     );
     buffers.overlaps = mapped.overlaps;
     buffers.candidates = mapped.candidates;
@@ -228,6 +233,43 @@ pub fn process_read(
                 .map(|o| (o.x_position_start, o.x_position_end, o.y_identifier, o.alignment_length)),
         );
     }
+    if std::env::var("RSHIFIASM_SCALL_DEBUG").is_ok()
+        && local_read_id == processed_reads_debug()
+        && std::env::var("RSHIFIASM_SCALL_P1").is_ok()
+    {
+        for (index, region) in buffers.overlaps.iter().enumerate().take(kept) {
+            eprintln!(
+                "[p1-reg] {} x=[{},{}] y_id={} y=[{},{}] strand={} aln={} nherr={} fc={}",
+                index,
+                region.x_position_start,
+                region.x_position_end,
+                region.y_identifier,
+                region.y_position_start,
+                region.y_position_end,
+                region.y_strand,
+                region.alignment_length,
+                region.non_homopolymer_errors,
+                region.fake_cigar.len()
+            );
+            for position in 0..region.fake_cigar.len() {
+                eprintln!(
+                    "[p1-fc] {} {} {} {}",
+                    index,
+                    position,
+                    region.fake_cigar.gap_position(position),
+                    region.fake_cigar.gap_shift(position)
+                );
+            }
+            for (position, window) in region.window_cigar.windows.iter().enumerate() {
+                eprintln!(
+                    "[p1-win] {} {} x=[{},{}] y=[{},{}] eb={} ee={} err={} thre={} cidx={} clen={}",
+                    index, position, window.x_start, window.x_end, window.y_start, window.y_end,
+                    window.extra_begin, window.extra_end, window.error, window.error_threshold,
+                    window.cigar_start, window.cigar_length
+                );
+            }
+        }
+    }
     if buffers.overlaps.is_empty() {
         return false;
     }
@@ -266,6 +308,80 @@ pub fn process_read(
     buffers.chain.tc.clear();
     buffers.chain.tc.extend(buffers.local.trace.iter().copied());
 
+    if std::env::var("RSHIFIASM_SCALL_DEBUG").is_ok()
+        && local_read_id == processed_reads_debug()
+        && std::env::var("RSHIFIASM_SCALL_REGS").is_ok()
+    {
+        for (index, region) in buffers.overlaps.iter().enumerate() {
+            eprintln!(
+                "[rs-reg] {} x_id={} x=[{},{}] y_id={} y=[{},{}] strand={} aln={} nherr={} fc={}",
+                index,
+                region.x_identifier,
+                region.x_position_start,
+                region.x_position_end,
+                region.y_identifier,
+                region.y_position_start,
+                region.y_position_end,
+                region.y_strand,
+                region.alignment_length,
+                region.non_homopolymer_errors,
+                region.fake_cigar.len()
+            );
+            for position in 0..region.fake_cigar.len() {
+                eprintln!(
+                    "[rs-fc] {} {} {} {}",
+                    index,
+                    position,
+                    region.fake_cigar.gap_position(position),
+                    region.fake_cigar.gap_shift(position)
+                );
+            }
+            for (cell_index, cell) in region.window_cigar.cells.iter().enumerate() {
+                eprintln!("[rs-cell] {} {} {}", index, cell_index, cell);
+            }
+            for (position, window) in region.window_cigar.windows.iter().enumerate() {
+                eprintln!(
+                    "[rs-win] {} {} x=[{},{}] y=[{},{}] eb={} ee={} err={} thre={} cidx={} clen={}",
+                    index, position, window.x_start, window.x_end, window.y_start, window.y_end,
+                    window.extra_begin, window.extra_end, window.error, window.error_threshold,
+                    window.cigar_start, window.cigar_length
+                );
+            }
+        }
+    }
+    if std::env::var("RSHIFIASM_SCALL_DEBUG").is_ok()
+        && local_read_id == processed_reads_debug()
+        && std::env::var("RSHIFIASM_SCALL_USEQ").is_ok()
+    {
+        for which in 3..6 {
+            let region = &buffers.overlaps[which];
+            let target_length = targets.length(region.y_identifier as usize);
+            let mut span_s = i64::from(region.y_position_start) - 300;
+            if span_s < 0 {
+                span_s = 0;
+            }
+            let mut span_l =
+                i64::from(region.y_position_end) + 1 - i64::from(region.y_position_start) + 600;
+            if span_s + span_l > target_length {
+                span_l = target_length - span_s;
+            }
+            let sequence = targets.sub_region(
+                region.y_identifier as usize,
+                span_s,
+                span_l,
+                region.y_strand as u8,
+            );
+            eprintln!(
+                "[rs-useq] which={} y_id={} strand={} span=[{},{}] seq={}",
+                which,
+                region.y_identifier,
+                region.y_strand,
+                span_s,
+                span_s + span_l,
+                String::from_utf8_lossy(&sequence)
+            );
+        }
+    }
     if std::env::var("RSHIFIASM_SCALL_DEBUG").is_ok() && local_read_id == processed_reads_debug() {
         for (index, entry) in buffers.chain.tk.iter().enumerate() {
             eprintln!(

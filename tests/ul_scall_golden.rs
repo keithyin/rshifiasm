@@ -113,6 +113,8 @@ fn scall_pass_reproduces_the_reference_ul_overlaps() {
         unitig_index: &unitig_index,
         reads: &reads,
         sources: &sources,
+        sample_distance: options.minimizer_sample_distance,
+        rewindow_size: options.minimizer_rewindow_size,
     };
     let mut reader =
         FastxReader::open("/tmp/ul.fq").expect("the synthetic UL reads must be present");

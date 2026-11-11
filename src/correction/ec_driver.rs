@@ -423,8 +423,8 @@ fn correct_read(
         &sketch_result.minimizers,
         index,
         &reads.read_lengths,
-        high_occurrence,
-        low_occurrence,
+        Some(high_occurrence),
+        Some(low_occurrence),
     );
     stage!("seeds");
     let chained = lchain_qgen_mcopy_fast(
@@ -819,8 +819,8 @@ pub fn run_debug_overlap(options: &mut AssemblyOptions) -> Result<(), String> {
             &sketch_result.minimizers,
             &index,
             &reads.read_lengths,
-            high_occurrence,
-            low_occurrence,
+            Some(high_occurrence),
+            Some(low_occurrence),
         );
         let chained = lchain_qgen_mcopy_fast(
             seeds,

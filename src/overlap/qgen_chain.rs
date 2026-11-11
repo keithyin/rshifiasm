@@ -788,6 +788,10 @@ pub(crate) fn chain_candidate_read_ch(
     target_length: i64,
     append_both_ends: bool,
     generate_cigar: bool,
+    enable_mcopy: bool,
+    mcopy_rate: f64,
+    mcopy_khit_cutoff: u32,
+    keep_chain_length: bool,
 ) -> usize {
     if anchor_count == 0 {
         return 0;
@@ -798,6 +802,7 @@ pub(crate) fn chain_candidate_read_ch(
     let mut predecessor = vec![-1i64; anchor_count];
     let mut scratch = vec![0i64; anchor_count];
     let mut score = vec![0i32; anchor_count];
+    let mut plus: i64 = 0;
 
     let mut maximum_chain_score: i64 = i64::from(i32::MIN);
     let mut maximum_chain_index: i64 = i64::from(i32::MIN);
@@ -929,20 +934,158 @@ pub(crate) fn chain_candidate_read_ch(
                 minimum_overlap_length = overlap_length;
             }
         }
+        if i64::from(score[index]) < plus {
+            plus = i64::from(score[index]);
+        }
     }
 
-    // Trace the best chain backwards into `scratch`.
-    let mut chain_length_count = 0usize;
+    // Label the best chain (`ii[i] = 1`) and trace it newest-to-oldest into
+    // `best_order` (the reference's `t[0..cL]`).
+    let mut best_membership = vec![false; anchor_count];
+    let mut best_order: Vec<i64> = Vec::new();
     let mut trace = maximum_chain_index;
     while trace >= 0 {
-        scratch[chain_length_count] = trace;
-        chain_length_count += 1;
+        best_membership[trace as usize] = true;
+        best_order.push(trace);
         trace = predecessor[trace as usize];
     }
+    let best_length = best_order.len();
 
+    // `enable_mcopy` branch of `lchain_qdp_mcopy`: emit every near-best chain
+    // starting at an anchor not covered by a heavier chain.
+    if enable_mcopy
+        && minimum_overlap_length < query_length
+        && best_length as u64 >= u64::from(mcopy_khit_cutoff)
+    {
+        let base_score = maximum_chain_score - plus;
+        let minimum_score = (base_score as f64 * mcopy_rate) as i64;
+        best_membership[maximum_chain_index as usize] = false;
+
+        let mut shifted_score: Vec<i64> = score.iter().map(|value| i64::from(*value)).collect();
+        let mut keys: Vec<(u64, usize)> = Vec::new();
+        for index in 0..anchor_count {
+            shifted_score[index] -= plus;
+            if !best_membership[index] && shifted_score[index] >= minimum_score {
+                let key = ((shifted_score[index] as u64) << 32) | ((index as u64) << 1);
+                keys.push((key, index));
+            }
+        }
+        let key_count = keys.len();
+        if key_count > 1 {
+            keys.sort_by_key(|entry| entry.0);
+            let emit_start = overlaps.len();
+            let mut visited = vec![false; anchor_count];
+            let mut chain_anchors: Vec<usize> = Vec::new();
+            for entry_index in (0..key_count).rev() {
+                let key = keys[entry_index].0;
+                let chain_start = ((key as u32) >> 1) as i64;
+                let offset = chain_anchors.len();
+                let mut cursor = chain_start;
+                while cursor >= 0 && !visited[cursor as usize] {
+                    chain_anchors.push(cursor as usize);
+                    visited[cursor as usize] = true;
+                    cursor = predecessor[cursor as usize];
+                }
+                if chain_anchors.len() == offset {
+                    continue;
+                }
+                let chain_score = if cursor < 0 {
+                    (key >> 32) as i64
+                } else {
+                    (key >> 32) as i64 - shifted_score[cursor as usize]
+                };
+                if chain_score < minimum_score {
+                    chain_anchors.truncate(offset);
+                    continue;
+                }
+                let overlap_index = overlaps.len();
+                push_chain_overlap(
+                    overlaps,
+                    query_identifier,
+                    query_length,
+                    target_length,
+                    chain_score + plus,
+                    &anchors[chain_anchors[chain_anchors.len() - 1]],
+                    &anchors[chain_anchors[offset]],
+                );
+                let region = &mut overlaps[overlap_index];
+                let span =
+                    i64::from(region.x_position_end) + 1 - i64::from(region.x_position_start);
+                if mcopy_khit_cutoff <= 1 || span <= (minimum_overlap_length << 2) {
+                    region.x_identifier = offset as u32;
+                    region.alignment_length = (chain_anchors.len() - offset) as u32;
+                } else {
+                    overlaps.pop();
+                    chain_anchors.truncate(offset);
+                }
+            }
+
+            let accepted = overlaps.len() - emit_start;
+            if accepted > 1 {
+                introsort_klib_by(
+                    &mut overlaps[emit_start..emit_start + accepted],
+                    &|left: &OverlapRegion, right: &OverlapRegion| {
+                        left.shared_seed > right.shared_seed
+                    },
+                );
+            }
+            let mut kept_anchor_count = 0usize;
+            let kept = if accepted == 0 {
+                0
+            } else {
+                filter_non_ovlp_xchains(
+                    &mut overlaps[emit_start..emit_start + accepted],
+                    &mut kept_anchor_count,
+                )
+            };
+            overlaps.truncate(emit_start + kept);
+            let limit = overlaps.len();
+
+            let mut written = 0usize;
+            for chain_index in emit_start..limit {
+                let offset = overlaps[chain_index].x_identifier as usize;
+                let count = overlaps[chain_index].alignment_length as usize;
+                overlaps[chain_index].non_homopolymer_errors = (destination_index + written) as u32;
+                let mut hits: Vec<KmerHit> = Vec::with_capacity(count);
+                for step in 0..count {
+                    let mut hit = anchors[chain_anchors[offset + (count - step - 1)]];
+                    hit.read_identifier = chain_index as u32;
+                    hits.push(hit);
+                }
+                overlaps[chain_index].x_identifier = query_identifier;
+                if generate_cigar {
+                    let x_start = overlaps[chain_index].x_position_start;
+                    let y_start = overlaps[chain_index].y_position_start;
+                    let x_end = overlaps[chain_index].x_position_end;
+                    generate_fake_cigar(
+                        &mut overlaps[chain_index].fake_cigar,
+                        x_start,
+                        y_start,
+                        x_end,
+                        append_both_ends,
+                        &hits,
+                    );
+                }
+                if !keep_chain_length {
+                    overlaps[chain_index].alignment_length = 0;
+                }
+                if candidates.len() < destination_index + written + count {
+                    candidates.resize(destination_index + written + count, KmerHit::default());
+                }
+                for (step, hit) in hits.into_iter().enumerate() {
+                    candidates[destination_index + written + step] = hit;
+                }
+                written += count;
+            }
+            return written;
+        }
+    }
+
+    // Single best chain fallback.
+    let chain_length_count = best_length;
     let overlap_index = overlaps.len();
-    let chain_start_anchor = anchors[scratch[chain_length_count - 1] as usize];
-    let chain_end_anchor = anchors[scratch[0] as usize];
+    let chain_start_anchor = anchors[best_order[chain_length_count - 1] as usize];
+    let chain_end_anchor = anchors[best_order[0] as usize];
     push_chain_overlap(
         overlaps,
         query_identifier,
@@ -956,13 +1099,16 @@ pub(crate) fn chain_candidate_read_ch(
         candidates.resize(destination_index + chain_length_count, KmerHit::default());
     }
     for offset in 0..chain_length_count {
-        let source = scratch[chain_length_count - offset - 1] as usize;
+        let source = best_order[chain_length_count - offset - 1] as usize;
         let mut hit = anchors[source];
         hit.read_identifier = overlap_index as u32;
         candidates[destination_index + offset] = hit;
     }
     let region = &mut overlaps[overlap_index];
     region.non_homopolymer_errors = destination_index as u32;
+    if keep_chain_length {
+        region.alignment_length = chain_length_count as u32;
+    }
     if generate_cigar {
         let x_start = region.x_position_start;
         let y_start = region.y_position_start;
@@ -977,6 +1123,48 @@ pub(crate) fn chain_candidate_read_ch(
         );
     }
     chain_length_count
+}
+
+/// `filter_non_ovlp_xchains` (`Hash_Table.cpp` 1815): keeps the chains whose
+/// query spans overlap by at most 10% and accumulates the anchor count of the
+/// survivors into `anchor_count`.
+fn filter_non_ovlp_xchains(chains: &mut [OverlapRegion], anchor_count: &mut usize) -> usize {
+    let total = chains.len();
+    let mut kept = 0usize;
+    *anchor_count = 0;
+    for index in 0..total {
+        let candidate = chains[index].clone();
+        let candidate_length =
+            i64::from(candidate.x_position_end) + 1 - i64::from(candidate.x_position_start);
+        let mut probe = 0usize;
+        while probe < kept {
+            let other = &chains[probe];
+            let other_length =
+                i64::from(other.x_position_end) + 1 - i64::from(other.x_position_start);
+            let overlap_start = candidate.x_position_start.max(other.x_position_start);
+            let overlap_end = candidate.x_position_end.min(other.x_position_end) + 1;
+            let overlap = if overlap_end > overlap_start {
+                i64::from(overlap_end - overlap_start)
+            } else {
+                0
+            };
+            if (overlap as f64) > (candidate_length as f64 * 0.1)
+                || (overlap as f64) > (other_length as f64 * 0.1)
+            {
+                break;
+            }
+            probe += 1;
+        }
+        if probe < kept {
+            continue;
+        }
+        if kept != index {
+            chains.swap(kept, index);
+        }
+        *anchor_count += chains[kept].alignment_length as usize;
+        kept += 1;
+    }
+    kept
 }
 
 /// Parameters of the qgen chain pass, mirroring the call site in
@@ -1291,6 +1479,208 @@ pub fn lchain_qgen_mcopy_fast(
                             let end = candidate_list[cursor].self_offset;
                             let start = end
                                 .wrapping_sub(candidate_list[cursor].count & 0xff);
+                            if u64::from(start) >= overlap_start
+                                && u64::from(end) <= overlap_end
+                            {
+                                contained += 1;
+                            }
+                            cursor += 1;
+                        }
+                        if contained >= minimum_occurrence {
+                            break;
+                        }
+                    }
+                    stronger += 1;
+                }
+
+                if stronger < overlaps.len()
+                    && query_end > overlaps[stronger].x_position_start as u64
+                {
+                    continue;
+                }
+            }
+
+            if kept != index {
+                overlaps.swap(kept, index);
+            }
+            kept += 1;
+        }
+        overlaps.truncate(kept);
+    }
+
+    for region in &mut overlaps {
+        region.alignment_length = 0;
+    }
+
+    let candidate_length = candidate_list.len();
+    QgenChainResult {
+        overlaps,
+        candidates: candidate_list,
+        candidate_length,
+    }
+}
+
+/// `lchain_qgen_mcopy` (`anchor.cpp` 1771), the non-fast variant used by the
+/// UL `ul_map_lchain` pass. It chains with the `lchain_qdp_mcopy` programme
+/// (`enable_mcopy = 1`, `khit_n = 1`) and applies the chain-count / r485
+/// filters without the fast variant's coverage-window pass.
+pub fn lchain_qgen_mcopy(
+    candidates: Vec<KmerHit>,
+    query_identifier: u32,
+    query_length: u64,
+    read_lengths: &[u64],
+    parameters: &QgenChainParameters,
+) -> QgenChainResult {
+    let mut candidate_list = candidates;
+    let mut overlaps: Vec<OverlapRegion> = Vec::new();
+    let mut chain_cutoff_hit = false;
+    let mut copied_anchors: usize = 0;
+
+    let candidate_count = candidate_list.len();
+    let mut group_start = 0usize;
+    let mut position = 1usize;
+
+    while position <= candidate_count {
+        if position == candidate_count
+            || candidate_list[position].read_identifier
+                != candidate_list[group_start].read_identifier
+        {
+            let target_identifier = candidate_list[group_start].read_identifier;
+            if target_identifier != query_identifier {
+                let overlap_start = overlaps.len();
+                let target_length = read_lengths
+                    .get(target_identifier as usize)
+                    .copied()
+                    .unwrap_or(0);
+                let copied = chain_candidate_read_ch(
+                    &mut candidate_list,
+                    group_start,
+                    position - group_start,
+                    copied_anchors,
+                    &mut overlaps,
+                    parameters.maximum_skip,
+                    parameters.maximum_iterations,
+                    parameters.maximum_distance,
+                    parameters.gap_penalty,
+                    parameters.skip_penalty,
+                    parameters.band_width_rate,
+                    query_identifier,
+                    query_length as i64,
+                    target_length as i64,
+                    parameters.append_both_ends,
+                    parameters.generate_offset,
+                    true,
+                    parameters.copy_rate,
+                    parameters.copy_kmer_cutoff,
+                    true,
+                );
+                copied_anchors += copied;
+                if parameters.chain_cutoff >= 2 && !chain_cutoff_hit {
+                    for region in &overlaps[overlap_start..] {
+                        if region.alignment_length < parameters.chain_cutoff {
+                            chain_cutoff_hit = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            group_start = position;
+        }
+        position += 1;
+    }
+    candidate_list.truncate(copied_anchors);
+
+    let maximum_chain_count = parameters.maximum_chain_count;
+    if overlaps.len() as u64 > u64::from(maximum_chain_count) {
+        introsort_klib_by(&mut overlaps, &|left: &OverlapRegion, right: &OverlapRegion| {
+            left.shared_seed > right.shared_seed
+        });
+
+        let mut type_counts = [0u32; 4];
+        let mut type_thresholds = [0i32; 4];
+        for region in &overlaps {
+            let overlap_class = overlap_type(region, query_length as u32);
+            type_counts[overlap_class] += 1;
+            if u64::from(type_counts[overlap_class]) == u64::from(maximum_chain_count) {
+                type_thresholds[overlap_class] = region.shared_seed;
+            }
+        }
+
+        if type_thresholds.iter().any(|threshold| *threshold > 0) {
+            // The reference resets `lch` in the `for` initialiser.
+            chain_cutoff_hit = false;
+            let mut kept = 0usize;
+            for index in 0..overlaps.len() {
+                let overlap_class = overlap_type(&overlaps[index], query_length as u32);
+                if overlaps[index].shared_seed >= type_thresholds[overlap_class] {
+                    if kept != index {
+                        overlaps.swap(kept, index);
+                    }
+                    if overlaps[kept].alignment_length < parameters.chain_cutoff {
+                        chain_cutoff_hit = true;
+                    }
+                    kept += 1;
+                }
+            }
+            overlaps.truncate(kept);
+        }
+    }
+
+    introsort_klib_by(&mut overlaps, &|left: &OverlapRegion, right: &OverlapRegion| {
+        ((u64::from(left.x_position_start) << 32) | u64::from(left.x_position_end))
+            < ((u64::from(right.x_position_start) << 32) | u64::from(right.x_position_end))
+    });
+
+    if chain_cutoff_hit {
+        let mut kept = 0usize;
+        for index in 0..overlaps.len() {
+            let region = overlaps[index].clone();
+            if region.alignment_length < parameters.chain_cutoff {
+                let query_start = region.x_position_start as u64;
+                let query_end = region.x_position_end as u64 + 1;
+                let mut overlap_bound =
+                    ((query_end - query_start) as f64 * OVERLAP_FRACTION) as u64;
+                if overlap_bound < 16 {
+                    overlap_bound = 16;
+                }
+                let minimum_seed_score = i64::from(region.shared_seed) * CHAIN_SCORE_FACTOR;
+                let minimum_occurrence =
+                    u64::from(region.alignment_length) << CHAIN_OCCURRENCE_SHIFT;
+
+                let mut stronger = 0usize;
+                while stronger < overlaps.len()
+                    && query_end > overlaps[stronger].x_position_start as u64
+                {
+                    let other = overlaps[stronger].clone();
+                    if other.alignment_length < parameters.chain_cutoff {
+                        stronger += 1;
+                        continue;
+                    }
+                    if u64::from(other.alignment_length) < minimum_occurrence {
+                        stronger += 1;
+                        continue;
+                    }
+                    if i64::from(other.shared_seed) < minimum_seed_score {
+                        stronger += 1;
+                        continue;
+                    }
+                    let other_start = other.x_position_start as u64;
+                    let other_end = other.x_position_end as u64 + 1;
+                    let overlap_start = other_start.max(query_start);
+                    let overlap_end = other_end.min(query_end);
+                    if overlap_end > overlap_start
+                        && overlap_end - overlap_start >= overlap_bound
+                    {
+                        let anchor_index = other.non_homopolymer_errors as usize;
+                        let target_identifier = candidate_list[anchor_index].read_identifier;
+                        let mut contained = 0u64;
+                        let mut cursor = anchor_index;
+                        while cursor < candidate_list.len()
+                            && candidate_list[cursor].read_identifier == target_identifier
+                            && contained < minimum_occurrence
+                        {
+                            let end = candidate_list[cursor].self_offset;
+                            let start = end.wrapping_sub(candidate_list[cursor].count & 0xff);
                             if u64::from(start) >= overlap_start
                                 && u64::from(end) <= overlap_end
                             {

@@ -47,12 +47,14 @@ impl QgenAnchor {
 
 /// `high_occ`/`low_occ` weighting of `minimizers_qgen0`.
 ///
-/// `max_occurrence` and `min_occurrence` are clamped to two by the reference,
-/// and the packed span is preserved in the low eight bits of the result.
+/// `max_occurrence` and `min_occurrence` are the already-resolved bounds: the
+/// reference clamps a non-NULL `high_occ`/`low_occ` to two, leaves `min_cnt` at
+/// zero when `low_occ` is NULL and `max_cnt` at `UINT32_MAX` when `high_occ` is
+/// NULL. The packed span is preserved in the low eight bits of the result.
 pub fn qgen_seed_weight(occurrence: u32, span: u8, max_occurrence: u32, min_occurrence: u32) -> u32 {
-    let maximum = max_occurrence.max(2);
-    let minimum = min_occurrence.max(2);
-    let doubled_maximum = maximum << 1;
+    let maximum = max_occurrence;
+    let minimum = min_occurrence;
+    let doubled_maximum = maximum.wrapping_shl(1);
 
     let weight = if occurrence < maximum && occurrence > minimum {
         1u32
@@ -72,13 +74,19 @@ pub fn qgen_seed_weight(occurrence: u32, span: u8, max_occurrence: u32, min_occu
 ///
 /// `read_lengths` gives the length of every target read, which is needed to
 /// undo the reverse-strand mirroring of target positions.
+///
+/// `max_occurrence`/`min_occurrence` mirror the reference's nullable
+/// `high_occ`/`low_occ`: `None` leaves `max_cnt` at `UINT32_MAX` / `min_cnt` at
+/// zero, while `Some(v)` clamps `v` to two.
 pub fn collect_qgen_seeds(
     minimizers: &[Minimizer],
     index: &PositionIndex,
     read_lengths: &[u64],
-    max_occurrence: u32,
-    min_occurrence: u32,
+    max_occurrence: Option<u32>,
+    min_occurrence: Option<u32>,
 ) -> Vec<KmerHit> {
+    let maximum = max_occurrence.map(|v| v.max(2)).unwrap_or(u32::MAX);
+    let minimum = min_occurrence.map(|v| v.max(2)).unwrap_or(0);
     let mut anchors: Vec<QgenAnchor> = Vec::new();
 
     for minimizer in minimizers {
@@ -146,8 +154,8 @@ pub fn collect_qgen_seeds(
                 count: qgen_seed_weight(
                     anchor.occurrence(),
                     anchor.span(),
-                    max_occurrence,
-                    min_occurrence,
+                    maximum,
+                    minimum,
                 ),
             }
         })
@@ -212,7 +220,7 @@ mod tests {
         );
 
         let read_lengths = vec![1000u64; 10];
-        let seeds = collect_qgen_seeds(&minimizers, &index, &read_lengths, 60, 12);
+        let seeds = collect_qgen_seeds(&minimizers, &index, &read_lengths, Some(60), Some(12));
 
         assert_eq!(seeds.len(), 2);
         // The forward-strand anchor sorts before the reverse-strand one

@@ -24,7 +24,7 @@ use crate::counting::minimizer::sketch;
 use crate::counting::position_index::PositionIndex;
 use crate::overlap::chaining::chain_refine;
 use crate::overlap::lchain_parameters::set_lchain_parameters;
-use crate::overlap::qgen_chain::{lchain_qgen_mcopy_fast, QgenChainParameters};
+use crate::overlap::qgen_chain::{lchain_qgen_mcopy, QgenChainParameters};
 use crate::overlap::qgen_seeds::collect_qgen_seeds;
 use crate::overlap::region::{CandidatesList, KmerHit, OverlapRegion};
 
@@ -77,11 +77,15 @@ pub struct UlMapResult {
 /// `ul_map_lchain` (`anchor.cpp` 2287) with `apend_be = 1`, `gen_off = 0`,
 /// `is_accurate = 1` and the UL copy-number settings of
 /// `worker_for_ul_scall_alignment`.
+///
+/// `filter_table` is `mz2_ha_sketch`'s `ha_flt_tab`: the unitig k-mer filter
+/// that drops every query minimizer absent from the unitig index.
 pub fn ul_map_lchain(
     query: &[u8],
     index: &PositionIndex,
     targets: &TargetSource<'_>,
     parameters: &UlAlignParameters,
+    filter_table: Option<&crate::counting::filter_table::KmerFilterTable>,
 ) -> UlMapResult {
     let minimizers = sketch(
         query,
@@ -89,17 +93,34 @@ pub fn ul_map_lchain(
         parameters.kmer_length as i32,
         u32::MAX,
         parameters.homopolymer_compression,
-        None,
+        filter_table,
         parameters.sample_distance as i32,
         parameters.rewindow_size as i32,
     )
     .minimizers;
+    if std::env::var("RSHIFIASM_MZ_DEBUG").is_ok() {
+        eprintln!("[rs-mz] n={}", minimizers.len());
+        for (index, minimizer) in minimizers.iter().enumerate().take(8) {
+            eprintln!(
+                "[rs-mz1] {} x={:x} pos={} rev={} span={}",
+                index,
+                {
+                    // reconstruct the hash for debugging; the x field is the
+                    // packed hash, unavailable from Minimizer
+                    0
+                },
+                minimizer.position,
+                minimizer.reverse as u32,
+                minimizer.span
+            );
+        }
+    }
 
     let target_lengths: Vec<u64> = (0..target_count(targets))
         .map(|identifier| targets.length(identifier) as u64)
         .collect();
     // `high_occ = 2`, `low_occ = NULL`.
-    let seeds = collect_qgen_seeds(&minimizers, index, &target_lengths, 2, 0);
+    let seeds = collect_qgen_seeds(&minimizers, index, &target_lengths, Some(2), None);
 
     // the scall worker passes `is_accurate = 0`
     let lchain = set_lchain_parameters(false, parameters.kmer_length);
@@ -119,11 +140,10 @@ pub fn ul_map_lchain(
         copy_rate: 0.2,
         chain_cutoff: 2,
         copy_kmer_cutoff: 3,
-        // the non-fast `lchain_qgen_mcopy` passes `ocv_w = 1`: per-base
-        // coverage windows for the type-3 threshold filter
-        coverage_window: 1,
+        // the non-fast `lchain_qgen_mcopy` has no coverage-window pass
+        coverage_window: 0,
     };
-    let result = lchain_qgen_mcopy_fast(seeds, u32::MAX, query.len() as u64, &target_lengths, &chain_parameters);
+    let result = lchain_qgen_mcopy(seeds, u32::MAX, query.len() as u64, &target_lengths, &chain_parameters);
 
     let mut candidates = CandidatesList {
         list: result.candidates,
@@ -2089,6 +2109,13 @@ pub(crate) fn gen_raln(
                 }
             }
         }
+        if std::env::var("RSHIFIASM_RALN_DEBUG").is_ok() {
+            eprintln!(
+                "[raln] k={}/{} piece_end q=[{},{}] t=[{},{}] cur_e={} aln_e={}",
+                k, window_end_id, query[0], query[1], target[0], target[1],
+                current_error, total_error + current_error
+            );
+        }
         total_error += current_error;
         update_ul_ov_t_coor(result, query[0], query[1], target[0], target[1]);
 
@@ -2477,9 +2504,47 @@ pub(crate) fn is_pri_aln(hit: &KmerHit) -> bool {
 /// `return_t_chain` (`Correct.cpp` 23050): refines the chain bracket of one
 /// overlap in place, marking the hits past the refined chain with the `alnw`
 /// sentinel. Returns the refined chain length.
+thread_local! {
+    static BRACKET_DUMP_LIMIT: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
 pub(crate) fn return_t_chain(region: &mut OverlapRegion, candidates: &mut CandidatesList) -> i64 {
     let start = region.shared_seed as usize;
     let mut end = start;
+    if std::env::var("RSHIFIASM_BRACKET_DEBUG").is_ok()
+        && candidates.list.get(start).map(|hit| hit.read_identifier) == Some(222)
+        && BRACKET_DUMP_LIMIT.with(|count| {
+            let value = count.get();
+            count.set(value + 1);
+            value == 0
+        })
+    {
+        let mut scan = start;
+        let first = candidates.list[start].read_identifier;
+        while scan < candidates.length as usize
+            && candidates.list[scan].read_identifier == first
+            && candidates.list[scan].read_identifier != ALNW_SENTINEL
+        {
+            scan += 1;
+        }
+        eprintln!(
+            "[bracket] start={} scn={} y_id={}",
+            start,
+            scan - start,
+            region.y_identifier
+        );
+        for (index, hit) in candidates.list[start..scan].iter().enumerate() {
+            eprintln!(
+                "[anch] {} self={} off={} strand={} readID={} cnt={}",
+                index,
+                hit.self_offset,
+                hit.offset,
+                hit.strand_value(),
+                hit.read_identifier,
+                hit.count
+            );
+        }
+    }
     let first_identifier = candidates.list[start].read_identifier;
     while end < candidates.length as usize
         && candidates.list[end].read_identifier == first_identifier

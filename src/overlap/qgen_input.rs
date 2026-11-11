@@ -454,6 +454,10 @@ fn special_lchain(
             target_length,
             parameters.append_both_ends,
             parameters.generate_offset,
+            false,
+            0.0,
+            0,
+            false,
         );
         if *start_index < group_starts.len()
             && group_starts[*start_index] == begin as u64
@@ -568,6 +572,10 @@ pub(crate) fn lchain_qgen_mcopy_input(
                         target_length,
                         parameters.append_both_ends,
                         parameters.generate_offset,
+                        false,
+                        0.0,
+                        0,
+                        false,
                     );
                 } else {
                     copied = special_lchain(
