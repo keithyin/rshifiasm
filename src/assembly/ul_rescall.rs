@@ -22,7 +22,11 @@ use crate::correction::interval::{get_interval, IntervalBuffer, WindowPool};
 use crate::correction::recalculate::similarity_pass;
 use crate::correction::region::THRESHOLD_MAXIMUM;
 use crate::correction::target::TargetSource;
-use crate::correction::ul_align::{is_alnw, ALNW_SENTINEL};
+use crate::correction::ug_lalign::{rechain_alignment_ul, ChainBracket};
+use crate::correction::ul_align::{
+    fusion_chain_ovlp, is_alnw, ovlp_base_aln, ALNW_SENTINEL,
+};
+use crate::correction::window_chain::is_unaligned_window;
 use crate::correction::window::number_of_windows;
 use crate::overlap::region::{CandidatesList, ChainData, KmerHit, OverlapRegion};
 use crate::reads::read_store::ReadStore;
@@ -1371,4 +1375,143 @@ pub fn count_k_hits_adv(
             run_start = run_end;
         }
     }
+}
+
+/// `update_overlap_region` (`Correct.cpp` 17249): copy `source`'s window cigar
+/// into `target` and re-derive the overlap coordinates (including the same
+/// left/right padding rule as `push_ovlp_chain_qgen`).
+fn update_overlap_region(target: &mut OverlapRegion, source: &OverlapRegion, xl: i64, yl: i64) {
+    target.window_cigar.cells = source.window_cigar.cells.clone();
+    target.window_cigar.windows = source.window_cigar.windows.clone();
+    let count = source.window_cigar.windows.len();
+    if count != 0 {
+        target.x_position_start = source.window_cigar.windows[0].x_start as u32;
+        target.x_position_end = source.window_cigar.windows[count - 1].x_end as u32;
+        target.y_position_start = source.window_cigar.windows[0].y_start as u32;
+        target.y_position_end = source.window_cigar.windows[count - 1].y_end as u32;
+    }
+    if target.x_position_start <= target.y_position_start {
+        target.y_position_start -= target.x_position_start;
+        target.x_position_start = 0;
+    } else {
+        target.x_position_start -= target.y_position_start;
+        target.y_position_start = 0;
+    }
+    let x_remainder = xl - target.x_position_end as i64 - 1;
+    let y_remainder = yl - target.y_position_end as i64 - 1;
+    if x_remainder <= y_remainder {
+        target.x_position_end = (xl - 1) as u32;
+        target.y_position_end += x_remainder as u32;
+    } else {
+        target.y_position_end = (yl - 1) as u32;
+        target.x_position_end += y_remainder as u32;
+    }
+}
+
+/// `cigar_gen_by_chain_adv` (`Correct.cpp` 17279): turn one overlap's
+/// consensus chain (`ch_a`) into per-piece alignments, retry the unmatched
+/// pieces with [`rechain_alignment_ul`], and write the final window cigar back
+/// into `region` (`z`).
+#[allow(clippy::too_many_arguments)]
+pub fn cigar_gen_by_chain_adv(
+    region: &mut OverlapRegion,
+    candidates: &mut CandidatesList,
+    chain_index: i64,
+    chain_count: i64,
+    overlaps: &mut Vec<UlOv>,
+    overlap_count: i64,
+    window_length: i64,
+    targets: &TargetSource<'_>,
+    query: &[u8],
+    extz: &mut BitExtz,
+    auxiliary: &mut OverlapRegion,
+    error_rate: f64,
+    query_length: i64,
+    h_kmer_hit: i64,
+) {
+    if overlap_count <= 0 {
+        return;
+    }
+    let target_total_length = targets.length(region.y_identifier as usize);
+
+    auxiliary.window_cigar.windows.clear();
+    auxiliary.window_cigar.cells.clear();
+    auxiliary.y_identifier = region.y_identifier;
+    auxiliary.y_strand = region.y_strand;
+    auxiliary.x_position_start = region.x_position_start;
+    auxiliary.x_position_end = region.x_position_end;
+    auxiliary.y_position_start = region.y_position_start;
+    auxiliary.y_position_end = region.y_position_end;
+
+    let entry_count;
+    {
+        let hits = &candidates.list[chain_index as usize..];
+        entry_count = fusion_chain_ovlp(
+            hits,
+            chain_count,
+            &mut overlaps[..overlap_count as usize],
+            overlap_count,
+            query_length,
+        );
+        for index in 0..entry_count as usize {
+            let bracket = ChainBracket {
+                qn: overlaps[index].qn,
+                tn: overlaps[index].tn,
+                qs: overlaps[index].qs,
+                qe: overlaps[index].qe,
+                ts: overlaps[index].ts,
+                te: overlaps[index].te,
+            };
+            ovlp_base_aln(
+                region,
+                hits,
+                chain_count,
+                &bracket,
+                window_length,
+                targets,
+                query,
+                extz,
+                &mut auxiliary.window_cigar,
+                error_rate,
+                query_length,
+                target_total_length,
+            );
+        }
+    }
+
+    let auxiliary_count = auxiliary.window_cigar.windows.len();
+    for index in 0..auxiliary_count {
+        if !is_unaligned_window(&auxiliary.window_cigar.windows[index]) {
+            continue;
+        }
+        rechain_alignment_ul(
+            region,
+            candidates,
+            &mut auxiliary.window_cigar,
+            index,
+            window_length,
+            targets,
+            query,
+            extz,
+            error_rate,
+            query_length,
+            target_total_length,
+            h_kmer_hit,
+        );
+    }
+
+    if auxiliary.window_cigar.windows.len() > auxiliary_count {
+        let mut write = 0usize;
+        for index in 0..auxiliary.window_cigar.windows.len() {
+            if index < auxiliary_count && is_unaligned_window(&auxiliary.window_cigar.windows[index]) {
+                continue;
+            }
+            auxiliary.window_cigar.windows[write] = auxiliary.window_cigar.windows[index];
+            write += 1;
+        }
+        auxiliary.window_cigar.windows.truncate(write);
+        auxiliary.window_cigar.windows.sort_by_key(|window| window.x_start);
+    }
+
+    update_overlap_region(region, auxiliary, query_length, target_total_length);
 }
