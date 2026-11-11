@@ -9,8 +9,8 @@
 //! `update_ovlp_src_bl` then symmetrises `bl` between the two directions.
 
 use crate::assembly::hit::ma_hit_to_arc;
+use crate::overlap::paf::PafHit;
 use crate::assembly::ul_store::{AllUl, UlReadVec};
-use crate::correction::ec_driver::PafList;
 use crate::reads::read_store::ReadStore;
 
 /// The `ug_opt_t` slice the source labelling consumes.
@@ -25,12 +25,12 @@ pub struct UlSourceOptions {
 /// reliable UL chains back onto the HiFi source overlaps.
 pub fn update_ovlp_src(
     store: &AllUl,
-    sources: &mut [PafList],
+    sources: &mut [Vec<PafHit>],
     reads: &ReadStore,
     options: &UlSourceOptions,
 ) {
     for read in sources.iter_mut() {
-        for hit in &mut read.hits {
+        for hit in read.iter_mut() {
             hit.block_length = 0;
         }
     }
@@ -58,7 +58,7 @@ fn determine_connective_backtrack(
     ul_read: &UlReadVec,
     block_index: u32,
     read_id: u32,
-    sources: &mut [PafList],
+    sources: &mut [Vec<PafHit>],
     reads: &ReadStore,
     options: &UlSourceOptions,
 ) {
@@ -88,9 +88,9 @@ fn determine_connective_backtrack(
         if (lk.te - lk.ts) >= reads.read_length(lk.hid as usize) as u32 {
             let lk_hid = lk_v >> 1;
             let mut hit_index = 0usize;
-            let hit_count = source.hits.len();
+            let hit_count = source.len();
             while hit_index < hit_count {
-                let hit = &source.hits[hit_index];
+                let hit = &source[hit_index];
                 if hit.query_identifier == li_hid && hit.target_identifier == lk_hid {
                     let (result, arc) = ma_hit_to_arc(
                         hit,
@@ -110,7 +110,7 @@ fn determine_connective_backtrack(
                 hit_index += 1;
             }
             if hit_index < hit_count {
-                source.hits[hit_index].block_length += 1;
+                source[hit_index].block_length += 1;
             }
         }
         lk_index = if lk.pidx == u32::MAX {
@@ -123,12 +123,12 @@ fn determine_connective_backtrack(
 
 /// `update_ovlp_src_bl` (`inter.cpp` 19976): make `bl` symmetric, so both
 /// directions of one HiFi overlap carry the same label (the sum).
-pub fn update_ovlp_src_bl(sources: &mut [PafList], reads: &ReadStore) {
+pub fn update_ovlp_src_bl(sources: &mut [Vec<PafHit>], reads: &ReadStore) {
     for read_id in 0..reads.total_reads as usize {
-        let hit_count = sources[read_id].hits.len();
+        let hit_count = sources[read_id].len();
         for hit_index in 0..hit_count {
             let (query, target, block_length) = {
-                let hit = &sources[read_id].hits[hit_index];
+                let hit = &sources[read_id][hit_index];
                 (hit.query_identifier, hit.target_identifier, hit.block_length)
             };
             if query > target {
@@ -136,15 +136,14 @@ pub fn update_ovlp_src_bl(sources: &mut [PafList], reads: &ReadStore) {
             }
             // `get_specific_overlap(&src[tn], tn, qn)`: the reverse hit.
             let reverse = sources[target as usize]
-                .hits
                 .iter()
                 .position(|hit| hit.query_identifier == target && hit.target_identifier == query);
             let Some(reverse_index) = reverse else {
                 continue;
             };
-            let sum = block_length + sources[target as usize].hits[reverse_index].block_length;
-            sources[read_id].hits[hit_index].block_length = sum;
-            sources[target as usize].hits[reverse_index].block_length = sum;
+            let sum = block_length + sources[target as usize][reverse_index].block_length;
+            sources[read_id][hit_index].block_length = sum;
+            sources[target as usize][reverse_index].block_length = sum;
         }
     }
 }

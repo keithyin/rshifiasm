@@ -7,7 +7,7 @@ use rshifiasm::assembly::hit::{
 };
 use rshifiasm::assembly::ul_index::{build_unitig_minimizer_index, dedup_hi_fis};
 use rshifiasm::command_line::options::AssemblyOptions;
-use rshifiasm::correction::ec_driver::PafList;
+use rshifiasm::overlap::paf::PafHit;
 
 #[test]
 #[ignore]
@@ -32,15 +32,7 @@ fn dedup_index_matches_the_reference_counts() {
     renew_graph_init(&mut forward, &mut reverse, &mut read_to_unitig);
     normalize_ma_hit_t_single_side_advance(&mut forward, false, None, 0);
     normalize_ma_hit_t_single_side_advance(&mut reverse, false, None, 0);
-    let sources: Vec<PafList> = forward
-        .into_iter()
-        .zip(forward_flags)
-        .map(|(hits, (is_fully_corrected, is_abnormal))| PafList {
-            hits,
-            is_fully_corrected,
-            is_abnormal,
-        })
-        .collect();
+    let sources: Vec<Vec<PafHit>> = forward;
     let index = dedup_hi_fis(&options, &reads, &sources, &lengths);
     let total_bases: u64 = index
         .unitig

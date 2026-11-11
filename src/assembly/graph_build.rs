@@ -176,12 +176,14 @@ pub struct InitialGraph {
     pub coverage_cut: Vec<CoverageCut>,
     pub bubble_label: BubbleLabel,
     pub coverage: i64,
+    /// `clean_contain_g`'s counters on the `--ul` path (`None` otherwise).
+    pub ultra_long_outcome: Option<crate::assembly::ul_consensus::CleanContainOutcome>,
 }
 
 /// `gen_init_sg`: prepares the overlaps and builds the first string graph.
 ///
-/// The reference's optional ultra-long (`all_ul_t`) input is `NULL` in the
-/// default configuration, so it is not accepted here.
+/// `ul` is the reference's optional ultra-long (`all_ul_t`) input: `None` on
+/// the default path, the scall output of `ul_load` on the `--ul` path.
 #[allow(clippy::too_many_arguments)]
 pub fn gen_init_sg(
     minimum_depth: i32,
@@ -194,8 +196,14 @@ pub fn gen_init_sg(
     minimum_overlap_length: i64,
     thread_count: i32,
     reads: &ReadStore,
-    options: &AssemblyOptions,
+    options: &mut AssemblyOptions,
+    mut ultra_long: Option<&mut crate::assembly::ul_store::AllUl>,
 ) -> InitialGraph {
+    let ul_occurrence = crate::assembly::ul_load::UL_COV_THRES;
+    // `if(ul) rescue_src_ul(src, n_read, UL_COV_THRES);`
+    if ultra_long.is_some() {
+        rescue_src_ul(sources, ul_occurrence);
+    }
     let mut coverage_cut =
         ma_hit_sub(minimum_depth, sources, read_lengths, minimum_overlap_length);
 
@@ -206,6 +214,9 @@ pub fn gen_init_sg(
         (options.maximum_overlap_divergence_final * 2.0) as f32,
         reads,
         options,
+        ultra_long
+            .as_ref()
+            .map(|ul| (&**ul, u64::from(ul_occurrence))),
     );
 
     ma_hit_cut(sources, read_lengths, minimum_overlap_length, &mut coverage_cut);
@@ -225,13 +236,25 @@ pub fn gen_init_sg(
         options.maximum_hang_rate,
     );
 
-    let mut graph = ma_sg_gen(
-        sources,
-        &coverage_cut,
-        maximum_hang,
-        minimum_overlap,
-        options.maximum_hang_rate,
-    );
+    let mut graph = if ultra_long.is_some() {
+        crate::assembly::ul_graph::ma_sg_gen_ul(
+            sources,
+            &coverage_cut,
+            read_to_unitig,
+            maximum_hang,
+            minimum_overlap,
+            options.maximum_hang_rate,
+            ul_occurrence,
+        )
+    } else {
+        ma_sg_gen(
+            sources,
+            &coverage_cut,
+            maximum_hang,
+            minimum_overlap,
+            options.maximum_hang_rate,
+        )
+    };
     if options.print_debug_gfa != 0 {
         // `if(asm_opt.prt_dbg_gfa) prt_dbg_gfa(sg, "raw", ...)`: a dump of the
         // raw unitig graph with sequences, taken before the transitive
@@ -247,7 +270,27 @@ pub fn gen_init_sg(
             minimum_overlap,
         );
     }
-    asg_arc_del_trans(&mut graph, gap_fuzz);
+    let mut ultra_long_outcome = None;
+    if let Some(ul_store) = ultra_long.as_deref_mut() {
+        // `gen_ug_opt_t(&uopt, src, NULL, ..., -1, -1, -1, -1, -1, ...)`
+        // `if(clean_contain_g(&uopt, sg, 0)) update_sg_uo(sg, src);`
+        let outcome = crate::assembly::ul_consensus::clean_contain_g(
+            options,
+            reads,
+            sources,
+            read_to_unitig,
+            ul_store,
+            &mut graph,
+            false,
+        );
+        if outcome.changed {
+            crate::assembly::ul_graph::update_sg_uo(&mut graph, sources);
+        }
+        crate::assembly::ul_graph::asg_arc_del_trans_ul(&mut graph, gap_fuzz);
+        ultra_long_outcome = Some(outcome);
+    } else {
+        asg_arc_del_trans(&mut graph, gap_fuzz);
+    }
 
     let threshold_count = thread_count.clamp(0, 10) as u32;
     let bubble_label = BubbleLabel::new(threshold_count, graph.sequences.len() as u32);
@@ -259,6 +302,22 @@ pub fn gen_init_sg(
         coverage_cut,
         bubble_label,
         coverage,
+        ultra_long_outcome,
+    }
+}
+
+/// `rescue_src_ul` (`Overlaps.cpp` 39189): revives the deleted overlaps that
+/// enough UL chains support (`bl >= occ`).
+fn rescue_src_ul(sources: &mut [Vec<PafHit>], occurrence: u32) {
+    for list in sources.iter_mut() {
+        for hit in list.iter_mut() {
+            if !hit.deleted {
+                continue;
+            }
+            if hit.block_length >= occurrence {
+                hit.deleted = false;
+            }
+        }
     }
 }
 
@@ -425,7 +484,7 @@ mod tests {
         let mut read_to_unitig = ReadToUnitig::new(2);
         read_to_unitig.reset();
         let reads = ReadStore::default();
-        let options = AssemblyOptions::default();
+        let mut options = AssemblyOptions::default();
 
         let initial = gen_init_sg(
             options.minimum_overlap_coverage,
@@ -438,7 +497,8 @@ mod tests {
             50,
             options.thread_count,
             &reads,
-            &options,
+            &mut options,
+            None,
         );
 
         assert_eq!(initial.graph.sequences.len(), 2);

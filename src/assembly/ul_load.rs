@@ -18,7 +18,7 @@ use crate::assembly::ul_scall::{
 use crate::assembly::ul_src::{update_ovlp_src, update_ovlp_src_bl, UlSourceOptions};
 use crate::assembly::ul_store::{gen_ul_vec_rid_t, load_all_ul_t, write_all_ul_t, AllUl};
 use crate::command_line::options::AssemblyOptions;
-use crate::correction::ec_driver::PafList;
+use crate::overlap::paf::PafHit;
 use crate::logging;
 use crate::reads::ReadStore;
 use crate::sequence::fastx_reader::FastxReader;
@@ -35,7 +35,7 @@ const P_CHAIN_RATE: f32 = 0.985;
 
 /// `print_ovlp_src_bl_stat` (`inter.cpp` 19527): the two statistics lines the
 /// reference prints after the source labelling.
-pub fn print_ovlp_src_bl_stat(store: &AllUl, reads: &ReadStore, sources: &[PafList]) {
+pub fn print_ovlp_src_bl_stat(store: &AllUl, reads: &ReadStore, sources: &[Vec<PafHit>]) {
     let mut covered = 0u64;
     let mut chained = 0u64;
     for read_id in 0..reads.total_reads as usize {
@@ -43,7 +43,7 @@ pub fn print_ovlp_src_bl_stat(store: &AllUl, reads: &ReadStore, sources: &[PafLi
             continue;
         }
         covered += 1;
-        if sources[read_id].hits.iter().any(|hit| hit.block_length != 0) {
+        if sources[read_id].iter().any(|hit| hit.block_length != 0) {
             chained += 1;
         }
     }
@@ -74,7 +74,7 @@ fn flush_chunk(
     buffers: &mut ScallBuffers,
     context: &ScallContext<'_>,
     parameters: &ScallParameters,
-    sources: &[PafList],
+    sources: &[Vec<PafHit>],
     read_lengths: &[u64],
 ) {
     for (name, sequence) in chunk {
@@ -108,7 +108,7 @@ fn flush_chunk(
 fn scall_ul_pipeline(
     options: &AssemblyOptions,
     reads: &ReadStore,
-    sources: &[PafList],
+    sources: &[Vec<PafHit>],
     parameters: &ScallParameters,
     index: &UlIndex,
     unitig_index: &UnitigMinimizerIndex,
@@ -210,7 +210,7 @@ fn scall_ul_pipeline(
 fn gen_ul_ovlps(
     options: &AssemblyOptions,
     reads: &ReadStore,
-    sources: &[PafList],
+    sources: &[Vec<PafHit>],
     parameters: &ScallParameters,
     cutoff: i64,
     store: &mut AllUl,
@@ -257,7 +257,7 @@ fn gen_ul_ovlps(
 pub fn ul_load(
     options: &mut AssemblyOptions,
     reads: &ReadStore,
-    sources: &mut [PafList],
+    sources: &mut [Vec<PafHit>],
 ) -> AllUl {
     eprintln!("[M::ul_load::] ==> UL");
     // `ha_opt_update_cov(&asm_opt, asm_opt.hom_cov)`, then the shared

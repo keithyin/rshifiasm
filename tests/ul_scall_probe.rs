@@ -11,7 +11,7 @@ use rshifiasm::assembly::ul_scall::{
     process_read, register_read, ScallBuffers, ScallContext, ScallParameters,
 };
 use rshifiasm::command_line::options::AssemblyOptions;
-use rshifiasm::correction::ec_driver::PafList;
+use rshifiasm::overlap::paf::PafHit;
 use rshifiasm::sequence::fastx_reader::FastxReader;
 
 #[test]
@@ -40,11 +40,7 @@ fn dump_read0_tk() {
     renew_graph_init(&mut forward, &mut reverse, &mut read_to_unitig);
     normalize_ma_hit_t_single_side_advance(&mut forward, false, None, 0);
     normalize_ma_hit_t_single_side_advance(&mut reverse, false, None, 0);
-    let sources: Vec<PafList> = forward
-        .into_iter()
-        .zip(forward_flags)
-        .map(|(hits, (f, a))| PafList { hits, is_fully_corrected: f, is_abnormal: a })
-        .collect();
+    let sources: Vec<Vec<PafHit>> = forward;
 
     let index = dedup_hi_fis(&options, &reads, &sources, &lengths);
     let mut index_options = options.clone();

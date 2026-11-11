@@ -9,6 +9,7 @@
 //! edit-distance alignment of the raw bases.
 
 use crate::alignment::banded_bpm::{reserve_banded_bpm, NO_ALIGNMENT_ERROR};
+use crate::assembly::ul_store::AllUl;
 use crate::assembly::hit::{delete_all_edges, CoverageCut, PRIMARY_LABEL};
 use crate::command_line::options::AssemblyOptions;
 use crate::correction::region::{adjust_threshold, determine_overlap_region, fill_subregion};
@@ -37,6 +38,7 @@ fn collect_sides(
     read_length: i64,
     max_left: &mut Side,
     max_right: &mut Side,
+    ultra_long: Option<(&AllUl, u64)>,
 ) {
     for hit in &sources[read_identifier] {
         if hit.deleted {
@@ -62,6 +64,35 @@ fn collect_sides(
             if query_end > max_right.end {
                 max_right.end = query_end;
             }
+        }
+    }
+
+    if let Some((ul, ul_thres)) = ultra_long {
+        // `collect_sides`'s UL half: only the UL blocks that cover the whole
+        // HiFi read (`ts == 0 && te == rLen`) count, and `ul_thres` of them
+        // declare both sides fully covered.
+        let mut covered = 0u64;
+        let start = ul.ridx.idx[read_identifier] as usize;
+        let end = ul.ridx.idx[read_identifier + 1] as usize;
+        for occurrence in &ul.ridx.occ[start..end] {
+            let ul_read = &ul.reads[(occurrence >> 32) as usize];
+            let block = &ul_read.bb[*occurrence as u32 as usize];
+            if block.base || !block.el {
+                continue;
+            }
+            // note here is ts && te, instead of qs && qe
+            if block.ts == 0 && block.te as u64 == read_length as u64 {
+                covered += 1;
+                if covered >= ul_thres {
+                    break;
+                }
+            }
+        }
+        if covered >= ul_thres {
+            max_left.start = 0;
+            max_left.end = read_length as u32;
+            max_right.start = 0;
+            max_right.end = read_length as u32;
         }
     }
 }
@@ -312,6 +343,7 @@ pub fn detect_chimeric_reads(
     shift_rate: f32,
     reads: &ReadStore,
     options: &AssemblyOptions,
+    ultra_long: Option<(&AllUl, u64)>,
 ) {
     let start_time = crate::logging::realtime_seconds();
     let read_count = sources.len();
@@ -332,7 +364,7 @@ pub fn detect_chimeric_reads(
             end: 0,
         };
 
-        collect_sides(i, sources, read_length, &mut max_left, &mut max_right);
+        collect_sides(i, sources, read_length, &mut max_left, &mut max_right, ultra_long);
 
         // No overlap anchored at one of the two ends: an end node, not a
         // chimera.
@@ -439,7 +471,7 @@ mod tests {
         ]];
         let mut max_left = Side { start: 100, end: 0 };
         let mut max_right = Side { start: 100, end: 0 };
-        collect_sides(0, &sources, 100, &mut max_left, &mut max_right);
+        collect_sides(0, &sources, 100, &mut max_left, &mut max_right, None);
         assert_eq!(max_left, Side { start: 0, end: 40 });
         assert_eq!(max_right, Side { start: 60, end: 100 });
     }
@@ -483,6 +515,7 @@ mod tests {
             0.06,
             &reads,
             &options,
+            None,
         );
 
         assert!(cuts[0].deleted);
@@ -515,6 +548,7 @@ mod tests {
             0.06,
             &reads,
             &options,
+            None,
         );
 
         // The whole-read overlap joins both sides, so read 0 stays.

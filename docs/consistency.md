@@ -2685,6 +2685,27 @@ C++ 39375/39384 位置（`drop_edges_by_trio` 后、`clean_weak_ma_hit_t` 前）
 `UL_INF` 快照逐字段一致。scall 的 `# bases` 恒为 0（参考只在 recorrect
 累计 `total_base`）。
 
+**`clean_contain_g` 共识簇（2026-11-12，已移植 `src/assembly/ul_consensus.rs`）**：
+`gen_init_sg` UL 分支接线完成：`rescue_src_ul`（39189）→ `ma_hit_sub` →
+`detect_chimeric_reads` UL 参数（`collect_sides` 的 UL 半段：`ridx` 中
+`ts==0 && te==rLen` 的整覆盖 UL 块 ≥`UL_COV_THRES` 时两侧视为全覆盖）→
+`ma_sg_gen_ul` → `clean_contain_g(&uopt, sg, 0)` → `update_sg_uo` →
+`asg_arc_del_trans_ul`。共识簇：`refine_contain_consensus_chain`（17640）、
+`collect_nc_ovlps`/`extract_nccov`（17784）、`linear_rchain_dp_adv`
+（17890，倒序 DP）、`gen_linear_rchains`、`gen_cns_chain_linear`（18037，
+(sc,sn,-ln) 字典序）、`gen_contain_consensus_chain`、
+`update_consensus_chain`（18212，idm 压缩重排）、`clean_contain_g0`/
+`clean_contained_chg`（21724/19937）；`repush_contain_trans_archs`/
+`asg_arc_push_contain_trans`（21844/21742，绝对索引 swap 窗口语义逐字
+复刻——最终 asg_cleanup 按弧多重集重建，窗口别名行为保真）。跳过死代码
+`dedup_contain_g` 簇（全部调用点被注释）。两个关键语义陷阱：`--ul-rate`
+默认 0.2（`infer_rovlp(ug=NULL)` 用 R_INF 全长而非 coverage-cut 图长）；
+`gconnect_test` 读 `arc.ol` 字段（Rust `overlap`）而非 `asg_arc_len(ul)`
+（后者是 `srcLen-ol` 距离）。门禁：`ul_load_golden` 扩展——
+`work_ul_gchains_consensus` try:152/done:122、`clean_contain_g0`
+discard:47、共识后 `UL_INF` 与 C++ 探针 dump（`/tmp/ul_consensus_probe.cpp`
+globalize 静态符号后链接）逐读逐块一致。
+
 ## 仍未迁移的分支
 
 - `--ul`（超长读整合，ul 路径，parse 期显式拒绝）。合成数据门禁与完整

@@ -236,9 +236,7 @@ pub fn build_string_graph_without_clean(
     // sources are round-tripped through it.
     let mut ultra_long = None;
     if options.ultra_long_read_files.is_some() {
-        let mut lists = join_paf_lists(std::mem::take(&mut forward), forward_flags.clone());
-        ultra_long = Some(crate::assembly::ul_load::ul_load(options, reads, &mut lists));
-        forward = split_paf_lists(lists).0;
+        ultra_long = Some(crate::assembly::ul_load::ul_load(options, reads, &mut forward));
     }
     // `if(!(asm_opt.is_ont)) clean_weak_ma_hit_t(...)`: the ONT chemical mask
     // already replaced the weak-overlap filter; with UL the threshold is
@@ -280,6 +278,7 @@ pub fn build_string_graph_without_clean(
         options.thread_count,
         reads,
         options,
+        ultra_long.as_mut(),
     );
 
     // The cast of the corrected overlaps is over; the later stages only read

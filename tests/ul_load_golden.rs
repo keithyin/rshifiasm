@@ -1,10 +1,13 @@
-//! Golden replay of the whole `ul_load` orchestration against the reference
-//! `--ul` run: the dedup index, the `.uidx.bin` cache (byte-compared), the
-//! scall pass, the `.ul.ovlp.bin` cache and the `bl` labelling statistics.
+//! Golden replay of the `--ul` first pass against the reference run: the
+//! `ul_load` orchestration (scall, `.uidx.bin` cache, `bl` labelling) and the
+//! `gen_init_sg` UL branch (contained-read consensus cleanup).
 //!
 //! Requires `/tmp/ulref.uidx.bin` (the reference unitig index), `/tmp/ul.fq`
-//! (the synthetic UL reads) and `reference/ul.ul.ovlp.bin` (the reference's
-//! `UL_INF` snapshot). Ignored by default.
+//! (the synthetic UL reads), `reference/ul.ul.ovlp.bin` (the reference's
+//! post-scall `UL_INF` snapshot) and `/tmp/ul_consensus_after.txt` (the C++
+//! probe's post-consensus `UL_INF` dump, written by
+//! `g++ -O1 -I /home/keith/projects/hifiasm /tmp/ul_consensus_probe.cpp`).
+//! Ignored by default.
 
 use rshifiasm::assembly::hit::{
     normalize_ma_hit_t_single_side_advance, renew_graph_init, try_rescue_overlaps, ReadToUnitig,
@@ -12,7 +15,6 @@ use rshifiasm::assembly::hit::{
 use rshifiasm::assembly::read_cache;
 use rshifiasm::assembly::ul_load::{ul_load, UL_COV_THRES};
 use rshifiasm::command_line::options::{AssemblyOptions, FileList, MINIMUM_CHAIN_COUNT};
-use rshifiasm::correction::ec_driver::PafList;
 
 const REFERENCE_PREFIX: &str = "/tmp/ulref";
 const SCRATCH_PREFIX: &str = "/tmp/ulout";
@@ -54,9 +56,7 @@ fn compare_uidx(actual: &[u8], expected: &[u8]) -> Option<usize> {
         for bucket in 0..bucket_count {
             let start = *cursor;
             *cursor += bucket_bytes;
-            if is_used(bucket)
-                && actual[start..*cursor] != expected[start..*cursor]
-            {
+            if is_used(bucket) && actual[start..*cursor] != expected[start..*cursor] {
                 return Some(start);
             }
         }
@@ -83,19 +83,51 @@ fn compare_uidx(actual: &[u8], expected: &[u8]) -> Option<usize> {
     None
 }
 
-fn source_lists(
-    forward: Vec<Vec<rshifiasm::overlap::paf::PafHit>>,
-    forward_flags: Vec<(bool, u8)>,
-) -> Vec<PafList> {
-    forward
-        .into_iter()
-        .zip(forward_flags)
-        .map(|(hits, (is_fully_corrected, is_abnormal))| PafList {
-            hits,
-            is_fully_corrected,
-            is_abnormal,
-        })
-        .collect()
+/// Asserts `store` matches one `R` line of the C++ probe's dump.
+fn assert_matches_dump(store: &rshifiasm::assembly::ul_store::AllUl, dump_path: &str) {
+    let dump = std::fs::read_to_string(dump_path)
+        .unwrap_or_else(|error| panic!("{dump_path} must be present: {error}"));
+    let mut lines = dump.lines();
+    for (read_id, read) in store.reads.iter().enumerate() {
+        let line = lines.next().expect("the dump must cover every read");
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(fields[0], "R");
+        assert_eq!(fields[1], read_id.to_string());
+        assert_eq!(fields[2], read.rlen.to_string(), "rlen at read {}", read_id);
+        assert_eq!(fields[3], read.dd.to_string(), "dd at read {}", read_id);
+        let block_count: usize = fields[4].parse().unwrap();
+        assert_eq!(
+            block_count,
+            read.bb.len(),
+            "block count at read {}",
+            read_id
+        );
+        for (block_index, block) in fields[5..5 + block_count].iter().enumerate() {
+            let values: Vec<u64> = block.split(':').map(|v| v.parse().unwrap()).collect();
+            let actual = &read.bb[block_index];
+            let expected = [
+                actual.hid as u64,
+                actual.qs as u64,
+                actual.qe as u64,
+                actual.ts as u64,
+                actual.te as u64,
+                actual.pidx as u64,
+                actual.pdis as u64,
+                actual.aidx as u64,
+                actual.pchain as u64,
+                u64::from(actual.rev),
+                u64::from(actual.base),
+                u64::from(actual.el),
+            ];
+            assert_eq!(
+                values.as_slice(),
+                &expected[..],
+                "block {} of read {}",
+                block_index,
+                read_id
+            );
+        }
+    }
 }
 
 #[test]
@@ -119,7 +151,6 @@ fn ul_load_reproduces_the_reference_first_pass() {
     // `ha_opt_update_cov_min` at the head of `build_string_graph_without_clean`.
     options.update_coverage_with_minimum(options.homozygous_coverage, MINIMUM_CHAIN_COUNT);
 
-    let _lengths: Vec<u64> = reads.read_lengths.clone();
     let mut read_to_unitig = ReadToUnitig::new(reads.total_reads as usize);
     let (mut forward, forward_flags): (Vec<Vec<_>>, Vec<_>) = state
         .forward
@@ -136,10 +167,9 @@ fn ul_load_reproduces_the_reference_first_pass() {
     normalize_ma_hit_t_single_side_advance(&mut forward, false, None, 0);
     normalize_ma_hit_t_single_side_advance(&mut reverse, false, None, 0);
 
-    let mut lists = source_lists(forward, forward_flags);
-    let store = ul_load(&mut options, &reads, &mut lists);
-    let _ = read_to_unitig;
-    let _ = UL_COV_THRES;
+    let mut lists = forward;
+    let _ = forward_flags;
+    let mut store = ul_load(&mut options, &reads, &mut lists);
 
     // `print_ovlp_src_bl_stat`'s two lines, recomputed from the labelled
     // sources: 5626/1184/1028 and 739/736/2/1 in the reference run.
@@ -150,7 +180,7 @@ fn ul_load_reproduces_the_reference_first_pass() {
             continue;
         }
         covered += 1;
-        if lists[read_id].hits.iter().any(|hit| hit.block_length != 0) {
+        if lists[read_id].iter().any(|hit| hit.block_length != 0) {
             chained += 1;
         }
     }
@@ -184,13 +214,11 @@ fn ul_load_reproduces_the_reference_first_pass() {
         .expect("the reference UL cache must exist");
     assert_eq!(reference.nid.len(), store.nid.len(), "UL read count");
     for (index, (expected, actual)) in reference.nid.iter().zip(store.nid.iter()).enumerate() {
-        assert_eq!(
-            expected, actual,
-            "UL read name mismatch at {}",
-            index
-        );
+        assert_eq!(expected, actual, "UL read name mismatch at {}", index);
     }
-    for (index, (expected, actual)) in reference.reads.iter().zip(store.reads.iter()).enumerate() {
+    for (index, (expected, actual)) in
+        reference.reads.iter().zip(store.reads.iter()).enumerate()
+    {
         assert_eq!(expected.rlen, actual.rlen, "rlen mismatch at {}", index);
         assert_eq!(expected.dd, actual.dd, "dd mismatch at {}", index);
         assert_eq!(
@@ -209,6 +237,33 @@ fn ul_load_reproduces_the_reference_first_pass() {
             );
         }
     }
+
+    // `gen_init_sg`'s UL branch (`Overlaps.cpp` 39394): the whole first graph
+    // pass, whose contained cleanup must match the reference log anchors
+    // (try:152/done:122 and discard:47) and the C++ probe's post-consensus
+    // dump.
+    let initial = rshifiasm::assembly::graph_build::gen_init_sg(
+        options.minimum_overlap_coverage,
+        &mut lists,
+        &reads.read_lengths,
+        &mut read_to_unitig,
+        options.maximum_hang_length,
+        options.minimum_overlap_length,
+        options.gap_fuzz,
+        i64::from(options.minimum_overlap_length),
+        options.thread_count,
+        &reads,
+        &mut options,
+        Some(&mut store),
+    );
+    let outcome = initial
+        .ultra_long_outcome
+        .expect("the UL branch must run the contained cleanup");
+    assert_eq!(outcome.tried, 152, "work_ul_gchains_consensus # try");
+    assert_eq!(outcome.corrected, 122, "work_ul_gchains_consensus # done");
+    assert_eq!(outcome.discarded, 47, "clean_contain_g0 # discard cread");
+    assert_matches_dump(&store, "/tmp/ul_consensus_after.txt");
+    let _ = UL_COV_THRES;
 
     for suffix in [".uidx.bin", ".ul.ovlp.bin"] {
         let _ = std::fs::remove_file(format!("{}{}", SCRATCH_PREFIX, suffix));

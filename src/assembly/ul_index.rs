@@ -33,7 +33,7 @@ use crate::assembly::ul::{UtgRid, UtgRidDt};
 use crate::assembly::unitig::{ma_ug_gen, UnitigGraph};
 use crate::command_line::options::{AssemblyOptions, FLAG_NO_HPC};
 use crate::container::ksort::{radix_sort_by_key_32, radix_sort_u64};
-use crate::correction::ec_driver::PafList;
+
 use crate::correction::target::unitig_sub_region;
 use crate::counting::filter_table::KmerFilterTable;
 use crate::counting::kmer_counter::{
@@ -97,7 +97,7 @@ struct IndexContext<'a> {
     /// `R_INF` read lengths.
     read_lengths: &'a [u64],
     /// `uopt->sources`.
-    sources: &'a [PafList],
+    sources: &'a [Vec<PafHit>],
     /// `uopt->min_ovlp`, an `int64_t` in the reference.
     minimum_overlap: i64,
     /// `uopt->max_hang`, an `int64_t` in the reference.
@@ -105,7 +105,7 @@ struct IndexContext<'a> {
 }
 
 impl<'a> IndexContext<'a> {
-    fn new(options: &'a AssemblyOptions, read_lengths: &'a [u64], sources: &'a [PafList]) -> Self {
+    fn new(options: &'a AssemblyOptions, read_lengths: &'a [u64], sources: &'a [Vec<PafHit>]) -> Self {
         Self {
             options,
             read_lengths,
@@ -136,8 +136,8 @@ impl<'a> IndexContext<'a> {
 
 /// `get_specific_overlap` (`Overlaps.cpp` 1075): the mirror entry of `qn -> tn`
 /// inside `tn`'s overlap list.
-fn get_specific_overlap(list: &PafList, qn: u32, tn: u32) -> Option<usize> {
-    list.hits
+fn get_specific_overlap(list: &[PafHit], qn: u32, tn: u32) -> Option<usize> {
+    list
         .iter()
         .position(|hit| hit.target_identifier == tn && hit.query_identifier == qn)
 }
@@ -212,7 +212,7 @@ fn ul_contain_gen(
         for &read in &unitig.reads {
             let i = (read >> 33) as usize;
             let orientation = (read >> 32) & 1;
-            for hit in &ctx.sources[i].hits {
+            for hit in &ctx.sources[i] {
                 if is_el && !hit.exact_region {
                     continue;
                 }
@@ -343,7 +343,7 @@ fn gen_r_contain(
     let mut cc: Vec<Vec<u32>> = ctx
         .sources
         .iter()
-        .map(|list| vec![0u32; list.hits.len()])
+        .map(|list| vec![0u32; list.len()])
         .collect();
 
     for i in 0..n_read {
@@ -351,7 +351,7 @@ fn gen_r_contain(
         if rg.sequences[i].deleted {
             continue;
         }
-        for hit in &ctx.sources[i].hits {
+        for hit in &ctx.sources[i] {
             if is_el && !hit.exact_region {
                 continue;
             }
@@ -407,12 +407,12 @@ fn read_contain_first_pass(
 ) {
     let begin = coverage.idx[i] as usize;
     let a_n = (coverage.idx[i + 1] - coverage.idx[i]) as usize;
-    for z in 0..ctx.sources[i].hits.len() {
+    for z in 0..ctx.sources[i].len() {
         cc[i][z] = 0;
         if a_n == 0 || rg.sequences[i].deleted {
             continue;
         }
-        let hit = ctx.sources[i].hits[z];
+        let hit = ctx.sources[i][z];
         let qn = hit.query_identifier;
         let tn = hit.target_identifier;
         if qn > tn {
@@ -471,7 +471,7 @@ fn read_contain_first_pass(
 fn read_contain_second_pass(
     coverage: &mut UCov,
     cc: &mut [Vec<u32>],
-    sources: &[PafList],
+    sources: &[Vec<PafHit>],
     i: usize,
 ) {
     let begin = coverage.idx[i] as usize;
@@ -488,8 +488,8 @@ fn read_contain_second_pass(
         coverage.interval[k] = coordinate.wrapping_add(depth);
     }
 
-    for z in 0..sources[i].hits.len() {
-        let hit = sources[i].hits[z];
+    for z in 0..sources[i].len() {
+        let hit = sources[i][z];
         let qn = hit.query_identifier;
         let tn = hit.target_identifier;
         if qn > tn {
@@ -537,8 +537,8 @@ fn update_ug_uo_t(
         let neighbour = w >> 1;
         let list = &ctx.sources[read as usize];
         let mut found = false;
-        for k in 0..list.hits.len() {
-            let hit = list.hits[k];
+        for k in 0..list.len() {
+            let hit = list[k];
             if hit.query_identifier == read && hit.target_identifier == neighbour {
                 let (r, t) = ctx.hit_to_arc(
                     &hit,
@@ -589,7 +589,7 @@ fn get_ug_edge_src<'a>(
         target.start
     };
     let list = &ctx.sources[(v >> 1) as usize];
-    for hit in &list.hits {
+    for hit in list.iter() {
         if hit.query_identifier == (v >> 1) && hit.target_identifier == (w >> 1) {
             let (r, t) = ctx.hit_to_arc(
                 hit,
@@ -662,7 +662,7 @@ fn append_inexact_phase(
     inserted: &mut u64,
 ) {
     let list = &ctx.sources[(v >> 1) as usize];
-    for hit in &list.hits {
+    for hit in list.iter() {
         if hit.exact_region {
             // we just need inexact edges
             continue;
@@ -843,7 +843,7 @@ pub fn gen_r_ug_idx_with_contain(
 pub fn dedup_hi_fis(
     options: &AssemblyOptions,
     reads: &ReadStore,
-    sources: &[PafList],
+    sources: &[Vec<PafHit>],
     read_lengths: &[u64],
 ) -> UlIndex {
     // `dedup_HiFis(sl->uopt, 1, 0)`.
@@ -865,7 +865,7 @@ pub fn dedup_hi_fis(
         if rg.sequences[i].deleted {
             continue;
         }
-        for hit in &sources[i].hits {
+        for hit in &sources[i] {
             if is_el && !hit.exact_region {
                 continue;
             }
@@ -903,7 +903,7 @@ pub fn dedup_hi_fis(
             cc_num += 1;
             continue;
         }
-        for hit in &sources[i].hits {
+        for hit in &sources[i] {
             if is_el && !hit.exact_region {
                 continue;
             }
@@ -1285,13 +1285,13 @@ mod tests {
     #[test]
     fn contained_read_is_dropped_and_all_indices_are_built() {
         let lengths = [1000u64, 1000, 300];
-        let mut lists = vec![PafList::default(); 3];
+        let mut lists: Vec<Vec<PafHit>> = vec![Vec::new(); 3];
         // A dovetail between read 0 and read 1, stored from both sides.
-        lists[0].hits.push(hit(0, 800, 1000, 1, 0, 200, false));
-        lists[1].hits.push(hit(1, 0, 200, 0, 800, 1000, false));
+        lists[0].push(hit(0, 800, 1000, 1, 0, 200, false));
+        lists[1].push(hit(1, 0, 200, 0, 800, 1000, false));
         // Read 2 (300 bp) sits inside read 0 at 200..500.
-        lists[0].hits.push(hit(0, 200, 500, 2, 0, 300, false));
-        lists[2].hits.push(hit(2, 0, 300, 0, 200, 500, false));
+        lists[0].push(hit(0, 200, 500, 2, 0, 300, false));
+        lists[2].push(hit(2, 0, 300, 0, 200, 500, false));
 
         let mut reads = ReadStore::default();
         reads.read_lengths = lengths.to_vec();
@@ -1355,24 +1355,24 @@ mod tests {
     #[test]
     fn inexact_edges_are_reinserted_between_unitig_ends() {
         let lengths = [1000u64, 1000, 1000, 1000];
-        let mut lists = vec![PafList::default(); 4];
+        let mut lists: Vec<Vec<PafHit>> = vec![Vec::new(); 4];
 
-        fn link(lists: &mut [PafList], exact: bool, a: u32, b: u32) {
+        fn link(lists: &mut [Vec<PafHit>], exact: bool, a: u32, b: u32) {
             let mut forward = hit(a, 800, 1000, b, 0, 200, false);
             forward.exact_region = exact;
             forward.exact_region_byte = u8::from(exact);
             let mut reverse = hit(b, 0, 200, a, 800, 1000, false);
             reverse.exact_region = exact;
             reverse.exact_region_byte = u8::from(exact);
-            lists[a as usize].hits.push(forward);
-            lists[b as usize].hits.push(reverse);
+            lists[a as usize].push(forward);
+            lists[b as usize].push(reverse);
         }
 
         // A -> B exactly, B -> C and A -> D only inexactly.
         let mut a_to_b = hit(0, 800, 1000, 1, 0, 200, false);
         a_to_b.exact_region = true;
-        lists[0].hits.push(a_to_b);
-        lists[1].hits.push(hit(1, 0, 200, 0, 800, 1000, false));
+        lists[0].push(a_to_b);
+        lists[1].push(hit(1, 0, 200, 0, 800, 1000, false));
         link(&mut lists, false, 1, 2);
         link(&mut lists, false, 0, 3);
 

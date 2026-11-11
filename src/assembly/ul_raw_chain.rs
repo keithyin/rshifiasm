@@ -19,7 +19,7 @@
 
 use crate::assembly::asg::MaUtg;
 use crate::assembly::ul::{infer_rovlp_reads, UlOv};
-use crate::correction::ec_driver::PafList;
+use crate::overlap::paf::PafHit;
 use crate::correction::rphase::SEC_MODE;
 use crate::correction::ul_align::{
     gen_err_unaligned, get_rid_backward_cigar_err, Rtrace, RtraceIter,
@@ -55,7 +55,7 @@ fn rch_connect(x: i32, i: i64) -> bool {
 #[derive(Clone, Copy)]
 pub struct UlGraphOptions<'a> {
     /// `uopt->sources`: the forward overlap lists of the HiFi reads.
-    pub sources: &'a [PafList],
+    pub sources: &'a [Vec<PafHit>],
     /// `uopt->min_ovlp`.
     pub minimum_overlap: i32,
     /// `uopt->max_hang`.
@@ -98,7 +98,7 @@ pub(crate) fn get_ecov_contain_adv(
         *flag = false;
     }
     let source = &options.sources[x];
-    for hit in source.hits.iter().take(source.hits.len()) {
+    for hit in source.iter().take(source.len()) {
         let qn = hit.query_identifier;
         let tn = hit.target_identifier;
         if tn != w >> 1 {
@@ -163,7 +163,7 @@ pub(crate) fn max_ovlp_src(
     let mut longest = 0i64;
     let x = (v >> 1) as usize;
     let source = &options.sources[x];
-    for hit in source.hits.iter().take(source.hits.len()) {
+    for hit in source.iter().take(source.len()) {
         let (result, arc) = ma_hit_to_arc(
             hit,
             reads.read_length(hit.query_identifier as usize) as i32,
@@ -195,7 +195,7 @@ pub(crate) fn max_ovlp_src_contain(
     let mut longest: i64 = 0;
     let x = (v >> 1) as usize;
     let source = &options.sources[x];
-    for hit in source.hits.iter().take(source.hits.len()) {
+    for hit in source.iter().take(source.len()) {
         let qn = hit.query_identifier;
         let tn = hit.target_identifier;
         let (result, arc) = ma_hit_to_arc(

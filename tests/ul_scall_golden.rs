@@ -60,7 +60,7 @@ fn scall_pass_reproduces_the_reference_ul_overlaps() {
     renew_graph_init(&mut forward, &mut reverse, &mut read_to_unitig);
     normalize_ma_hit_t_single_side_advance(&mut forward, false, None, 0);
     normalize_ma_hit_t_single_side_advance(&mut reverse, false, None, 0);
-    let sources = source_lists(forward, forward_flags, reverse, reverse_flags);
+    let sources = forward;
 
     let index = dedup_hi_fis(&options, &reads, &sources, &lengths);
     assert_eq!(index.unitig.unitigs.len(), 575);

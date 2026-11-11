@@ -14,7 +14,7 @@ use std::path::Path;
 use crate::assembly::asg::AsgArc;
 use crate::assembly::hit::ma_hit_to_arc;
 use crate::assembly::ul::{UcBlock, UlOv};
-use crate::correction::ec_driver::PafList;
+use crate::overlap::paf::PafHit;
 use crate::correction::rphase::SEC_MODE;
 
 /// `UL_FLANK` (`Process_Read.cpp` 11).
@@ -119,7 +119,7 @@ fn encode_base(dest: &mut [u8], src: &[u8], n_site: &mut Vec<u32>, offset: u32) 
 /// The parameters [`append_ul_t`] reads from `ug_opt_t` and `All_reads`.
 pub struct AppendParameters<'a> {
     /// `uopt->sources`.
-    pub sources: &'a [PafList],
+    pub sources: &'a [Vec<PafHit>],
     /// `Get_READ_LENGTH(R_INF, rid)`.
     pub read_lengths: &'a [u64],
     /// `asm_opt.max_hang_rate`.
@@ -139,7 +139,7 @@ pub struct AppendParameters<'a> {
 fn determine_chain_distance(
     overlaps: &[UlOv],
     blocks: &mut [UcBlock],
-    sources: &[PafList],
+    sources: &[Vec<PafHit>],
     read_lengths: &[u64],
     maximum_hang: i64,
     minimum_overlap: i64,
@@ -186,7 +186,7 @@ fn determine_chain_distance(
 
             let mut found = false;
             if let Some(list) = sources.get(query as usize) {
-                for hit in &list.hits {
+                for hit in list {
                     if hit.query_identifier == query && hit.target_identifier == target {
                         let query_length = read_lengths[query as usize] as i32;
                         let target_length = read_lengths[target as usize] as i32;
@@ -670,7 +670,7 @@ mod tests {
         let mut store = AllUl::new();
         let sequence = b"ACGTACGTAC";
         let mut overlaps: Vec<UlOv> = Vec::new();
-        let sources: Vec<PafList> = Vec::new();
+        let sources: Vec<Vec<PafHit>> = Vec::new();
         let lengths = [10u64];
         let parameters = AppendParameters {
             sources: &sources,

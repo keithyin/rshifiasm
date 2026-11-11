@@ -12,12 +12,12 @@ use crate::assembly::ul_index::{UlContain, UnitigMinimizerIndex};
 use crate::assembly::ul_raw_chain::{gen_rid_raw_chain, GlChain, UlGraphOptions};
 use crate::assembly::ul_store::{append_ul_t, AllUl, AppendParameters};
 use crate::assembly::asg::MaUtg;
-use crate::correction::ec_driver::PafList;
 use crate::correction::hc_align::BitExtz;
 use crate::correction::target::TargetSource;
 use crate::correction::ul_align::{
     gen_aux_ovlp, ul_map_lchain, ul_rid_lalign_adv, UlAlignParameters, UlLocalAlignment,
 };
+use crate::overlap::paf::PafHit;
 use crate::overlap::region::{CandidatesList, OverlapRegion};
 use crate::reads::read_store::ReadStore;
 
@@ -70,7 +70,7 @@ pub struct ScallContext<'a> {
     /// `R_INF`.
     pub reads: &'a ReadStore,
     /// `uopt->sources`.
-    pub sources: &'a [PafList],
+    pub sources: &'a [Vec<PafHit>],
     /// `asm_opt.mz_sample_dist`.
     pub sample_distance: i32,
     /// `asm_opt.mz_rewin`.
@@ -102,7 +102,7 @@ pub struct ScallBuffers {
 
 fn append_parameters<'a>(
     parameters: &ScallParameters,
-    sources: &'a [PafList],
+    sources: &'a [Vec<PafHit>],
     read_lengths: &'a [u64],
 ) -> AppendParameters<'a> {
     AppendParameters {
@@ -121,7 +121,7 @@ pub fn register_read(
     sequence: &[u8],
     buffers: &mut ScallBuffers,
     parameters: &ScallParameters,
-    sources: &[PafList],
+    sources: &[Vec<PafHit>],
     read_lengths: &[u64],
 ) {
     let append = append_parameters(parameters, sources, read_lengths);
@@ -440,7 +440,7 @@ pub fn push_blocks(
     store: &mut AllUl,
     buffers: &mut ScallBuffers,
     parameters: &ScallParameters,
-    sources: &[PafList],
+    sources: &[Vec<PafHit>],
     read_lengths: &[u64],
     read_id_base: usize,
 ) {

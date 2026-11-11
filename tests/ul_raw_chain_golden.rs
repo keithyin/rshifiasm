@@ -12,7 +12,7 @@ use rshifiasm::assembly::ul::{UlOv, MAX_SEC_ERR};
 use rshifiasm::assembly::ul_raw_chain::{
     gen_rid_raw_chain, GlChain, UlGraphOptions,
 };
-use rshifiasm::correction::ec_driver::PafList;
+use rshifiasm::overlap::paf::PafHit;
 use rshifiasm::correction::hc_align::BitExtz;
 use rshifiasm::correction::target::TargetSource;
 use rshifiasm::correction::ul_align::Rtrace;
@@ -157,14 +157,10 @@ fn raw_chain_replays_the_reference_read_zero() {
     let (reads, state) =
         rshifiasm::assembly::read_cache::load_all_data_from_disk(&mut options)
             .expect("the reference caches must load");
-    let sources: Vec<PafList> = state
+    let sources: Vec<Vec<PafHit>> = state
         .forward
         .iter()
-        .map(|list| PafList {
-            hits: list.hits.clone(),
-            is_fully_corrected: list.is_fully_corrected,
-            is_abnormal: list.is_abnormal,
-        })
+        .map(|list| list.hits.clone())
         .collect();
     let graph_options = UlGraphOptions {
         sources: &sources,
