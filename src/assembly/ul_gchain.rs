@@ -37,7 +37,7 @@ const UG_SKIP_GRAPH_N: i64 = 72;
 /// `G_CHAIN_BW` (`inter.h`).
 const G_CHAIN_BW: i64 = 16;
 /// `G_CHAIN_INDEL` (`inter.h`).
-const G_CHAIN_INDEL: i64 = 100;
+const G_CHAIN_INDEL: i64 = 128;
 /// `P_CHAIN_COV` (`inter.h`).
 const P_CHAIN_COV: f64 = 0.985;
 /// `N_GCHAIN_RATE` (`inter.h`).

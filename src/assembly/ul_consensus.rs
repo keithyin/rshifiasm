@@ -37,7 +37,7 @@ const UG_ITER_N: i64 = 5000;
 /// `UG_DIS_N` (`inter.h`).
 const UG_DIS_N: i64 = 50000;
 /// `G_CHAIN_INDEL` (`inter.h`).
-const G_CHAIN_INDEL: i64 = 100;
+const G_CHAIN_INDEL: i64 = 128;
 
 fn is_rg_connect(graph: &Asg, v: u32, w: u32) -> bool {
     let (start, count) = graph.arc_range(v);
