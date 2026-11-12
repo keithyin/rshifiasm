@@ -44,6 +44,7 @@ pub mod ul_renew;
 pub mod ul_renew_ng;
 pub mod ul_renew_gfa;
 pub mod ul2ul;
+pub mod ulg_clean;
 pub mod ul_binning;
 pub mod ul_integer;
 pub mod ul_load;
