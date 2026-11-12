@@ -671,9 +671,9 @@ pub fn renew_ng(
 /// coverage cuts and re-runs the containment pass.
 #[allow(clippy::too_many_arguments)]
 pub fn renew_r_to_u(
-    sources: &mut [Vec<PafHit>],
+    sources: &mut [PafList],
     flags: &mut [()],
-    reverse_sources: &mut [Vec<PafHit>],
+    reverse_sources: &mut [PafList],
     reverse_flags: &mut [()],
     coverage_cut: &mut [CoverageCut],
     read_to_unitig: &mut ReadToUnitig,
@@ -681,25 +681,38 @@ pub fn renew_r_to_u(
     min_ovlp: i32,
     reads: &crate::reads::ReadStore,
 ) {
+    // `clear_ma_hit_t_alloc`: clears the `del` flag of every stored hit
+    // (the lists survive); `reset_ma_sub_t` with `g == NULL` clears the cut
+    // deletions.
     for list in sources.iter_mut() {
-        list.clear();
+        for hit in list.hits.iter_mut() {
+            hit.deleted = false;
+        }
     }
     for list in reverse_sources.iter_mut() {
-        list.clear();
+        for hit in list.hits.iter_mut() {
+            hit.deleted = false;
+        }
     }
     for cut in coverage_cut.iter_mut() {
-        cut.start = 0;
-        cut.end = 0;
+        cut.deleted = false;
     }
     let _ = (flags, reads);
+    let mut forward: Vec<Vec<PafHit>> = sources
+        .iter()
+        .map(|list| list.hits.clone())
+        .collect();
     crate::assembly::hit::ma_hit_contained_advance(
-        sources,
+        &mut forward,
         coverage_cut,
         read_to_unitig,
         max_hang,
         min_ovlp,
         1.0,
     );
+    for (list, hits) in sources.iter_mut().zip(forward) {
+        list.hits = hits;
+    }
 }
 
 /// `AllUl` keeps the UL read names; the reference's `UL_INF` access inside
@@ -1228,4 +1241,328 @@ pub fn realloc_rdb_adv(
     *read_to_unitig = crate::assembly::hit::ReadToUnitig::from_entries(vec![u32::MAX; rid_n]);
     b_mask.reset(ng.sequences.len(), 0, 0);
     eprintln!("-[M::realloc_rdb_adv] rid_n0::{}, rid_n::{}", rid_n0, rid_n);
+}
+
+/// `shrink_1b` (`gfa_ut.cpp` 7837): trims one base off a full-length end
+/// block when the neighbour still dominates it.
+pub fn shrink_1b(
+    ug: &UnitigGraph,
+    reads: &crate::reads::ReadStore,
+    z: &mut crate::assembly::ul::UcBlock,
+    lim: Option<&crate::assembly::ul::UcBlock>,
+    is_forward: bool,
+) {
+    if z.ts != 0 || z.te != ug.graph.sequences[z.hid as usize].length {
+        return;
+    }
+    let bc = *z;
+    if z.ts + 1 < z.te && z.qs + 1 < z.qe {
+        let off = crate::assembly::ul::get_offset_adjust(1, z.te - z.ts, z.qe - z.qs);
+        if is_forward {
+            if !z.rev {
+                z.ts += 1;
+                z.qs += off;
+            } else {
+                z.te -= 1;
+                z.qs += off;
+            }
+            if let Some(lim) = lim {
+                if !(z.qs <= lim.qs && z.qe <= lim.qe) {
+                    *z = bc;
+                }
+            }
+        } else {
+            if !z.rev {
+                z.te -= 1;
+                z.qe -= off;
+            } else {
+                z.ts += 1;
+                z.qe -= off;
+            }
+            if let Some(lim) = lim {
+                if !(z.qs >= lim.qs && z.qe >= lim.qe) {
+                    *z = bc;
+                }
+            }
+        }
+        let cover_before = crate::assembly::ul_renew::ugl_cover_check(
+            u64::from(bc.ts),
+            u64::from(bc.te),
+            &ug.unitigs[bc.hid as usize],
+            reads,
+        );
+        let cover_after = crate::assembly::ul_renew::ugl_cover_check(
+            u64::from(z.ts),
+            u64::from(z.te),
+            &ug.unitigs[z.hid as usize],
+            reads,
+        );
+        if cover_before && !cover_after {
+            *z = bc;
+        }
+    }
+}
+
+/// `renew_ul_vec_t` (`gfa_ut.cpp` 7848): re-derives the query coordinates of
+/// a rewritten block chain from the `pidx`/`pdis` links.
+pub fn renew_ul_vec_t(x: &mut crate::assembly::ul_store::UlReadVec, ug: &UnitigGraph) {
+    if x.bb.is_empty() {
+        return;
+    }
+    let bn = x.bb.len();
+    let mut qs: i64 = 0;
+    let mut l = 0usize;
+    let mut k = 1usize;
+    loop {
+        let at_end = k == bn;
+        if at_end || x.bb[k].pidx == u32::MAX {
+            if k > l {
+                let mut dd: i64 = 0;
+                let mut z = k as i64 - 1;
+                while z >= l as i64 {
+                    let zu = z as usize;
+                    if zu > l {
+                        debug_assert_eq!(x.bb[zu].pidx as usize, zu - 1);
+                        dd += i64::from(x.bb[zu].pdis);
+                    } else {
+                        debug_assert_eq!(x.bb[zu].pidx, u32::MAX);
+                        dd += i64::from(ug.graph.sequences[x.bb[zu].hid as usize].length);
+                    }
+                    dd -= i64::from(
+                        ug.graph.sequences[x.bb[zu].hid as usize].length
+                            - (x.bb[zu].te - x.bb[zu].ts),
+                    );
+                    z -= 1;
+                }
+                if dd < 0 {
+                    dd = 0;
+                }
+                let mut qe = qs + dd;
+                let mut dd_next = 0i64;
+                if k < bn {
+                    dd_next = qe + i64::from(x.bb[k].qs) - i64::from(x.bb[k - 1].qe);
+                    if dd_next < 0 {
+                        dd_next = 0;
+                    }
+                }
+                let mut z = k as i64 - 1;
+                while z >= l as i64 {
+                    let zu = z as usize;
+                    qs = qe - i64::from(x.bb[zu].te - x.bb[zu].ts);
+                    if qs < 0 {
+                        qs = 0;
+                    }
+                    x.bb[zu].qs = qs as u32;
+                    x.bb[zu].qe = qe as u32;
+                    if zu > l {
+                        qe += i64::from(
+                            ug.graph.sequences[x.bb[zu].hid as usize].length
+                                - (x.bb[zu].te - x.bb[zu].ts),
+                        );
+                        qe -= i64::from(x.bb[zu].pdis);
+                        if qe < 0 {
+                            qe = 0;
+                        }
+                    }
+                    z -= 1;
+                }
+                if k < bn {
+                    qs = dd_next;
+                }
+            }
+            l = k;
+        }
+        if at_end {
+            break;
+        }
+        k += 1;
+    }
+    x.rlen = x.bb[bn - 1].qe;
+}
+
+/// `shrink_ul0` (`gfa_ut.cpp` 7742): splits one UL read's block chain at the
+/// disconnected `pidx`/`pdis` links, appending the earlier pieces as new
+/// reads and rewriting the last piece in place.
+pub fn shrink_ul0(
+    uls: &mut AllUl,
+    str_: &mut crate::assembly::ul_integer::UlStr,
+    id: usize,
+    buf: &mut Vec<u64>,
+    ug: &UnitigGraph,
+    reads: &crate::reads::ReadStore,
+) {
+    if (str_.cn as usize) < 2 {
+        return;
+    }
+    buf.clear();
+    let mut bl = 0u32;
+    let mut p_k = u32::MAX;
+    let mut pv = u32::MAX;
+    let mut k = 0usize;
+    while k < str_.cn as usize {
+        let xi = uls.reads[id].bb[(str_.a[k] >> 32) as usize];
+        let mut is_conn = false;
+        let c_k = k as u32;
+        let cv = (str_.a[k] as u32) ^ 1;
+        debug_assert_eq!(
+            (xi.hid << 1) + u32::from(xi.rev),
+            str_.a[k] as u32
+        );
+        if p_k != u32::MAX {
+            if xi.pidx == (str_.a[p_k as usize] >> 32) as u32 {
+                let arcs = ug.graph.arcs_of(cv);
+                let mut i = 0usize;
+                while i < arcs.len() {
+                    if arcs[i].deleted {
+                        i += 1;
+                        continue;
+                    }
+                    if arcs[i].v == pv {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i < arcs.len() {
+                    let s = arcs[i].ul as u32;
+                    if s == xi.pdis {
+                        is_conn = true;
+                    } else {
+                        let d = if s >= xi.pdis { s - xi.pdis } else { xi.pdis - s };
+                        let mm = s.max(xi.pdis);
+                        if (d as f64) <= (mm as f64 * 0.08) || d <= 512 {
+                            is_conn = true;
+                        }
+                    }
+                }
+            } else if xi.pidx == u32::MAX {
+                is_conn = true;
+            }
+        }
+        if is_conn {
+            is_conn = false;
+            assert!(k > 0);
+            let yi = uls.reads[id].bb[(str_.a[k - 1] >> 32) as usize];
+            if xi.qs >= yi.qs && xi.qe >= yi.qe {
+                is_conn = true;
+            }
+        }
+        if is_conn {
+            bl += 1;
+        } else {
+            if bl > 0 {
+                let word = (((k as u64) - 1 - bl as u64) << 32) + bl as u64 + 1;
+                buf.push(word);
+            }
+            bl = 0;
+        }
+        p_k = c_k;
+        pv = cv;
+        k += 1;
+    }
+    if bl > 0 {
+        let word = (((k as u64) - 1 - bl as u64) << 32) + bl as u64 + 1;
+        buf.push(word);
+    }
+
+    if buf.is_empty() {
+        str_.cn = 0;
+        return;
+    }
+    let copy_group = |uls: &mut AllUl,
+                      slots: &[u64],
+                      out: &mut crate::assembly::ul_store::UlReadVec,
+                      base_nid: usize| {
+        let mut m = 0usize;
+        for (j, &kk) in slots.iter().enumerate() {
+            let blk = uls.reads[id].bb[(str_.a[kk as usize] >> 32) as usize];
+            let pidx = blk.pidx;
+            let aidx = blk.aidx;
+            let pdis = blk.pdis;
+            out.bb[m] = blk;
+            if j == 0 {
+                out.bb[m].pidx = u32::MAX;
+                out.bb[m].pdis = u32::MAX;
+            } else if pidx != u32::MAX {
+                out.bb[m].pidx = m as u32 - 1;
+                out.bb[m].pdis = pdis;
+            }
+            if j + 1 == slots.len() {
+                out.bb[m].aidx = u32::MAX;
+            } else if aidx != u32::MAX {
+                out.bb[m].aidx = m as u32 + 1;
+            }
+            m += 1;
+        }
+        out.bb.truncate(m);
+        assert!(out.bb.len() > 1);
+        let lim1 = if out.bb.len() >= 2 {
+            Some(out.bb[1])
+        } else {
+            None
+        };
+        shrink_1b(ug, reads, &mut out.bb[0], lim1.as_ref(), true);
+        let lim2 = if out.bb.len() >= 2 {
+            Some(out.bb[out.bb.len() - 2])
+        } else {
+            None
+        };
+        let last = out.bb.len() - 1;
+        shrink_1b(ug, reads, &mut out.bb[last], lim2.as_ref(), false);
+        let d = out.bb[0].qs;
+        for blk in out.bb.iter_mut() {
+            blk.qs -= d;
+            blk.qe -= d;
+        }
+        out.rlen = out.bb[out.bb.len() - 1].qe;
+        let _ = base_nid;
+        renew_ul_vec_t(out, ug);
+    };
+
+    if buf.len() > 1 {
+        for i in 0..buf.len() - 1 {
+            let s = (buf[i] >> 32) as usize;
+            let e = s + (buf[i] & 0xffff_ffff) as usize;
+            // new name
+            let name = uls.nid[id].clone();
+            uls.nid.push(name);
+            // new overlap list
+            let mut x = crate::assembly::ul_store::UlReadVec::default();
+            x.bb = vec![crate::assembly::ul::UcBlock::default(); e - s];
+            let slots: Vec<u64> = (s..e).map(|kk| kk as u64).collect();
+            copy_group(uls, &slots, &mut x, uls.nid.len());
+            uls.reads.push(x);
+        }
+    }
+    // the last group updates in place
+    let i = buf.len() - 1;
+    let s = (buf[i] >> 32) as usize;
+    let e = s + (buf[i] & 0xffff_ffff) as usize;
+    let slots: Vec<u64> = (s..e).map(|kk| kk as u64).collect();
+    let mut x = std::mem::take(&mut uls.reads[id]);
+    x.bb.resize(e - s, crate::assembly::ul::UcBlock::default());
+    copy_group(uls, &slots, &mut x, uls.nid.len());
+    uls.reads[id] = x;
+}
+
+/// `shrink_uls` (`gfa_ut.cpp` 7755) plus `rebuid_idx` (7653): the whole
+/// post-correction compaction.
+pub fn shrink_uls(
+    uls: &mut AllUl,
+    str_idx: &mut crate::assembly::ul_integer::UlStrIdx,
+    ug: &mut UnitigGraph,
+    reads: &crate::reads::ReadStore,
+    hifi_read_count: usize,
+) {
+    let ul_n = uls.reads.len();
+    let mut buf: Vec<u64> = Vec::new();
+    for k in 0..ul_n {
+        let mut str_ = std::mem::take(&mut str_idx.str[k]);
+        shrink_ul0(uls, &mut str_, k, &mut buf, ug, reads);
+        str_idx.str[k] = str_;
+    }
+    // `rebuid_idx`
+    crate::assembly::ul_renew::filter_ul_ug(uls, ug, reads);
+    crate::assembly::ul_store::gen_ul_vec_rid_t(uls, hifi_read_count);
+    crate::assembly::ul_renew::update_ug_arch_ul_mul(ug, uls);
+    *str_idx = crate::assembly::ul_integer::init_ul_str_idx(&uls.reads, ug.unitigs.len());
 }
