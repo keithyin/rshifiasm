@@ -2978,6 +2978,42 @@ integer_sg_gen）→ ② u2g_clean/renew_u2g_cov/renew_u2g_bg/usg 构建 →
 ⑦ U7 解锁 --ul + e2e 门禁（re.ul.msk.bin 逐字节 → re.ul.ovlp.bin 字段 →
 8 个 GFA/BED 逐字节）。Hi-C（task 5）在其后。
 
+## U6 续四（2026-11-12 第五轮，ul2ul 引擎核心落地）
+
+- `730b77c` **`ul_integer.rs`**：`UlStr`/`UlStrIdx`/`IntegerAln`/`UlChain`/
+  `Ul2ulT`/`Ul2ulItem`、`init_ul_str_idx`（CSR + 环检测游标，与 C 的
+  末槽游标写法逐行对应）、`ug_occ_w`、`uc_block_qse_cutoff`、
+  `normlize_gdis`/`normlize_gdis_exact`（pidx/aidx 双向游走）、
+  `dis_check_integer_aln_t`（两轮：块端点距离 + 精确路径距离）、
+  `integer_chain`（共线短路 + DP + 锚点压缩）、`append_connective`/
+  `connective_conform`、`integer_chain_dp`（hom 掩码 + occ_thres 连通 +
+  corrected 判定）、`update_exact_ul_ovlps`（精确重叠拼装 + 尾部
+  qs/qe/rs/re 归一化）。
+  注意 `UlChain.sc` 在 `integer_chain_dp` 里被复用作 `idx[k].sc`（C 的
+  `idx[k].sc = 0`），append_connective 的游标是 `idx->sc`。
+
+**ul2ul 引擎剩余（下一轮）**：`integer_align_extention`（gfa_ut.cpp
+~4900 区）、`gap_chain_check`、`refine_integer_ovlps`(5073 已读完)、
+`poa_cns_chain`(6138-6389)、`update_raw_integer_seq`(6389-6460)、
+`integer_normalize_ovlp` 的读重写尾部(6697 后半)、
+`clip_integer_chimeric` 尾部、`chimeric_integer_deal`(7213)、
+`integer_append_ug_ovlp`、`worker_integert_clean`、
+`remove_integert_containment`(7935)、`integer_sg_gen`(7963，出
+usg_t) → u2g_clean/renew_u2g_cov/renew_u2g_bg → convert_usg_t +
+renew_ng + realloc_rdb_adv + update_paf + renew_R_to_U →
+ul_realignment_gfa 组装 → gradually_renew_g/renew_g 接线 →
+U7 解锁 + e2e。`integer_normalize_ovlp` 的输入是
+integer_gen_ovlp 的产物（sc 链表）——gen_ul2ul 驱动序列见「U6 续三」。
+
+**读片段剩余清单**（本轮未读，行号供下轮直接读）：
+integer_align_extention（grep "integer_align_extention" ~4880）、
+gap_chain_check（~5000 区）、poa_cns_chain(6138)、update_raw_integer_seq
+(6389)、integer_append_ug_ovlp（grep）、worker_integert_clean（grep）、
+remove_integert_containment(7935)、integer_sg_gen(7963)、
+u2g_clean(16281)、renew_u2g_cov(16560)、renew_u2g_bg(16653)、
+push_scaff_node（grep）、reset_scaf_node_uinfo_srt_t/push_scaf_bases
+（gfa_ut.cpp ~14400 区）、update_paf(inter.cpp 17164)。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
