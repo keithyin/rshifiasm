@@ -102,6 +102,11 @@ impl BubbleType {
     pub fn is_het(&self, id: u32) -> bool {
         self.index[id as usize] == self.full_bubble_count as u32 + 1
     }
+
+    /// `IF_BUB(ID, B)` (`hic.h` 87).
+    pub fn is_bubble(&self, id: u32) -> bool {
+        self.index[id as usize] < self.full_bubble_count as u32 + 1
+    }
 }
 
 /// `pdq` (`hic.h` 66-78): the Dijkstra workspace of `get_shortest_path`.

@@ -1331,6 +1331,9 @@ pub fn gen_raw_ug_seq(
 /// unitigs and the raw-read CSR.
 #[derive(Default)]
 pub struct UlCov {
+    /// `uln` of the owning `ul2ul_idx_t` (needed by `ulg_type` inside the
+    /// path walks).
+    pub uln: u64,
     /// `uc`: the UL occupancy of every integer unitig (contained + free).
     pub uc: Vec<u32>,
     /// `raw_uc`: the free UL occupancy.
@@ -1648,6 +1651,7 @@ pub fn renew_u2g_cov(
     str_idx: &crate::assembly::ul_integer::UlStrIdx,
 ) {
     cov.uc = vec![0; iug_unitigs.len()];
+    cov.uln = z.uln;
     cov.raw_uc = vec![0; iug_unitigs.len()];
     cov.hc = vec![0; iug_unitigs.len()];
     cov.iug_a = vec![Vec::new(); iug_unitigs.len()];

@@ -2,9 +2,10 @@
 //! 10519-11150 + 15332 + 15616-16050): tip cuts, bubble identification and
 //! the bridge marking over the hybrid UL/unitig graph (`usg_t`).
 
-use crate::assembly::asg::{Asg, AsgArc};
+use crate::assembly::asg::{Asg, AsgArc, MaUtg};
+use crate::assembly::bubble::BubbleBuffer;
 use crate::assembly::bubble_chain::BubbleType;
-use crate::assembly::ul2ul::{Usg, UsgArc};
+use crate::assembly::ul2ul::{Ul2ulIdx, UlBg, UlCov, Usg, UsgArc};
 use crate::container::ksort::radix_sort_u64;
 
 /// `bg_*` flags (`gfa_ut.cpp` 8617-8620).
@@ -1114,15 +1115,29 @@ pub fn get_ul_path_info(
                     // the previous and current integer unitigs through
                     // `cc.iug_a`; the bridge table stores the flag on the
                     // same pair.
-                    let l = cov.get_bg_flag_pub(&t.bg, uv, uw);
-                    if l == BG_WRONG {
-                        if let Some(out) = bridge_w.as_deref_mut() {
-                            *out += 1;
-                        }
+                    let ia = &cov.iug_a[(uv >> 1) as usize];
+                    let mut bv = ia[if uv & 1 != 0 { 0 } else { ia.len() - 1 }].v;
+                    if uv & 1 != 0 {
+                        bv ^= 1;
                     }
-                    if l == BG_AMBIGUOUS {
-                        if let Some(out) = bridge_am.as_deref_mut() {
-                            *out += 1;
+                    let iw = &cov.iug_a[(uw >> 1) as usize];
+                    let mut bw = iw[if uw & 1 != 0 { iw.len() - 1 } else { 0 }].v;
+                    if uw & 1 != 0 {
+                        bw ^= 1;
+                    }
+                    if crate::assembly::ul2ul::ulg_type(cov.uln, (bv >> 1) as usize) != 0
+                        && crate::assembly::ul2ul::ulg_type(cov.uln, (bw >> 1) as usize) != 0
+                    {
+                        let l = cov.get_bg_flag_pub(&t.bg, bv, bw);
+                        if l == BG_WRONG {
+                            if let Some(out) = bridge_w.as_deref_mut() {
+                                *out += 1;
+                            }
+                        }
+                        if l == BG_AMBIGUOUS {
+                            if let Some(out) = bridge_am.as_deref_mut() {
+                                *out += 1;
+                            }
                         }
                     }
                 }
@@ -1216,154 +1231,6 @@ pub fn idx_check_rate(a: &[u64], tot: u64, winlen: u64, match_rate: f32) -> bool
         k += 1;
     }
     false
-}
-
-/// `get_remove_hifi_occ` (`gfa_ut.cpp` 8499): masks the raw-read words of
-/// the candidate vertices in the CSR and reports whether the deletion is
-/// acceptable — the reference returns 1 when `del_n <= thres`. `del_occ`
-/// carries the deleted base count.
-pub fn get_remove_hifi_occ(
-    cov: &mut crate::assembly::ul2ul::UlCov,
-    iug_g: &Asg,
-    thres: u64,
-    v_a: &[u64],
-    ub: &mut Vec<u64>,
-    del_occ: Option<&mut u32>,
-) -> bool {
-    let mut del_n: u64 = 0;
-    let mut buf: Vec<u64> = Vec::new();
-    let mut fn_count = 0usize;
-    let mut dup_raw = false;
-    for &vk in v_a {
-        let iu = cov.iug_a[(vk >> 1) as usize].clone();
-        for (z, item) in iu.iter().enumerate() {
-            let raw_id = (item.v >> 1) as usize;
-            let start = cov.iug_idx[raw_id] as usize;
-            let end = cov.iug_idx[raw_id + 1] as usize;
-            let mut keep_ns = [0u32; 2];
-            let pn = buf.len();
-            let mut n_mask = 0usize;
-            for m in start..end {
-                let word = cov.iug_b[m];
-                let iug_id = ((word << 1) >> 33) as usize;
-                let iug_off = (word & 0x7fff_ffff) as usize;
-                if iug_g.sequences[iug_id].deleted {
-                    continue;
-                }
-                if (word >> 63) != 0 {
-                    n_mask += 1;
-                    continue;
-                }
-                if iug_id == (vk >> 1) as usize && iug_off == z {
-                    cov.iug_b[m] |= 0x8000_0000_0000_0000;
-                    buf.push((u64::MAX << 32) | m as u64);
-                } else {
-                    let entry = &cov.iug_a[iug_id][iug_off];
-                    if entry.v & 1 == 0 {
-                        keep_ns[0] = keep_ns[0].max(entry.n);
-                    } else {
-                        keep_ns[1] = keep_ns[1].max(entry.n);
-                    }
-                }
-            }
-            debug_assert_eq!(buf.len(), pn + 1);
-            let raw_len = cov.raw_len(raw_id);
-            if keep_ns[0] as u64 + keep_ns[1] as u64 >= raw_len {
-                keep_ns[0] = raw_len as u32;
-                keep_ns[1] = raw_len as u32;
-            }
-            let is = keep_ns[0] as u64;
-            let ie = raw_len - keep_ns[1] as u64;
-            if ie > is {
-                let (ms, me) = if item.v & 1 == 0 {
-                    (0u64, u64::from(item.n))
-                } else {
-                    (raw_len - u64::from(item.n), raw_len)
-                };
-                if is.max(ms) < ie.min(me) {
-                    del_n += (ie.min(me) - is.max(ms)) as u64;
-                    buf[pn] = ((buf[pn] << 32) >> 32) | (raw_id as u64) << 32;
-                    fn_count += 1;
-                    if n_mask > 0 {
-                        dup_raw = true;
-                    }
-                }
-            }
-        }
-    }
-    if del_n > thres && dup_raw {
-        radix_sort_u64(&mut buf);
-        del_n = 0;
-        let mut l = 0usize;
-        let mut k = 1usize;
-        while k <= fn_count {
-            if k == fn_count || (buf[k] >> 32) != (buf[l] >> 32) {
-                let raw_id = (buf[l] >> 32) as usize;
-                let start = cov.iug_idx[raw_id] as usize;
-                let end = cov.iug_idx[raw_id + 1] as usize;
-                let mut del_ns = [0u32; 2];
-                let mut keep_ns = [0u32; 2];
-                for m in start..end {
-                    let word = cov.iug_b[m];
-                    let iug_id = ((word << 1) >> 33) as usize;
-                    let iug_off = (word & 0x7fff_ffff) as usize;
-                    if iug_g.sequences[iug_id].deleted {
-                        continue;
-                    }
-                    let entry = &cov.iug_a[iug_id][iug_off];
-                    if (word >> 63) != 0 {
-                        if entry.v & 1 == 0 {
-                            del_ns[0] = del_ns[0].max(entry.n);
-                        } else {
-                            del_ns[1] = del_ns[1].max(entry.n);
-                        }
-                    } else if entry.v & 1 == 0 {
-                        keep_ns[0] = keep_ns[0].max(entry.n);
-                    } else {
-                        keep_ns[1] = keep_ns[1].max(entry.n);
-                    }
-                }
-                debug_assert!(del_ns[0] + del_ns[1] > 0);
-                let raw_len = cov.raw_len(raw_id);
-                if keep_ns[0] as u64 + keep_ns[1] as u64 >= raw_len {
-                    keep_ns[0] = raw_len as u32;
-                    keep_ns[1] = raw_len as u32;
-                }
-                let is = keep_ns[0] as u64;
-                let ie = raw_len - keep_ns[1] as u64;
-                if ie > is {
-                    if del_ns[0] as u64 + del_ns[1] as u64 >= raw_len {
-                        del_n += ie - is;
-                    } else {
-                        let mut ms = 0u64;
-                        let me = del_ns[0] as u64;
-                        if ms < me && is.max(ms) < ie.min(me) {
-                            del_n += (ie.min(me) - is.max(ms)) as u64;
-                        }
-                        ms = raw_len - del_ns[1] as u64;
-                        let me = raw_len;
-                        if ms < me && is.max(ms) < ie.min(me) {
-                            del_n += (ie.min(me) - is.max(ms)) as u64;
-                        }
-                    }
-                }
-                if del_n > thres {
-                    break;
-                }
-                l = k;
-            }
-            k += 1;
-        }
-    }
-    for &word in &buf {
-        cov.iug_b[(word & 0xffff_ffff) as usize] <<= 1;
-        cov.iug_b[(word & 0xffff_ffff) as usize] >>= 1;
-    }
-    if let Some(out) = del_occ {
-        *out = del_n as u32;
-    }
-    ub.clear();
-    del_n <= thres
 }
 
 /// `gen_ug_integer_seq_on_fly` (`gfa_ut.cpp` 9203): the raw-read sequence of
@@ -1651,28 +1518,271 @@ pub fn get_integer_seq_ovlps(
     occ
 }
 
-/// `usg_topocut_aux` (`gfa_ut.cpp` 8770 region): the naive topological cut
-/// on the integer unitig graph.
+/// The `ul_resolve_t` slices shared by the ulg cleanup cluster. The C
+/// driver threads `uidx` through every helper; the port passes this context
+/// instead.
+pub struct UlResolve<'a> {
+    /// `uidx->uovl.cc`.
+    pub cov: &'a mut UlCov,
+    /// `uidx->uovl`, the ul2ul index.
+    pub z_items: &'a Ul2ulIdx,
+    /// `uidx->uovl.i_ug`, the integer unitig graph being cleaned.
+    pub iug: &'a mut crate::assembly::unitig::UnitigGraph,
+    /// `uidx->l1_ug`, the raw unitig graph.
+    pub raw: &'a crate::assembly::unitig::UnitigGraph,
+    /// The UL read store (`uidx->UL_INF.a`).
+    pub store: &'a [crate::assembly::ul_store::UlReadVec],
+    /// `raw->u.a`.
+    pub raw_unitigs: &'a [MaUtg],
+    /// `R_INF.read_lengths`.
+    pub read_lengths: &'a [u64],
+    /// The per-unitig read lists consumed by `get_integer_seq_ovlps`.
+    pub unitig_reads: &'a [Vec<u64>],
+    /// `uidx->pstr`.
+    pub str_idx: &'a crate::assembly::ul_integer::UlStrIdx,
+    /// `uidx->bub`.
+    pub bub: &'a BubbleType,
+    /// `uidx->uovl.bg`.
+    pub bg: &'a UlBg,
+    /// `uidx->uovl.telo` (`NULL` without `--telo-motif`).
+    pub telo: Option<&'a [u8]>,
+}
+
+impl UlResolve<'_> {
+    /// `get_iug_u_raw_occ` (`gfa_ut.cpp` 8041).
+    pub fn get_iug_u_raw_occ(
+        &self,
+        id: u32,
+        ul_occ: Option<&mut u32>,
+        raw_ug_occ: Option<&mut u32>,
+    ) {
+        if let Some(out) = ul_occ {
+            *out = self.cov.raw_uc[id as usize];
+        }
+        if let Some(out) = raw_ug_occ {
+            *out = self.iug.unitigs[id as usize].reads.len() as u32
+                - self.cov.raw_uc[id as usize];
+        }
+    }
+
+    /// `get_bridges` (`gfa_ut.cpp` 8636): the wrong/ambiguous bridge counts
+    /// along a vertex list.
+    pub fn get_bridges(&self, v_a: &[u64], w_occ: Option<&mut u32>, am_occ: Option<&mut u32>) {
+        let mut w = 0u64;
+        let mut am = 0u64;
+        let mut uv = u32::MAX;
+        for &k in v_a {
+            w += u64::from(self.bg.w_n[(k >> 1) as usize]);
+            am += u64::from(self.bg.a_n[(k >> 1) as usize]);
+            let uw = k as u32;
+            if uv != u32::MAX {
+                let ia = &self.cov.iug_a[(uv >> 1) as usize];
+                let mut bv = ia[if uv & 1 != 0 { 0 } else { ia.len() - 1 }].v;
+                if uv & 1 != 0 {
+                    bv ^= 1;
+                }
+                let iw = &self.cov.iug_a[(uw >> 1) as usize];
+                let mut bw = iw[if uw & 1 != 0 { iw.len() - 1 } else { 0 }].v;
+                if uw & 1 != 0 {
+                    bw ^= 1;
+                }
+                if crate::assembly::ul2ul::ulg_type(self.cov.uln, (bv >> 1) as usize) != 0
+                    && crate::assembly::ul2ul::ulg_type(self.cov.uln, (bw >> 1) as usize) != 0
+                {
+                    let l = self.cov.get_bg_flag_pub(&self.bg.bg, bv, bw);
+                    if l == BG_WRONG {
+                        w += 1;
+                    }
+                    if l == BG_AMBIGUOUS {
+                        am += 1;
+                    }
+                }
+            }
+            uv = uw;
+        }
+        if let Some(out) = w_occ {
+            *out = w as u32;
+        }
+        if let Some(out) = am_occ {
+            *out = am as u32;
+        }
+    }
+}
+
+/// `get_remove_hifi_occ` (`gfa_ut.cpp` 8499): masks the raw-read words of
+/// the candidate vertices in the CSR and reports whether the deletion is
+/// acceptable — the reference returns 1 when `del_n <= thres`. `del_occ`
+/// carries the deleted base count.
+pub fn get_remove_hifi_occ(
+    ctx: &mut UlResolve,
+    thres: u64,
+    v_a: &[u64],
+    ub: &mut Vec<u64>,
+    del_occ: Option<&mut u32>,
+) -> bool {
+    let cov = &mut *ctx.cov;
+    let iug_g = &ctx.iug.graph;
+    let mut del_n: u64 = 0;
+    let mut buf: Vec<u64> = Vec::new();
+    let mut fn_count = 0usize;
+    let mut dup_raw = false;
+    for &vk in v_a {
+        let iu = cov.iug_a[(vk >> 1) as usize].clone();
+        for (z, item) in iu.iter().enumerate() {
+            let raw_id = (item.v >> 1) as usize;
+            let start = cov.iug_idx[raw_id] as usize;
+            let end = cov.iug_idx[raw_id + 1] as usize;
+            let mut keep_ns = [0u32; 2];
+            let pn = buf.len();
+            let mut n_mask = 0usize;
+            for m in start..end {
+                let word = cov.iug_b[m];
+                let iug_id = ((word << 1) >> 33) as usize;
+                let iug_off = (word & 0x7fff_ffff) as usize;
+                if iug_g.sequences[iug_id].deleted {
+                    continue;
+                }
+                if (word >> 63) != 0 {
+                    n_mask += 1;
+                    continue;
+                }
+                if iug_id == (vk >> 1) as usize && iug_off == z {
+                    cov.iug_b[m] |= 0x8000_0000_0000_0000;
+                    buf.push((u64::MAX << 32) | m as u64);
+                } else {
+                    let entry = &cov.iug_a[iug_id][iug_off];
+                    if entry.v & 1 == 0 {
+                        keep_ns[0] = keep_ns[0].max(entry.n);
+                    } else {
+                        keep_ns[1] = keep_ns[1].max(entry.n);
+                    }
+                }
+            }
+            debug_assert_eq!(buf.len(), pn + 1);
+            let raw_len = cov.raw_len(raw_id);
+            if u64::from(keep_ns[0]) + u64::from(keep_ns[1]) >= raw_len {
+                keep_ns[0] = raw_len as u32;
+                keep_ns[1] = raw_len as u32;
+            }
+            let is = u64::from(keep_ns[0]);
+            let ie = raw_len - u64::from(keep_ns[1]);
+            if ie > is {
+                let (ms, me) = if item.v & 1 == 0 {
+                    (0u64, u64::from(item.n))
+                } else {
+                    (raw_len - u64::from(item.n), raw_len)
+                };
+                if is.max(ms) < ie.min(me) {
+                    del_n += ie.min(me) - is.max(ms);
+                    buf[pn] = ((buf[pn] << 32) >> 32) | (raw_id as u64) << 32;
+                    fn_count += 1;
+                    if n_mask > 0 {
+                        dup_raw = true;
+                    }
+                }
+            }
+        }
+    }
+    if del_n > thres && dup_raw {
+        radix_sort_u64(&mut buf);
+        del_n = 0;
+        let mut l = 0usize;
+        let mut k = 1usize;
+        while k <= fn_count {
+            if k == fn_count || (buf[k] >> 32) != (buf[l] >> 32) {
+                let raw_id = (buf[l] >> 32) as usize;
+                let start = cov.iug_idx[raw_id] as usize;
+                let end = cov.iug_idx[raw_id + 1] as usize;
+                let mut del_ns = [0u32; 2];
+                let mut keep_ns = [0u32; 2];
+                for m in start..end {
+                    let word = cov.iug_b[m];
+                    let iug_id = ((word << 1) >> 33) as usize;
+                    let iug_off = (word & 0x7fff_ffff) as usize;
+                    if iug_g.sequences[iug_id].deleted {
+                        continue;
+                    }
+                    let entry = &cov.iug_a[iug_id][iug_off];
+                    if (word >> 63) != 0 {
+                        if entry.v & 1 == 0 {
+                            del_ns[0] = del_ns[0].max(entry.n);
+                        } else {
+                            del_ns[1] = del_ns[1].max(entry.n);
+                        }
+                    } else if entry.v & 1 == 0 {
+                        keep_ns[0] = keep_ns[0].max(entry.n);
+                    } else {
+                        keep_ns[1] = keep_ns[1].max(entry.n);
+                    }
+                }
+                debug_assert!(del_ns[0] + del_ns[1] > 0);
+                let raw_len = cov.raw_len(raw_id);
+                if u64::from(keep_ns[0]) + u64::from(keep_ns[1]) >= raw_len {
+                    keep_ns[0] = raw_len as u32;
+                    keep_ns[1] = raw_len as u32;
+                }
+                let is = u64::from(keep_ns[0]);
+                let ie = raw_len - u64::from(keep_ns[1]);
+                if ie > is {
+                    if u64::from(del_ns[0]) + u64::from(del_ns[1]) >= raw_len {
+                        del_n += ie - is;
+                    } else {
+                        let mut ms = 0u64;
+                        let me = u64::from(del_ns[0]);
+                        if ms < me && is.max(ms) < ie.min(me) {
+                            del_n += ie.min(me) - is.max(ms);
+                        }
+                        ms = raw_len - u64::from(del_ns[1]);
+                        let me = raw_len;
+                        if ms < me && is.max(ms) < ie.min(me) {
+                            del_n += ie.min(me) - is.max(ms);
+                        }
+                    }
+                }
+                if del_n > thres {
+                    break;
+                }
+                l = k;
+            }
+            k += 1;
+        }
+    }
+    for &word in &buf {
+        cov.iug_b[(word & 0xffff_ffff) as usize] <<= 1;
+        cov.iug_b[(word & 0xffff_ffff) as usize] >>= 1;
+    }
+    if let Some(out) = del_occ {
+        *out = del_n as u32;
+    }
+    ub.clear();
+    del_n <= thres
+}
+
+/// `usg_topocut_aux` (`gfa_ut.cpp` 8784): the naive topological cut on the
+/// integer unitig graph.
 pub fn usg_topocut_aux(
-    cov: &mut crate::assembly::ul2ul::UlCov,
-    g: &Asg,
-    mut v: u32,
+    ctx: &mut UlResolve,
+    v: u32,
     max_ext: u32,
-    max_ext_hifi: u64,
+    max_ext_hifi: u32,
     b: &mut Vec<u64>,
     ub: &mut Vec<u64>,
 ) -> bool {
-    let mut w = v;
+    let mut v = v;
     let pn = b.len();
     let mut n_ext = 0u32;
     while n_ext < max_ext {
-        let kv = get_arcs(g, v ^ 1, None, 1);
+        let kv = get_arcs(&ctx.iug.graph, v ^ 1, None, 1);
         if kv != 1 {
             break;
         }
-        n_ext += cov.raw_uc[(v >> 1) as usize];
+        let mut ul_occ = 0u32;
+        ctx.get_iug_u_raw_occ(v >> 1, Some(&mut ul_occ), None);
+        n_ext += ul_occ;
         b.push(u64::from(v));
-        let av: Vec<u32> = g
+        let av: Vec<u32> = ctx
+            .iug
+            .graph
             .arcs_of(v)
             .iter()
             .filter(|a| !a.deleted)
@@ -1681,20 +1791,17 @@ pub fn usg_topocut_aux(
         if av.len() != 1 {
             break;
         }
-        w = av[0];
-        v = w;
+        v = av[0];
     }
-    let mut hit = false;
     if n_ext < max_ext {
         let tail: Vec<u64> = b[pn..].to_vec();
-        if get_remove_hifi_occ(cov, g, u64::from(max_ext_hifi), &tail, ub, None) {
+        if get_remove_hifi_occ(ctx, u64::from(max_ext_hifi), &tail, ub, None) {
             b.truncate(pn);
             return true;
         }
-        hit = false;
     }
     b.truncate(pn);
-    hit
+    false
 }
 
 /// The shared walk of `get_ul_arc_supports` / `check_ul_contain_arc_supports`
@@ -1703,16 +1810,7 @@ pub fn usg_topocut_aux(
 /// variants differ only in zeroing `min_w_v` on collapse.
 #[allow(clippy::too_many_arguments)]
 fn ul_arc_supports_walk(
-    cov: &mut crate::assembly::ul2ul::UlCov,
-    z_items: &crate::assembly::ul2ul::Ul2ulIdx,
-    iug: &crate::assembly::unitig::UnitigGraph,
-    raw: &crate::assembly::unitig::UnitigGraph,
-    store: &[crate::assembly::ul_store::UlReadVec],
-    raw_unitigs: &[crate::assembly::asg::MaUtg],
-    read_lengths: &[u64],
-    unitig_reads: &[Vec<u64>],
-    str_idx: &crate::assembly::ul_integer::UlStrIdx,
-    bub: &BubbleType,
+    ctx: &mut UlResolve,
     ve: &AsgArc,
     b_int: &mut Vec<u64>,
     b_raw: &mut Vec<u64>,
@@ -1721,15 +1819,15 @@ fn ul_arc_supports_walk(
     return_w_r: &mut u64,
     zero_on_collapse: bool,
 ) -> u32 {
+    let cov = &mut *ctx.cov;
+    let iug = &*ctx.iug;
     let b_int_s = b_int.len();
     let b_raw_s = b_raw.len();
     *return_w_v = u64::MAX;
     *return_w_r = u64::MAX;
     let mut is_collapse = false;
     let v = (ve.ul >> 32) as u32;
-    get_ul_path_info(
-        &iug.graph, cov, None, v ^ 1, None, None, None, None, None, b_int,
-    );
+    get_ul_path_info(&iug.graph, cov, None, v ^ 1, None, None, None, None, None, b_int);
     let nv = b_int.len() - b_int_s;
     for k in 0..nv / 2 {
         let front = b_int[b_int_s + k];
@@ -1748,7 +1846,7 @@ fn ul_arc_supports_walk(
         &iug.graph, cov, None, ve.v, None, Some(&mut v_occ), None, None, None, b_int,
     );
     let v_path: Vec<u64> = b_int[b_int_s..].to_vec();
-    gen_ug_integer_seq_on_fly(cov, z_items, raw, &v_path, b_raw);
+    gen_ug_integer_seq_on_fly(cov, ctx.z_items, ctx.raw, &v_path, b_raw);
     let l_v = b_raw.len() - b_raw_s;
     let av: Vec<AsgArc> = iug.graph.arcs_of(v).to_vec();
     let mut min_w_v = u64::MAX;
@@ -1764,7 +1862,7 @@ fn ul_arc_supports_walk(
             &iug.graph, cov, None, arc.v, None, Some(&mut r_occ), None, None, None, b_int,
         );
         let r_path: Vec<u64> = b_int[b_int_s..].to_vec();
-        gen_ug_integer_seq_on_fly(cov, z_items, raw, &r_path, b_raw);
+        gen_ug_integer_seq_on_fly(cov, ctx.z_items, ctx.raw, &r_path, b_raw);
         let l_r = b_raw.len() - b_raw_s - l_v;
         let zn = l_v.min(l_r);
         let mut z = 0usize;
@@ -1773,23 +1871,23 @@ fn ul_arc_supports_walk(
         }
         let mut skip_hom_local = skip_hom;
         if skip_hom_local && z < l_v {
-            skip_hom_local = is_het_bridge(bub, &b_raw[b_raw_s..b_raw_s + l_v], z as i64 - 1);
+            skip_hom_local = is_het_bridge(ctx.bub, &b_raw[b_raw_s..b_raw_s + l_v], z as i64 - 1);
         }
         if skip_hom_local && z < l_r {
             skip_hom_local =
-                is_het_bridge(bub, &b_raw[b_raw_s + l_v..b_raw_s + l_v + l_r], z as i64 - 1);
+                is_het_bridge(ctx.bub, &b_raw[b_raw_s + l_v..b_raw_s + l_v + l_r], z as i64 - 1);
         }
         assert!(z > 0);
         let mut w_v = u64::MAX;
         let mut w_r = u64::MAX;
         if z < l_v {
             get_integer_seq_ovlps(
-                str_idx,
-                store,
-                raw_unitigs,
-                read_lengths,
-                unitig_reads,
-                bub,
+                ctx.str_idx,
+                ctx.store,
+                ctx.raw_unitigs,
+                ctx.read_lengths,
+                ctx.unitig_reads,
+                ctx.bub,
                 &b_raw[b_raw_s..b_raw_s + l_v],
                 z as i64 - 1,
                 skip_hom_local,
@@ -1799,12 +1897,12 @@ fn ul_arc_supports_walk(
         }
         if z < l_r {
             get_integer_seq_ovlps(
-                str_idx,
-                store,
-                raw_unitigs,
-                read_lengths,
-                unitig_reads,
-                bub,
+                ctx.str_idx,
+                ctx.store,
+                ctx.raw_unitigs,
+                ctx.read_lengths,
+                ctx.unitig_reads,
+                ctx.bub,
                 &b_raw[b_raw_s + l_v..b_raw_s + l_v + l_r],
                 z as i64 - 1,
                 skip_hom_local,
@@ -1818,11 +1916,7 @@ fn ul_arc_supports_walk(
         if w_r == u64::MAX {
             w_r = 0;
         }
-        if min_w_v == u64::MAX
-            || z == zn
-            || min_w_v > w_v
-            || (min_w_v == w_v && min_w_r < w_r)
-        {
+        if min_w_v == u64::MAX || z == zn || min_w_v > w_v || (min_w_v == w_v && min_w_r < w_r) {
             min_w_v = w_v;
             min_w_r = w_r;
             if z == zn && v_occ < r_occ {
@@ -1847,16 +1941,7 @@ fn ul_arc_supports_walk(
 /// `get_ul_arc_supports` (`gfa_ut.cpp` 9577).
 #[allow(clippy::too_many_arguments)]
 pub fn get_ul_arc_supports(
-    cov: &mut crate::assembly::ul2ul::UlCov,
-    z_items: &crate::assembly::ul2ul::Ul2ulIdx,
-    iug: &crate::assembly::unitig::UnitigGraph,
-    raw: &crate::assembly::unitig::UnitigGraph,
-    store: &[crate::assembly::ul_store::UlReadVec],
-    raw_unitigs: &[crate::assembly::asg::MaUtg],
-    read_lengths: &[u64],
-    unitig_reads: &[Vec<u64>],
-    str_idx: &crate::assembly::ul_integer::UlStrIdx,
-    bub: &BubbleType,
+    ctx: &mut UlResolve,
     ve: &AsgArc,
     b_int: &mut Vec<u64>,
     b_raw: &mut Vec<u64>,
@@ -1865,8 +1950,7 @@ pub fn get_ul_arc_supports(
     return_w_r: &mut u64,
 ) -> u32 {
     ul_arc_supports_walk(
-        cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads, str_idx, bub,
-        ve, b_int, b_raw, skip_hom, return_w_v, return_w_r, true,
+        ctx, ve, b_int, b_raw, skip_hom, return_w_v, return_w_r, true,
     )
 }
 
@@ -1874,16 +1958,7 @@ pub fn get_ul_arc_supports(
 /// without the collapse zeroing of `min_w_v`.
 #[allow(clippy::too_many_arguments)]
 pub fn check_ul_contain_arc_supports(
-    cov: &mut crate::assembly::ul2ul::UlCov,
-    z_items: &crate::assembly::ul2ul::Ul2ulIdx,
-    iug: &crate::assembly::unitig::UnitigGraph,
-    raw: &crate::assembly::unitig::UnitigGraph,
-    store: &[crate::assembly::ul_store::UlReadVec],
-    raw_unitigs: &[crate::assembly::asg::MaUtg],
-    read_lengths: &[u64],
-    unitig_reads: &[Vec<u64>],
-    str_idx: &crate::assembly::ul_integer::UlStrIdx,
-    bub: &BubbleType,
+    ctx: &mut UlResolve,
     ve: &AsgArc,
     b_int: &mut Vec<u64>,
     b_raw: &mut Vec<u64>,
@@ -1892,16 +1967,14 @@ pub fn check_ul_contain_arc_supports(
     return_w_r: &mut u64,
 ) -> u32 {
     ul_arc_supports_walk(
-        cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads, str_idx, bub,
-        ve, b_int, b_raw, skip_hom, return_w_v, return_w_r, false,
+        ctx, ve, b_int, b_raw, skip_hom, return_w_v, return_w_r, false,
     )
 }
 
 /// `check_ulg_to_del` (`gfa_ut.cpp` 9735).
 #[allow(clippy::too_many_arguments)]
 pub fn check_ulg_to_del(
-    cov: &mut crate::assembly::ul2ul::UlCov,
-    g: &Asg,
+    ctx: &mut UlResolve,
     v: u32,
     w: u32,
     kv: u32,
@@ -1926,10 +1999,12 @@ pub fn check_ulg_to_del(
     } else if kv > 1 && kw > 1 {
         to_del = true;
     } else if kw == 1 {
-        if usg_topocut_aux(cov, g, w ^ 1, max_ext, max_ext_hifi, b, ub) {
+        if usg_topocut_aux(ctx, w ^ 1, max_ext, max_ext_hifi as u32, b, ub) {
             to_del = true;
         }
-    } else if kv == 1 && usg_topocut_aux(cov, g, v ^ 1, max_ext, max_ext_hifi, b, ub) {
+    } else if kv == 1
+        && usg_topocut_aux(ctx, v ^ 1, max_ext, max_ext_hifi as u32, b, ub)
+    {
         to_del = true;
     }
     to_del
@@ -1940,16 +2015,7 @@ pub fn check_ulg_to_del(
 /// the reference body and dropped here.
 #[allow(clippy::too_many_arguments)]
 pub fn ulg_arc_cut_supports(
-    cov: &mut crate::assembly::ul2ul::UlCov,
-    z_items: &crate::assembly::ul2ul::Ul2ulIdx,
-    iug: &mut crate::assembly::unitig::UnitigGraph,
-    raw: &crate::assembly::unitig::UnitigGraph,
-    store: &[crate::assembly::ul_store::UlReadVec],
-    raw_unitigs: &[crate::assembly::asg::MaUtg],
-    read_lengths: &[u64],
-    unitig_reads: &[Vec<u64>],
-    str_idx: &crate::assembly::ul_integer::UlStrIdx,
-    bub: &BubbleType,
+    ctx: &mut UlResolve,
     max_ext: i32,
     max_ext_hifi: u32,
     len_rat: f32,
@@ -1959,22 +2025,23 @@ pub fn ulg_arc_cut_supports(
     b: &mut Vec<u64>,
     ub: &mut Vec<u64>,
 ) -> u32 {
-    let n_vtx = (iug.graph.sequences.len() << 1) as u32;
+    let n_vtx = (ctx.iug.graph.sequences.len() << 1) as u32;
     b.clear();
     for v in 0..n_vtx {
-        if iug.graph.sequences[(v >> 1) as usize].deleted {
+        if ctx.iug.graph.sequences[(v >> 1) as usize].deleted {
             continue;
         }
         // `g->seq_vis[v] == 0`: the bubble vertices marked by
         // `asg_arc_identify_simple_bubbles_multi` are skipped.
-        if iug.graph.sequence_visited[v as usize] != 0 {
+        if ctx.iug.graph.sequence_visited[v as usize] != 0 {
             continue;
         }
-        let nv = iug.graph.arcs_of(v).len();
+        let nv = ctx.iug.graph.arcs_of(v).len();
         if nv < 2 {
             continue;
         }
-        let kv = iug
+        let kv = ctx
+            .iug
             .graph
             .arcs_of(v)
             .iter()
@@ -1984,7 +2051,7 @@ pub fn ulg_arc_cut_supports(
         if kv < 2 {
             continue;
         }
-        for (i, arc) in iug.graph.arcs_of(v).iter().enumerate() {
+        for (i, arc) in ctx.iug.graph.arcs_of(v).iter().enumerate() {
             if arc.deleted {
                 continue;
             }
@@ -1998,12 +2065,11 @@ pub fn ulg_arc_cut_supports(
     let mut scratch_raw: Vec<u64> = Vec::new();
     for entry in b.iter_mut() {
         let arc_index = *entry as usize;
-        let ve = iug.graph.arcs[arc_index];
+        let ve = ctx.iug.graph.arcs[arc_index];
         let mut w_v = 0u64;
         let mut w_r = 0u64;
         get_ul_arc_supports(
-            cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads, str_idx,
-            bub, &ve, &mut scratch_int, &mut scratch_raw, true, &mut w_v, &mut w_r,
+            ctx, &ve, &mut scratch_int, &mut scratch_raw, true, &mut w_v, &mut w_r,
         );
         *entry |= w_v << 32;
     }
@@ -2011,35 +2077,38 @@ pub fn ulg_arc_cut_supports(
     let mut cnt = 0u32;
     for k in 0..b.len() {
         let arc_index = (b[k] & 0xffff_ffff) as usize;
-        if iug.graph.arcs[arc_index].deleted {
+        if ctx.iug.graph.arcs[arc_index].deleted {
             continue;
         }
-        let v = (iug.graph.arcs[arc_index].ul >> 32) as u32;
-        let w = iug.graph.arcs[arc_index].v ^ 1;
-        if iug.graph.sequences[(v >> 1) as usize].deleted
-            || iug.graph.sequences[(w >> 1) as usize].deleted
+        let v = (ctx.iug.graph.arcs[arc_index].ul >> 32) as u32;
+        let w = ctx.iug.graph.arcs[arc_index].v ^ 1;
+        if ctx.iug.graph.sequences[(v >> 1) as usize].deleted
+            || ctx.iug.graph.sequences[(w >> 1) as usize].deleted
         {
             continue;
         }
-        let nv = iug.graph.arcs_of(v).len();
-        let nw = iug.graph.arcs_of(w).len();
+        let nv = ctx.iug.graph.arcs_of(v).len();
+        let nw = ctx.iug.graph.arcs_of(w).len();
         if nv <= 1 && nw <= 1 {
             continue;
         }
-        let ve = iug.graph.arcs[arc_index];
-        let kv = iug
+        let ve = ctx.iug.graph.arcs[arc_index];
+        let kv = ctx
+            .iug
             .graph
             .arcs_of(v)
             .iter()
             .filter(|a| !a.deleted)
             .count() as u32;
-        let we = iug
+        let we = ctx
+            .iug
             .graph
             .arcs_of(w)
             .iter()
             .find(|a| !a.deleted && a.v == v ^ 1)
             .copied();
-        let kw = iug
+        let kw = ctx
+            .iug
             .graph
             .arcs_of(w)
             .iter()
@@ -2054,8 +2123,7 @@ pub fn ulg_arc_cut_supports(
                 let mut w_q = 0u64;
                 let mut w_t = 0u64;
                 collapse = check_ul_contain_arc_supports(
-                    cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads,
-                    str_idx, bub, &ve, b, ub, skip_hom, &mut w_q, &mut w_t,
+                    ctx, &ve, b, ub, skip_hom, &mut w_q, &mut w_t,
                 ) != 0;
             }
             if !collapse && kw > 1 {
@@ -2063,8 +2131,7 @@ pub fn ulg_arc_cut_supports(
                     let mut w_q = 0u64;
                     let mut w_t = 0u64;
                     collapse = check_ul_contain_arc_supports(
-                        cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads,
-                        str_idx, bub, &we, b, ub, skip_hom, &mut w_q, &mut w_t,
+                        ctx, &we, b, ub, skip_hom, &mut w_q, &mut w_t,
                     ) != 0;
                 }
             }
@@ -2073,10 +2140,7 @@ pub fn ulg_arc_cut_supports(
             if kv > 1 {
                 let mut w_q = 0u64;
                 let mut w_t = 0u64;
-                get_ul_arc_supports(
-                    cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads,
-                    str_idx, bub, &ve, b, ub, skip_hom, &mut w_q, &mut w_t,
-                );
+                get_ul_arc_supports(ctx, &ve, b, ub, skip_hom, &mut w_q, &mut w_t);
                 if w_q == u64::MAX {
                     continue;
                 }
@@ -2090,10 +2154,7 @@ pub fn ulg_arc_cut_supports(
                 };
                 let mut w_q = 0u64;
                 let mut w_t = 0u64;
-                get_ul_arc_supports(
-                    cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads,
-                    str_idx, bub, &we, b, ub, skip_hom, &mut w_q, &mut w_t,
-                );
+                get_ul_arc_supports(ctx, &we, b, ub, skip_hom, &mut w_q, &mut w_t);
                 if w_q == u64::MAX {
                     continue;
                 }
@@ -2103,8 +2164,7 @@ pub fn ulg_arc_cut_supports(
             }
         }
         let to_del = check_ulg_to_del(
-            cov,
-            &iug.graph,
+            ctx,
             v,
             w,
             kv,
@@ -2119,13 +2179,929 @@ pub fn ulg_arc_cut_supports(
         if to_del {
             // `ve->del = we->del = 1` (the mirror arcs are left intact,
             // exactly like the reference).
-            iug.graph.arcs[arc_index].deleted = true;
-            iug.graph.delete_first_arc(w, v ^ 1);
+            ctx.iug.graph.arcs[arc_index].deleted = true;
+            ctx.iug.graph.delete_first_arc(w, v ^ 1);
             cnt += 1;
         }
     }
     if cnt > 0 {
-        iug.graph.cleanup();
+        ctx.iug.graph.cleanup();
     }
     cnt
+}
+
+/// `ulg_seq_del` (`gfa_ut.cpp` 8662): deletes one integer unitig vertex with
+/// both arc directions and empties the unitig.
+pub fn ulg_seq_del(iug: &mut crate::assembly::unitig::UnitigGraph, s: u32) {
+    iug.graph.sequences[s as usize].deleted = true;
+    for k in 0..2u32 {
+        let v = (s << 1) | k;
+        let targets: Vec<u32> = iug.graph.arcs_of(v).iter().map(|a| a.v).collect();
+        for t in targets {
+            iug.graph.delete_arc(v, t, true);
+            iug.graph.delete_arc(t ^ 1, v ^ 1, true);
+        }
+    }
+    iug.unitigs[s as usize] = MaUtg::default();
+}
+
+/// `ulg_arc_cut_tips` (`gfa_ut.cpp` 8673).
+#[allow(clippy::too_many_arguments)]
+pub fn ulg_arc_cut_tips(
+    ctx: &mut UlResolve,
+    max_ext: u32,
+    max_ext_hifi: u32,
+    is_double_check: bool,
+    b: &mut Vec<u64>,
+    ub: &mut Vec<u64>,
+) -> u32 {
+    let n_vtx = (ctx.iug.graph.sequences.len() << 1) as u32;
+    b.clear();
+    let mut cnt = 0u32;
+    for v in 0..n_vtx {
+        if ctx.iug.graph.sequences[(v >> 1) as usize].deleted {
+            continue;
+        }
+        if get_arcs(&ctx.iug.graph, v ^ 1, None, 1) != 0 {
+            continue;
+        }
+        let mut ul_occ = 0u32;
+        ctx.get_iug_u_raw_occ(v >> 1, Some(&mut ul_occ), None);
+        let mut kv = ul_occ;
+        let mut is_telo = ctx
+            .telo
+            .is_some_and(|t| t[(v >> 1) as usize] != 0);
+        let mut w = v;
+        for _ in 0..max_ext {
+            let (kind, lw) = ctx.iug.graph.is_unitig_end(w ^ 1);
+            if kind != crate::assembly::asg::ASG_ET_MERGEABLE {
+                break;
+            }
+            w = lw.expect("a mergeable edge always reports its endpoint") as u32;
+            ctx.get_iug_u_raw_occ(w >> 1, Some(&mut ul_occ), None);
+            kv += ul_occ;
+            if let Some(t) = ctx.telo {
+                if t[(w >> 1) as usize] != 0 {
+                    is_telo = true;
+                }
+            }
+        }
+        if kv <= max_ext && !is_telo {
+            b.push((u64::from(kv) << 32) | u64::from(v));
+        }
+    }
+    radix_sort_u64(b);
+    for k in 0..b.len() {
+        let v = b[k] as u32;
+        if ctx.iug.graph.sequences[(v >> 1) as usize].deleted {
+            continue;
+        }
+        if get_arcs(&ctx.iug.graph, v ^ 1, None, 1) != 0 {
+            continue;
+        }
+        let pb = b.len();
+        b.push(u64::from(v));
+        let mut ul_occ = 0u32;
+        ctx.get_iug_u_raw_occ(v >> 1, Some(&mut ul_occ), None);
+        let mut kv = ul_occ;
+        let mut is_telo = ctx
+            .telo
+            .is_some_and(|t| t[(v >> 1) as usize] != 0);
+        let mut w = v;
+        for _ in 0..max_ext {
+            let (kind, lw) = ctx.iug.graph.is_unitig_end(w ^ 1);
+            if kind != crate::assembly::asg::ASG_ET_MERGEABLE {
+                break;
+            }
+            w = lw.expect("a mergeable edge always reports its endpoint") as u32;
+            b.push(u64::from(w));
+            ctx.get_iug_u_raw_occ(w >> 1, Some(&mut ul_occ), None);
+            kv += ul_occ;
+            if let Some(t) = ctx.telo {
+                if t[(w >> 1) as usize] != 0 {
+                    is_telo = true;
+                }
+            }
+        }
+        if !is_telo && kv <= max_ext {
+            let mut del_occ = 0u32;
+            if get_remove_hifi_occ(
+                ctx,
+                u64::from(max_ext_hifi),
+                &b[pb..],
+                ub,
+                Some(&mut del_occ),
+            ) {
+                let (mut w_occ, mut a_occ) = (0u32, 0u32);
+                if is_double_check {
+                    ctx.get_bridges(&b[pb..], Some(&mut w_occ), Some(&mut a_occ));
+                }
+                if !is_double_check || w_occ > 0 || a_occ > 0 || kv == 0 || del_occ == 0 {
+                    for i in pb..b.len() {
+                        ulg_seq_del(ctx.iug, (b[i] >> 1) as u32);
+                    }
+                    cnt += (b.len() - pb) as u32;
+                }
+            }
+        }
+        b.truncate(pb);
+    }
+    if cnt > 0 {
+        ctx.iug.graph.cleanup();
+    }
+    cnt
+}
+
+/// `get_ug_integer_seq_occ` (`gfa_ut.cpp` 10162): the raw read count of the
+/// integer sequence of a path.
+fn get_ug_integer_seq_occ(ctx: &UlResolve, u_a: &[u64], b: &mut Vec<u64>) -> u32 {
+    let bn = b.len();
+    gen_ug_integer_seq_on_fly(&*ctx.cov, ctx.z_items, ctx.raw, u_a, b);
+    let mut occ = 0u32;
+    for k in bn..b.len() {
+        occ += ctx.raw.unitigs[(b[k] >> 1) as usize].reads.len() as u32;
+    }
+    b.truncate(bn);
+    occ
+}
+
+/// `ul_occ_check` (`gfa_ut.cpp` 10173).
+#[allow(clippy::too_many_arguments)]
+fn ul_occ_check(
+    ctx: &mut UlResolve,
+    qocc_ul: u32,
+    qocc_hifi: u32,
+    tv: u32,
+    occ_rate: f32,
+    b: &mut Vec<u64>,
+    ub: &mut Vec<u64>,
+) -> bool {
+    let bn = b.len();
+    get_ul_path_info(
+        &ctx.iug.graph, &*ctx.cov, None, tv, None, None, None, None, None, b,
+    );
+    let mut tocc_ul = 0u32;
+    for z in bn..b.len() {
+        let mut ul = 0u32;
+        ctx.get_iug_u_raw_occ((b[z] >> 1) as u32, Some(&mut ul), None);
+        tocc_ul += ul;
+    }
+    let path: Vec<u64> = b[bn..].to_vec();
+    let tocc_hifi = get_ug_integer_seq_occ(ctx, &path, ub);
+    b.truncate(bn);
+    (qocc_ul as f32) <= (tocc_ul as f32 * occ_rate)
+        && (qocc_hifi as f32) <= (tocc_hifi as f32 * occ_rate)
+}
+
+/// `ul_homo_path_check` (`gfa_ut.cpp` 10198).
+#[allow(clippy::too_many_arguments)]
+fn ul_homo_path_check(
+    ctx: &mut UlResolve,
+    v: u32,
+    w: u32,
+    raw_ug_occ: u32,
+    match_rate: f32,
+    b: &mut Vec<u64>,
+    rb: &mut Vec<u64>,
+) -> bool {
+    let bn = b.len();
+    let rbn = rb.len();
+    get_ul_path_info(&ctx.iug.graph, &*ctx.cov, None, v, None, None, None, None, None, b);
+    let vn = b.len() - bn;
+    get_ul_path_info(&ctx.iug.graph, &*ctx.cov, None, w, None, None, None, None, None, b);
+    let wn = b.len() - bn - vn;
+    let va: Vec<u64> = b[bn..bn + vn].to_vec();
+    let wa: Vec<u64> = b[bn + vn..].to_vec();
+    gen_ug_integer_seq_on_fly(&*ctx.cov, ctx.z_items, ctx.raw, &va, rb);
+    let rvn = rb.len() - rbn;
+    let rva: Vec<u64> = rb[rbn..].to_vec();
+    gen_ug_integer_seq_on_fly(&*ctx.cov, ctx.z_items, ctx.raw, &wa, rb);
+    let rwn = rb.len() - rbn - rvn;
+    let rwa: Vec<u64> = rb[rbn + rvn..].to_vec();
+    b.truncate(bn);
+    for (k, &word) in rva.iter().enumerate() {
+        let rid = (word >> 1) as u32;
+        let mut x: u64;
+        if ctx.bub.is_bubble(rid) {
+            x = (u64::from(ctx.bub.index[rid as usize]) | 0x8000_0000) << 32;
+        } else {
+            x = u64::from(rid) << 32;
+        }
+        x |= (k as u64) << 1;
+        b.push(x);
+    }
+    for (k, &word) in rwa.iter().enumerate() {
+        let rid = (word >> 1) as u32;
+        let mut x: u64;
+        if ctx.bub.is_bubble(rid) {
+            x = (u64::from(ctx.bub.index[rid as usize]) | 0x8000_0000) << 32;
+        } else {
+            x = u64::from(rid) << 32;
+        }
+        x |= 1;
+        x |= (k as u64) << 1;
+        b.push(x);
+    }
+    radix_sort_u64(&mut b[bn..]);
+    let mut o = [0u64; 2];
+    let mut l = bn;
+    let mut k = bn + 1;
+    loop {
+        let at_end = k == b.len();
+        if at_end || (b[k] >> 32) != (b[l] >> 32) {
+            if k - l > 1 {
+                let mut c = [0u64; 2];
+                let mut z = l;
+                while z < k {
+                    c[(b[z] & 1) as usize] += 1;
+                    if c[0] > 0 && c[1] > 0 {
+                        break;
+                    }
+                    z += 1;
+                }
+                if c[0] > 0 && c[1] > 0 {
+                    for z in l..k {
+                        o[(b[z] & 1) as usize] += 1;
+                        let mut x = (b[z] << 32) >> 32;
+                        x >>= 1;
+                        if b[z] & 1 != 0 {
+                            x |= 1 << 32;
+                        }
+                        b[z] = x;
+                    }
+                } else {
+                    for z in l..k {
+                        b[z] = u64::MAX;
+                    }
+                }
+            } else {
+                for z in l..k {
+                    b[z] = u64::MAX;
+                }
+            }
+            l = k;
+        }
+        if at_end {
+            break;
+        }
+        k += 1;
+    }
+    radix_sort_u64(&mut b[bn..]);
+    // The reference shrinks `b->n` but keeps reading the surviving entries
+    // past it through raw pointers; copy them out before the truncation.
+    let survivors: Vec<u64> = b[bn..].to_vec();
+    b.truncate(bn);
+    rb.truncate(rbn);
+    if o[0] > 0
+        && idx_check_rate(
+            &survivors[..o[0] as usize],
+            o[0],
+            u64::from(raw_ug_occ),
+            match_rate,
+        )
+    {
+        return true;
+    }
+    if o[1] > 0
+        && idx_check_rate(
+            &survivors[o[0] as usize..o[0] as usize + o[1] as usize],
+            o[1],
+            u64::from(raw_ug_occ),
+            match_rate,
+        )
+    {
+        return true;
+    }
+    false
+}
+
+/// `ulg_arc_cut_z` (`gfa_ut.cpp` 10337). `is_trio`/`max_drop_len` are unused
+/// in the reference body and dropped here.
+#[allow(clippy::too_many_arguments)]
+pub fn ulg_arc_cut_z(
+    ctx: &mut UlResolve,
+    max_ext: u32,
+    max_ext_hifi: u32,
+    len_rat: f32,
+    small_occ_rate: f32,
+    raw_ug_occ: u32,
+    raw_match_rate: f32,
+    skip_hom: bool,
+    b: &mut Vec<u64>,
+    ub: &mut Vec<u64>,
+) -> u32 {
+    let n_vtx = (ctx.iug.graph.sequences.len() << 1) as u32;
+    b.clear();
+    for v in 0..n_vtx {
+        if ctx.iug.graph.sequences[(v >> 1) as usize].deleted {
+            continue;
+        }
+        let av: Vec<AsgArc> = ctx.iug.graph.arcs_of(v).to_vec();
+        let nv = av.len();
+        if nv < 2 {
+            continue;
+        }
+        let mut kv = 0u32;
+        for arc in &av {
+            if arc.deleted {
+                continue;
+            }
+            kv += 1;
+            if kv > 2 {
+                break;
+            }
+        }
+        if kv != 2 {
+            continue;
+        }
+        for (i, arc) in av.iter().enumerate() {
+            if arc.deleted {
+                continue;
+            }
+            let kw = get_arcs(&ctx.iug.graph, arc.v ^ 1, None, 1) as u32;
+            if kw == 2 {
+                b.push(i as u64);
+            } else if kw == 1 {
+                ub.clear();
+                if get_ul_path_info(
+                    &ctx.iug.graph, &*ctx.cov, None, arc.v, None, None, None, None, None, ub,
+                ) == 1
+                {
+                    let mut raw_ul = 0u32;
+                    for &word in ub.iter() {
+                        let mut ul = 0u32;
+                        ctx.get_iug_u_raw_occ((word >> 1) as u32, Some(&mut ul), None);
+                        raw_ul += ul;
+                    }
+                    b.push((u64::from(raw_ul) << 32) | i as u64);
+                }
+            }
+        }
+    }
+    radix_sort_u64(b);
+    let mut cnt = 0u32;
+    for k in 0..b.len() {
+        let arc_index = (b[k] & 0xffff_ffff) as usize;
+        if ctx.iug.graph.arcs[arc_index].deleted {
+            continue;
+        }
+        let v = (ctx.iug.graph.arcs[arc_index].ul >> 32) as u32;
+        let w = ctx.iug.graph.arcs[arc_index].v ^ 1;
+        if ctx.iug.graph.sequences[(v >> 1) as usize].deleted
+            || ctx.iug.graph.sequences[(w >> 1) as usize].deleted
+        {
+            continue;
+        }
+        let av: Vec<AsgArc> = ctx.iug.graph.arcs_of(v).to_vec();
+        let nv = av.len();
+        let aw: Vec<AsgArc> = ctx.iug.graph.arcs_of(w).to_vec();
+        let nw = aw.len();
+        if nv <= 1 && nw <= 1 {
+            continue;
+        }
+        let mut vp = [v ^ 1, u32::MAX];
+        let ve = ctx.iug.graph.arcs[arc_index];
+        let mut kv = 0u32;
+        for arc in &av {
+            if arc.deleted {
+                continue;
+            }
+            if arc.v != w ^ 1 {
+                vp[1] = arc.v;
+            }
+            kv += 1;
+        }
+        let mut wp = [w ^ 1, u32::MAX];
+        let mut we: Option<AsgArc> = None;
+        let mut kw = 0u32;
+        for arc in &aw {
+            if arc.deleted {
+                continue;
+            }
+            if arc.v == v ^ 1 {
+                we = Some(*arc);
+            } else {
+                wp[1] = arc.v;
+            }
+            kw += 1;
+        }
+        if kv <= 1 && kw <= 1 {
+            continue;
+        }
+        if kv != 2 || kw > 2 {
+            continue;
+        }
+        let mut raw_ul = 0u32;
+        let mut wt = w;
+        let mut wte: Option<AsgArc> = we;
+        let mut kwt = kw;
+        let pb = b.len();
+        ub.clear();
+        if kw == 1 {
+            let kind = get_ul_path_info(
+                &ctx.iug.graph,
+                &*ctx.cov,
+                None,
+                w ^ 1,
+                Some(&mut wt),
+                None,
+                None,
+                None,
+                None,
+                b,
+            );
+            if kind == 1 {
+                // TWO_INPUT
+                for z in pb..b.len() {
+                    let mut ul = 0u32;
+                    ctx.get_iug_u_raw_occ((b[z] >> 1) as u32, Some(&mut ul), None);
+                    raw_ul += ul;
+                }
+                let ul_saved = wt;
+                // `get_arcs(ug->g, wt, &wt, 1); wt = ug->g->arc[wt].v^1;`
+                let mut idx1: Vec<usize> = Vec::new();
+                get_arcs(&ctx.iug.graph, wt, Some(&mut idx1), 1);
+                wt = ctx.iug.graph.arcs[idx1[0]].v ^ 1;
+                wp[0] = wt ^ 1;
+                wp[1] = u32::MAX;
+                let wtw: Vec<AsgArc> = ctx.iug.graph.arcs_of(wt).to_vec();
+                kwt = 0;
+                for arc in &wtw {
+                    if arc.deleted {
+                        continue;
+                    }
+                    if arc.v == ul_saved ^ 1 {
+                        wte = Some(*arc);
+                    } else {
+                        wp[1] = arc.v;
+                    }
+                    kwt += 1;
+                }
+            } else {
+                b.truncate(pb);
+                continue;
+            }
+        }
+        assert!(kv == 2 && kwt == 2);
+        if raw_ul <= max_ext {
+            let tail: Vec<u64> = b[pb..].to_vec();
+            if get_remove_hifi_occ(ctx, u64::from(max_ext_hifi), &tail, ub, None) {
+                let raw_hifi = get_ug_integer_seq_occ(ctx, &tail, ub);
+                b.truncate(pb);
+                if raw_ul > 0 {
+                    let mut ok = true;
+                    for tv in [vp[0], vp[1], wp[0], wp[1]] {
+                        if !ul_occ_check(ctx, raw_ul, raw_hifi, tv, small_occ_rate, b, ub) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                }
+                let mut w_q = 0u64;
+                let mut w_t = 0u64;
+                get_ul_arc_supports(ctx, &ve, b, ub, skip_hom, &mut w_q, &mut w_t);
+                b.truncate(pb);
+                ub.clear();
+                if w_q == u64::MAX || (w_q as f32) > (w_t as f32 * len_rat) {
+                    continue;
+                }
+                let wte = wte.expect("the extended target edge must exist");
+                let mut w_q = 0u64;
+                let mut w_t = 0u64;
+                get_ul_arc_supports(ctx, &wte, b, ub, skip_hom, &mut w_q, &mut w_t);
+                b.truncate(pb);
+                ub.clear();
+                if w_q == u64::MAX || (w_q as f32) > (w_t as f32 * len_rat) {
+                    continue;
+                }
+                if !ul_homo_path_check(ctx, vp[0], wp[1], raw_ug_occ, raw_match_rate, b, ub) {
+                    continue;
+                }
+                if !ul_homo_path_check(ctx, wp[0], vp[1], raw_ug_occ, raw_match_rate, b, ub) {
+                    continue;
+                }
+                if kw == 1 {
+                    let start = b.len();
+                    let mut wt2 = wt;
+                    get_ul_path_info(
+                        &ctx.iug.graph,
+                        &*ctx.cov,
+                        None,
+                        w ^ 1,
+                        Some(&mut wt2),
+                        None,
+                        None,
+                        None,
+                        None,
+                        b,
+                    );
+                    for z in start..b.len() {
+                        ulg_seq_del(ctx.iug, (b[z] >> 1) as u32);
+                    }
+                }
+                ctx.iug.graph.arcs[arc_index].deleted = true;
+                ctx.iug.graph.delete_first_arc(w, v ^ 1);
+                cnt += 1;
+            }
+        }
+        b.truncate(pb);
+    }
+    if cnt > 0 {
+        ctx.iug.graph.cleanup();
+    }
+    cnt
+}
+
+/// `ulg_bub_pop_cut_aux` (`gfa_ut.cpp` 9865): the cut form of the bubble pop
+/// — deletes the off-path bubble vertices when they carry little coverage.
+#[allow(clippy::too_many_arguments)]
+fn ulg_bub_pop_cut_aux(
+    ctx: &mut UlResolve,
+    v0: u32,
+    x: &mut crate::assembly::bubble::BubbleBuffer,
+    max_ext: u32,
+    max_ext_hifi: u32,
+    b: &mut Vec<u64>,
+    ub: &mut Vec<u64>,
+) -> u64 {
+    let bn = b.len();
+    let mut v = x.sources[0];
+    loop {
+        let u = x.info[v as usize].parent;
+        x.info[v as usize].distance = u32::MAX;
+        v = u;
+        if v == v0 {
+            break;
+        }
+    }
+    let mut n_ext = 0u32;
+    for &node in &x.visited {
+        if x.info[node as usize].distance == u32::MAX {
+            continue;
+        }
+        let mut ul_occ = 0u32;
+        ctx.get_iug_u_raw_occ(node >> 1, Some(&mut ul_occ), None);
+        n_ext += ul_occ;
+        b.push(u64::from(node));
+    }
+    let mut r = 0u64;
+    if n_ext <= max_ext {
+        let tail: Vec<u64> = b[bn..].to_vec();
+        if get_remove_hifi_occ(ctx, u64::from(max_ext_hifi), &tail, ub, None) {
+            r = 1;
+        }
+    }
+    b.truncate(bn);
+    r
+}
+
+/// `ulg_bub_pop_backtrack` (`gfa_ut.cpp` 9887): the pop form — deletes the
+/// bubble and restores the optimal path.
+fn ulg_bub_pop_backtrack(
+    iug: &mut crate::assembly::unitig::UnitigGraph,
+    v0: u32,
+    x: &crate::assembly::bubble::BubbleBuffer,
+) -> u64 {
+    let mut cnt = x.visited_edges.len() as u64;
+    for &node in &x.visited {
+        iug.graph.sequences[(node >> 1) as usize].deleted = true;
+    }
+    for &edge in &x.visited_edges {
+        let arc = iug.graph.arcs[edge as usize];
+        iug.graph.arcs[edge as usize].deleted = true;
+        iug.graph.delete_arc(arc.v ^ 1, ((arc.ul >> 32) as u32) ^ 1, true);
+    }
+    let mut v = x.sources[0];
+    loop {
+        let u = x.info[v as usize].parent;
+        iug.graph.sequences[(v >> 1) as usize].deleted = false;
+        iug.graph.delete_arc(u, v, false);
+        iug.graph.delete_arc(v ^ 1, u ^ 1, false);
+        cnt -= 1;
+        v = u;
+        if v == v0 {
+            break;
+        }
+    }
+    let visited: Vec<u32> = x.visited.clone();
+    for &node in &visited {
+        if !iug.graph.sequences[(node >> 1) as usize].deleted {
+            continue;
+        }
+        ulg_seq_del(iug, node >> 1);
+    }
+    cnt
+}
+
+/// `ulg_bub_pop1` (`gfa_ut.cpp` 9941).
+#[allow(clippy::too_many_arguments)]
+pub fn ulg_bub_pop1(
+    ctx: &mut UlResolve,
+    v0: u32,
+    max_dist: u64,
+    x: &mut crate::assembly::bubble::BubbleBuffer,
+    max_ext: u32,
+    max_ext_hifi: u32,
+    check_bubble_only: bool,
+    is_pop: bool,
+    skip_hom: bool,
+    b: &mut Vec<u64>,
+    ub: &mut Vec<u64>,
+    r_w_c: &mut u32,
+    r_w_m: &mut u32,
+) -> u64 {
+    *r_w_c = u32::MAX;
+    *r_w_m = u32::MAX;
+    if ctx.iug.graph.sequences[(v0 >> 1) as usize].deleted
+        || get_arcs(&ctx.iug.graph, v0, None, 1) < 2
+    {
+        return 0;
+    }
+    x.sources.clear();
+    x.visited.clear();
+    x.visited_edges.clear();
+    let head = &mut x.info[v0 as usize];
+    head.positive_count = 0;
+    head.distance = 0;
+    head.negative_count = 0;
+    head.node_count = 0;
+    head.non_positive_count = 0;
+    x.sources.push(v0);
+    let mut cnt = 0u64;
+    let mut fail_b = false;
+    let mut n_tips = 0u32;
+    let mut tip_end = u32::MAX;
+    let mut n_pending = 0u32;
+    loop {
+        let v = x.sources.pop().expect("the search stack must not be empty");
+        let d = x.info[v as usize].distance;
+        let c = x.info[v as usize].positive_count;
+        let m = x.info[v as usize].negative_count;
+        let av: Vec<AsgArc> = ctx.iug.graph.arcs_of(v).to_vec();
+        let nv = av.len();
+        let kv = get_arcs(&ctx.iug.graph, v, None, 1) as u32;
+        let mut i = 0usize;
+        while i < nv {
+            let arc = av[i];
+            if arc.deleted {
+                i += 1;
+                continue;
+            }
+            let w = arc.v;
+            // `l = (uint32_t)av[i].ul`: the node length in the low half.
+            let l = if v == v0 { 0u32 } else { arc.ul as u32 };
+            if (w >> 1) == (v0 >> 1) {
+                fail_b = true;
+                break;
+            }
+            let (arc_start, _) = ctx.iug.graph.arc_range(v);
+            x.visited_edges.push((arc_start + i) as u32);
+            if u64::from(d.wrapping_add(l)) > max_dist {
+                fail_b = true;
+                break;
+            }
+            let kw = get_arcs(&ctx.iug.graph, w ^ 1, None, 1) as u32;
+            let mut wc = 0u64;
+            let wm = ctx.cov.get_ul_occ((w >> 1) as usize);
+            if !check_bubble_only {
+                if kv > 1 {
+                    let mut w_q = 0u64;
+                    let mut w_t = 0u64;
+                    get_ul_arc_supports(ctx, &arc, b, ub, skip_hom, &mut w_q, &mut w_t);
+                    if w_q < w_t {
+                        let ww = if w_q == 0 {
+                            10u64
+                        } else if w_t != 0 {
+                            ((w_t - w_q) * 10) / w_t
+                        } else {
+                            0
+                        };
+                        if ww > wc {
+                            wc = ww;
+                        }
+                    }
+                }
+                if kw > 1 {
+                    let we = ctx
+                        .iug
+                        .graph
+                        .get_arc(w ^ 1, v ^ 1)
+                        .expect("the mirror edge must exist");
+                    let mut w_q = 0u64;
+                    let mut w_t = 0u64;
+                    get_ul_arc_supports(ctx, &we, b, ub, skip_hom, &mut w_q, &mut w_t);
+                    if w_q < w_t {
+                        let ww = if w_q == 0 {
+                            10u64
+                        } else if w_t != 0 {
+                            ((w_t - w_q) * 10) / w_t
+                        } else {
+                            0
+                        };
+                        if ww > wc {
+                            wc = ww;
+                        }
+                    }
+                }
+            }
+            if !x.info[w as usize].state {
+                x.visited.push(w);
+                let t = &mut x.info[w as usize];
+                t.parent = v;
+                t.state = true;
+                t.distance = d.wrapping_add(l);
+                t.positive_count = (u64::from(c) + wc) as u32;
+                t.negative_count = (u64::from(m) + wm) as u32;
+                t.remaining = kw;
+                n_pending += 1;
+            } else {
+                let mut to_replace = false;
+                if u64::from(c) + wc < u64::from(x.info[w as usize].positive_count) {
+                    to_replace = true;
+                } else if u64::from(c) + wc == u64::from(x.info[w as usize].positive_count)
+                    && u64::from(m) + wm > u64::from(x.info[w as usize].negative_count)
+                {
+                    to_replace = true;
+                } else if u64::from(c) + wc == u64::from(x.info[w as usize].positive_count)
+                    && u64::from(m) + wm == u64::from(x.info[w as usize].negative_count)
+                    && d.wrapping_add(l) > x.info[w as usize].distance
+                {
+                    to_replace = true;
+                }
+                if to_replace {
+                    let t = &mut x.info[w as usize];
+                    t.parent = v;
+                    t.positive_count = (u64::from(c) + wc) as u32;
+                    t.negative_count = (u64::from(m) + wm) as u32;
+                }
+                if d.wrapping_add(l) < x.info[w as usize].distance {
+                    x.info[w as usize].distance = d.wrapping_add(l);
+                }
+            }
+            x.info[w as usize].remaining -= 1;
+            if x.info[w as usize].remaining == 0 {
+                let z = get_arcs(&ctx.iug.graph, w, None, 1) as u32;
+                if z > 0 {
+                    x.sources.push(w);
+                } else {
+                    if n_tips != 0 {
+                        fail_b = true;
+                        break;
+                    }
+                    n_tips += 1;
+                    tip_end = w;
+                }
+                n_pending -= 1;
+            }
+            i += 1;
+        }
+        if fail_b {
+            break;
+        }
+        if n_tips == 1 {
+            if tip_end != u32::MAX && n_pending == 0 && x.sources.is_empty() {
+                x.sources.push(tip_end);
+                break;
+            }
+            fail_b = true;
+            break;
+        }
+        if i < nv || x.sources.is_empty() {
+            fail_b = true;
+            break;
+        }
+        if !(x.sources.len() > 1 || n_pending > 0) {
+            break;
+        }
+    }
+    if !fail_b {
+        cnt = 1;
+        *r_w_c = x.info[x.sources[0] as usize].positive_count;
+        *r_w_m = x.info[x.sources[0] as usize].negative_count;
+        if !check_bubble_only {
+            if is_pop {
+                cnt = ulg_bub_pop_backtrack(ctx.iug, v0, x);
+            } else {
+                cnt = ulg_bub_pop_cut_aux(ctx, v0, x, max_ext, max_ext_hifi, b, ub);
+            }
+        }
+    }
+    for &node in &x.visited {
+        let t = &mut x.info[node as usize];
+        t.state = false;
+        t.positive_count = 0;
+        t.distance = 0;
+        t.negative_count = 0;
+        t.node_count = 0;
+        t.non_positive_count = 0;
+    }
+    if cnt == 0 {
+        *r_w_c = u32::MAX;
+        *r_w_m = u32::MAX;
+    }
+    cnt
+}
+
+/// `ulg_pop_bubble` (`gfa_ut.cpp` 10084).
+#[allow(clippy::too_many_arguments)]
+pub fn ulg_pop_bubble(
+    ctx: &mut UlResolve,
+    i_max_dist: Option<&mut u64>,
+    max_ext: u32,
+    max_ext_hifi: u32,
+    skip_hom: bool,
+    ob: &mut Vec<u64>,
+    ub: &mut Vec<u64>,
+) -> u64 {
+    if !ctx.iug.graph.is_symmetric {
+        ctx.iug.graph.symmetrize();
+    }
+    let n_vtx = (ctx.iug.graph.sequences.len() << 1) as u32;
+    let mut x = crate::assembly::bubble::BubbleBuffer::default();
+    x.info = vec![crate::assembly::bubble::BubbleInfo::default(); n_vtx as usize];
+    let max_dist = match i_max_dist {
+        Some(dist) => *dist,
+        None => crate::assembly::ul_renew_gfa::get_bub_pop_max_dist_advance(
+            &mut ctx.iug.graph,
+        ),
+    };
+    ob.clear();
+    ub.clear();
+    let mut n_pop = 0u64;
+    if max_dist > 0 {
+        for v in 0..n_vtx {
+            let nv = ctx.iug.graph.arcs_of(v).len();
+            if nv < 2 || ctx.iug.graph.sequences[(v >> 1) as usize].deleted {
+                continue;
+            }
+            let n_arc = ctx
+                .iug
+                .graph
+                .arcs_of(v)
+                .iter()
+                .filter(|a| !a.deleted)
+                .count();
+            if n_arc < 2 {
+                continue;
+            }
+            ob.clear();
+            ub.clear();
+            let mut wc = [0u32; 2];
+            let mut wm = [0u32; 2];
+            if ulg_bub_pop1(
+                ctx, v, max_dist, &mut x, max_ext, max_ext_hifi, true, false, skip_hom, ob, ub,
+                &mut wc[0], &mut wm[0],
+            ) != 0
+            {
+                let w = x.sources[0] ^ 1;
+                let mut mm_c = u32::MAX;
+                let mut mm_m = u32::MAX;
+                let mut mm_v = u32::MAX;
+                ob.clear();
+                ub.clear();
+                if ulg_bub_pop1(
+                    ctx, v, max_dist, &mut x, max_ext, max_ext_hifi, false, false, skip_hom, ob,
+                    ub, &mut wc[0], &mut wm[0],
+                ) != 0
+                {
+                    mm_c = wc[0];
+                    mm_m = wm[0];
+                    mm_v = v;
+                }
+                ob.clear();
+                ub.clear();
+                if ulg_bub_pop1(
+                    ctx, w, max_dist, &mut x, max_ext, max_ext_hifi, false, false, skip_hom, ob,
+                    ub, &mut wc[1], &mut wm[1],
+                ) != 0
+                {
+                    // The reference's condition requires both `wc[1] < mm_c`
+                    // and `wc[1] == mm_c`, so it only fires on the unset
+                    // sentinel; replicated verbatim.
+                    if (wc[1] < mm_c) && (wc[1] == mm_c && wm[1] > mm_m) {
+                        mm_c = wc[1];
+                        mm_m = wm[1];
+                        mm_v = w;
+                    }
+                }
+                if mm_v != u32::MAX {
+                    ob.clear();
+                    ub.clear();
+                    let popped = ulg_bub_pop1(
+                        ctx, mm_v, max_dist, &mut x, max_ext, max_ext_hifi, false, true,
+                        skip_hom, ob, ub, &mut wc[0], &mut wm[0],
+                    );
+                    assert!(popped != 0);
+                    n_pop += popped;
+                }
+            }
+        }
+    }
+    if n_pop > 0 {
+        ctx.iug.graph.cleanup();
+    }
+    n_pop
 }
