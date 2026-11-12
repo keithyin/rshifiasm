@@ -3460,3 +3460,47 @@ convert_usg_t + idx_a/extra 顶点 + 第一遍 scaffold 收集。缺：
   （res_dump 按 seq_id 升序拼接），与 hifiasm 默认 `-t 1` 一致。
 - `u2g_hybrid_aln` 输出约定：ob = 纯路径顶点拼接，ub =
   `<offset>:32|<len>:32`（按 seq_id 排序）。
+
+## 续十三（2026-11-12，renew_ng 完成与 rescall 上下文重构）
+
+1. **renew_ng 全量完成**（15107，提交 d1e92f8）：
+   - `fill_scaffolds`(14932) = `reload_uu`（clear + `load_all_ul_t(".{bin}")`
+     + gen_ul_vec_rid_t）→ `gen_scaffold_id`(14837，扫 `UL_INF.ridx` 的
+     bb 链找 dd==3 的 UL 桥接，填 ulid/raw_sof/raw_eof）→ `dd=4` 标记 →
+     `load_scaf_base`(14330，读 `.uidx.ucr.bin`：[rid:u64][len:u32]
+     [N_site.n:u64][N_site][r_base(len/4+1)]，只装 dd==4 的)。
+   - `realloc_rdb_adv`(14663)：Rust ReadStore 扩展
+     （read_names/read_lengths/sequences(PackedSequence)/trio_labels/
+     coverage_cut），scaffold 节点走 `reset_scaf_node_uinfo`（三态）+
+     `push_scaf_bases`(14620：两端 get_end_hifi + 中段 get_ul_subregion
+     或 'A' 填充 + encode_base)，ff==1 时 `ng.seq[i].del=1`；名字
+     （scaf / UL 读名）；`ruIndex.index = -1`；`reset_bub_label_t`。
+   - 第二遍弧构建（15229-15325）：unitig 内部弧 + h_usg 弧，
+     `gen_spec_edge(ng, sources=更新后的 R_INF.paf)`；失败 → scaffold
+     节点：`ng.seq[nocc].del` 时 `push_direct_scaff_node`(15019，
+     gen_spec_rc_edge 差值 5%/16 容差判定) 否则 `push_scaff_node`(17234)
+     两条 min_ovlp 假重叠 + 4 条弧。`asg_cleanup(ng)`、nocc 断言。
+   - `update_paf`/`push_scaff_node`/`renew_paf0/paf1` 改为 PafList 原生；
+     renew_paf1 的 len 占位 0 修复为 `ng.sequences[k].length`。
+   - `get_ul_subregion`(14563)/`get_end_hifi`(14400) 新增。
+2. **ul_recall 上下文自洽化**：`gen_ul_reovlps` 改收
+   (reads, sources(每读 Vec<PafHit>), unitigs, read_graph, 采样/悬摆
+   参数) 内部自建 ScallContext/UlRescallContext（unitig_graph =
+   新图，cc = gen_ul_idx 的 cc）；`ul_realignment` 改收
+   (reads, source_lists(&[PafList]), coverage_cut, sg, bin_file, ...)
+   并在内部扁平化 PafList→Vec<PafHit>。round≥2 的重对齐现在用新图。
+
+### 续十四待办（精确）
+
+1. `shrink_uls`/`shrink_ul0`(7742)/`shrink_1b`(7837)/`renew_ul_vec_t`
+   (7848)/`rebuid_idx`(7653) —— `ul_re_correct` 即使
+   `integer_correct_round=0` 也会调 `shrink_uls`（bb 链按 pidx/pdis 连通
+   性分裂 + 重挂 ridx/pstr）。**先确认默认 0 轮时它是否为恒等**（若每条
+   UL 的 str 链是单连通块则 buf->u.n==0 → str->cn=0？！注意
+   `buf->u.n <= 0` 时 `str->cn = str->n = 0` —— 这会把 UL 全清空，
+   需要仔细比对 is_conn 判定，不可跳过）。
+2. `ul_realignment_gfa`(17598) 组装 + `renew_g`(Overlaps.cpp 39262)/
+   `gradually_renew_g`(39297) + pipeline.rs 接线（ul_clean_gfa 之后按
+   ar 分叉）。deep_clean/hic_clean_adv 仍 stub（hic.cpp 泡泡机制）。
+3. `renew_r_to_u`（ul_renew_ng.rs:673）改 PafList 原生。
+4. U7：解除 --ul parse 拒绝 + e2e 门禁。
