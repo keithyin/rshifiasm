@@ -2843,6 +2843,65 @@ bub_links 之前、`asg_arc_cut_chimeric` 用 `UL_COV_THRES`、循环内
 `comput_sc_partial_cigar`(已有) + `check_trans_rate_gap` 簇 +
 `worker_for_ul_recorrect_alignment`(12550 区) + `recorrect_ul_pipeline`(20047)。
 
+## U6 续二（2026-11-12 第三轮，rescall 驱动落地）
+
+- `74dae2e` **`ul_mask.rs`（push_graph_bin 子树 + msk 缓存）**：
+  `gen_src_shared_interval_adv`、`trans_ovlp_connect`、`is_mask_err_full`、
+  `cal_exact_len`/`cal_exact_batch`（左/右两端 exact run）、
+  `get_mask_interval`（游标 `usize::MAX` 表示 -1）、`full_lst_set`、
+  `push_emask0`/`push_emask_lst`、`srt_kv_emask_t`、`push_graph_bin`
+  （b0 三组排序切分 a2/a1/a0、mn 配额）、`write_emask_table`/
+  `load_emask_table`（`.ul.msk.bin` = fingerprint + u32 n + 每单位图
+  (u64 n + n×32B 记录；emask_t 32 字节 = 28 载荷 + 1 标志字节 + 3 零填充，
+  memset 保证逐字节可复现）。
+- **`ul_binning.rs`**：`build_binning_index`（GBIN_K/W=31/31 的
+  count/fill/sort/remap/cut，复用 TransBaseIndex 结构）+
+  `graph_ovlp_binning`（每单位图 `ug_map_lchain_simple` 等价物：
+  sketch → minimizers_qgen_input(SeedInput) → lchain_qgen_mcopy_input →
+  `ug_lalign_public` ×2（GBIN_E=0.04, wl=375）→ `push_graph_bin`）。
+  `ul_align::ul_map_lchain` 拆出 `ul_map_lchain_khit`（rescall 传
+  mcopy_khit_cut=1）。
+- **`ul_recall.rs`**：`RescallParameters`（init_mg_opt 19/10）、
+  `RescallBuffers`、`rescall_one_read`（worker_for_ul_rescall_alignment：
+  ul_map_lchain(khit=1) → ul_lalign 第一遍(aln=NULL) → gen_aux_ovlp →
+  gl_chain_flter → gen_shared_intervals → filter_topN →
+  update_sketch_trace（b0=idx/b1=dp/b2=trace 的存取舞步）→ ul_lalign
+  第二遍(aln=lo) → 恢复循环（[live..ton) 单窗口回填 + live=ton）→
+  gl_chain）、`rescall_ul_pipeline`（分块 + `write_compress_base_disk`
+  到 `.uidx.ucr.bin`）、`gen_ul_reovlps`（gen_ul_idx → uidx 缓存 →
+  msk 缓存 → rescall）、`ul_realignment`（gen_polished_ug → 缓存 →
+  filter_ul_ug → gen_ul_vec_rid_t → update_ug_arch_ul_mul）。
+  `ul_index::gen_ul_idx` 公开包装（cc 数组随 UlIndex 带出）。
+  **length 显式传递**：`gl_chain_flter`/`filter_sec`/`filter_topN`/
+  `gl_chain` 改为 slice+`&mut usize`，截断改为 swap 压缩（worker 的
+  恢复循环依赖尾部保留的被丢条目——C 的 `ol->length` 语义）。
+  `ul_lalign`/`rphase_hl`/`mask_ovlps` 的 `mm` 改为 `&EmaskTable`（只读）。
+  `P_CHAIN_RATE` 改 pub；`ul_store::encode_base_public` 新增。
+
+**下一批（接线与剩余 renewal，按序）**：
+1. `ul_realignment_gfa`(gfa_ut.cpp 17598) 已读完：hic_clean(sg)（已有）→
+   deep_clean 时 `deep_graph_clean`（**缺**）→ `ul_realignment`（已搭）→
+   `filter_sg_by_ug`（**缺**）→ `gen_bubble_chain`（**缺**，
+   trio_dual.rs 的同名是别的）→ `init_ul_resolve_t`（**缺**，
+   ul_resolve_t/ulg_opt_t 结构）→ rlen 备份（!free_uld）→
+   `ul_re_correct(uidx, integer_correct_round)`（**缺**，integer 簇）→
+   `init_ulg_opt_t` → `gen_ul2ul(uidx, uopt, &uu, 0, is_bridg)`（**缺**，
+   inter.cpp 16827）→ `renew_ng(uidx->uovl.h_usg, init_ug, sg, uopt, cov,
+   ruIndex, 16, bin_file)`（**缺**，inter.cpp 15107）→ 替换 sg/sources →
+   `renew_R_to_U`（**缺**）→ `post_rescue`（已有 rescue.rs）。
+2. `gradually_renew_g`(39297)/`renew_g`(39271) 接入 pipeline.rs
+   clean_graph 尾部（`ul_clean_gfa` 之后；renew 参数
+   free_uld=(ul_aln_round<=1)、is_bridg=1、deep_clean=(polyploidy<=2)，
+   第一轮 bin_file="re"；后续 k=1..ul_aln_round 用 "re{k}"、
+   free_uld=((k+1)==ul_aln_round)、is_bridg=0、deep_clean=0；
+   每轮 gen_ug_opt_t + ug_ext_gfa + hic_clean_adv）。
+3. 门禁顺序：先 `.re.ul.msk.bin` 逐字节（binning）→ `.re.ul.ovlp.bin`
+   字段（rescall）→ 8 个 GFA/BED 逐字节（renew_ng 全链）→ U7 解锁
+   `--ul` parse 拒绝。
+4. recorrect 侧（worker_for_ul_recorrect_alignment + recorrect_ul_pipeline
+   + gl_chain_refine_advance 簇）暂按 C 排查是否在默认 ul_clean_round=1
+   路径上（ul_re_correct 的 integer_correct_round 默认 0）。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
