@@ -69,6 +69,7 @@ fn complement_byte(base: u8) -> u8 {
 
 /// The unitig list and unitig graph of the reference's `ma_ug_t`.
 #[derive(Debug, Clone, Default)]
+/// The unitig graph, `ma_ug_t`.
 pub struct UnitigGraph {
     /// `ma_ug_t::u`.
     pub unitigs: Vec<MaUtg>,

@@ -120,6 +120,10 @@ pub struct Ul2ulIdx {
     pub h_usg: Usg,
     /// `cc.uc` (the coverage of every vertex, `renew_u2g_cov`).
     pub uc: Vec<u32>,
+    /// `bg`, the bridge table (`renew_u2g_bg`).
+    pub bg: UlBg,
+    /// `i_ug`, the integer unitig graph (`ma_ug_gen` of `i_g`).
+    pub i_ug: crate::assembly::unitig::UnitigGraph,
 }
 
 impl Ul2ulIdx {
@@ -997,11 +1001,23 @@ pub fn integer_sg_gen(
 }
 
 /// The `gen_ul2ul` driver (`gfa_ut.cpp` 16827) for the default path.
+#[allow(clippy::too_many_arguments)]
 pub fn gen_ul2ul(
     store: &mut AllUl,
     unitig_graph: &mut UnitigGraph,
+    sg: &crate::assembly::asg::Asg,
     str_idx: &UlStrIdx,
-    min_ovlp: i64,
+    bub: &crate::assembly::bubble_chain::BubbleType,
+    sources: &[Vec<crate::overlap::paf::PafHit>],
+    reads: &crate::reads::ReadStore,
+    minimum_overlap: i64,
+    maximum_hang: i32,
+    maximum_hang_rate: f32,
+    gap_fuzz: i32,
+    b_mask: &mut crate::assembly::bubble::BubbleLabel,
+    options: &crate::assembly::ulg_clean::UlgOptions,
+    keep_raw_utg: bool,
+    is_bridg: bool,
 ) -> Ul2ulIdx {
     let uln = store.reads.len() as u64;
     let gn = unitig_graph.graph.sequences.len() as u64;
@@ -1148,8 +1164,65 @@ pub fn gen_ul2ul(
         str_idx,
         &unitig_graph.unitigs,
         &unitig_graph.graph,
-        min_ovlp,
+        minimum_overlap,
     );
+    // `asg_arc_del_trans(z->i_g, uopt->gap_fuzz); z->i_ug = ma_ug_gen(z->i_g);`
+    crate::assembly::graph_build::asg_arc_del_trans(&mut z.i_g, gap_fuzz);
+    z.i_ug = crate::assembly::unitig::ma_ug_gen(&mut z.i_g);
+    // `renew_u2g_cov(uidx, uidx->uopt->te); renew_u2g_bg(uidx);`
+    let mut cov = std::mem::take(&mut z.cov);
+    renew_u2g_cov(
+        &z,
+        &z.i_ug.unitigs,
+        unitig_graph,
+        sources,
+        reads,
+        maximum_hang,
+        maximum_hang_rate,
+        minimum_overlap as i32,
+        &mut cov,
+        str_idx,
+    );
+    z.cov = cov;
+    z.bg = renew_u2g_bg(&z.cov, str_idx, &z.i_ug.graph, unitig_graph, bub);
+    // `u2g_clean(uidx, ulopt, keep_raw_utg, is_bridg)`
+    let mut cov = std::mem::take(&mut z.cov);
+    let mut bg = std::mem::take(&mut z.bg);
+    let mut i_ug = std::mem::take(&mut z.i_ug);
+    let ctx_unitig_reads: Vec<Vec<u64>> = unitig_graph
+        .unitigs
+        .iter()
+        .map(|u| u.reads.clone())
+        .collect();
+    let ctx_raw_unitigs: Vec<crate::assembly::asg::MaUtg> = unitig_graph.unitigs.clone();
+    let ng = crate::assembly::ulg_clean::u2g_clean(
+        &mut cov,
+        &mut bg,
+        &z,
+        &mut i_ug,
+        &z.i_g,
+        unitig_graph,
+        sg,
+        &store.reads,
+        &ctx_raw_unitigs,
+        &reads.read_lengths,
+        &ctx_unitig_reads,
+        str_idx,
+        bub,
+        sources,
+        reads,
+        maximum_hang,
+        maximum_hang_rate,
+        minimum_overlap,
+        b_mask,
+        options,
+        keep_raw_utg,
+        is_bridg,
+    );
+    z.i_ug = i_ug;
+    z.cov = cov;
+    z.bg = bg;
+    z.h_usg = ng;
     z
 }
 
@@ -1800,10 +1873,12 @@ pub fn renew_ul2_utg(
     maximum_hang: i32,
     maximum_hang_rate: f32,
     minimum_overlap: i32,
-) {
-    // `renew_utg(&i_ug, i_g, NULL)` — `ma_ug_gen` on the renewed graph.
-    let rebuilt = crate::assembly::unitig::ma_ug_gen(&mut i_g.clone());
-    *i_ug = rebuilt;
+    bub: &crate::assembly::bubble_chain::BubbleType,
+) -> UlBg {
+    // `renew_utg(&i_ug, i_g, NULL)`: regroup the (mutated) unitig graph and
+    // merge the unitig contents back from the integer string graph.
+    crate::assembly::unitig::renew_utg(i_ug, i_g, &[]);
+    i_ug.graph.sequence_visited = vec![0u8; i_ug.graph.sequences.len() * 2];
     let mut cov = std::mem::take(&mut z.cov);
     renew_u2g_cov(
         z,
@@ -1818,13 +1893,13 @@ pub fn renew_ul2_utg(
         str_idx,
     );
     z.cov = cov;
+    renew_u2g_bg(&z.cov, str_idx, &i_ug.graph, raw, bub)
 }
 
 /// `u2g_threading` (`gfa_ut.cpp` 16146): builds `h_usg` from the raw graph
 /// plus the integer-unitig walks.
 #[allow(clippy::too_many_arguments)]
 pub fn u2g_threading(
-    z: &mut Ul2ulIdx,
     iug: &crate::assembly::unitig::UnitigGraph,
     raw: &crate::assembly::unitig::UnitigGraph,
     sg: &crate::assembly::asg::Asg,

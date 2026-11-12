@@ -3105,3 +3105,190 @@ pub fn ulg_pop_bubble(
     }
     n_pop
 }
+/// `ulg_opt_t`, reduced to the fields `u2g_clean` consumes (`gfa_ut.cpp`
+/// 16906).
+#[derive(Debug, Clone)]
+pub struct UlgOptions {
+    /// `clean_round`.
+    pub clean_round: i64,
+    /// `min_path_drop_ratio`.
+    pub min_path_drop_ratio: f64,
+    /// `max_path_drop_ratio`.
+    pub max_path_drop_ratio: f64,
+    /// `max_tip`.
+    pub max_tip: i64,
+    /// `max_tip_hifi`.
+    pub max_tip_hifi: i64,
+    /// `is_trio`.
+    pub is_trio: bool,
+}
+
+/// `u2g_clean` (`gfa_ut.cpp` 16281): the whole integer-unitig cleanup —
+/// repeated support/tip cuts, bubble pops and the z-shaped chimeric cuts —
+/// then the `renew_ul2_utg` rebuild and the `u2g_threading` of `h_usg`.
+///
+/// `cov`/`bg` are the caller's `mem::take` of `z.cov`/`z.bg`; the rebuild
+/// refills both.
+#[allow(clippy::too_many_arguments)]
+pub fn u2g_clean(
+    cov: &mut UlCov,
+    bg: &mut UlBg,
+    z_items: &Ul2ulIdx,
+    iug: &mut crate::assembly::unitig::UnitigGraph,
+    i_g: &Asg,
+    raw: &crate::assembly::unitig::UnitigGraph,
+    sg: &Asg,
+    store: &[crate::assembly::ul_store::UlReadVec],
+    raw_unitigs: &[MaUtg],
+    read_lengths: &[u64],
+    unitig_reads: &[Vec<u64>],
+    str_idx: &crate::assembly::ul_integer::UlStrIdx,
+    bub: &BubbleType,
+    sources: &[Vec<crate::overlap::paf::PafHit>],
+    reads: &crate::reads::ReadStore,
+    maximum_hang: i32,
+    maximum_hang_rate: f32,
+    minimum_overlap: i64,
+    b_mask: &mut crate::assembly::bubble::BubbleLabel,
+    options: &UlgOptions,
+    keep_raw_utg: bool,
+    is_bridg: bool,
+) -> Usg {
+    // `CALLOC(iug->g->seq_vis, iug->g->n_seq*2)`
+    iug.graph.sequence_visited = vec![0u8; iug.graph.sequences.len() * 2];
+    let mut bu: Vec<u64> = Vec::new();
+    let mut uu: Vec<u64> = Vec::new();
+    let step = if options.clean_round == 1 {
+        options.max_path_drop_ratio
+    } else {
+        (options.max_path_drop_ratio - options.min_path_drop_ratio)
+            / ((options.clean_round - 1) as f64)
+    };
+    let mut max_tip_hifi = options.max_tip_hifi;
+    for _ss in 0..2i64 {
+        for i in 0..options.clean_round {
+            let mut drop = options.min_path_drop_ratio + step * (i as f64);
+            if drop > options.max_path_drop_ratio {
+                drop = options.max_path_drop_ratio;
+            }
+            for (topo_level, mm_tip, double_check) in [
+                (2u32, options.max_tip, true),
+                (1, options.max_tip, true),
+                (1, 0x7fff_ffffi64, false),
+            ] {
+                let mut cnt = 1u32;
+                while cnt != 0 {
+                    cnt = 0;
+                    crate::assembly::bubble_identify::asg_arc_identify_simple_bubbles_multi(
+                        &mut iug.graph, b_mask, false, 0,
+                    );
+                    let mut ctx = UlResolve {
+                        cov: &mut *cov,
+                        z_items,
+                        iug,
+                        raw,
+                        store,
+                        raw_unitigs,
+                        read_lengths,
+                        unitig_reads,
+                        str_idx,
+                        bub,
+                        bg: &*bg,
+                        // `uidx->uovl.telo`: only populated with
+                        // `--telo-motif`, which is not ported yet.
+                        telo: None,
+                    };
+                    cnt += ulg_arc_cut_supports(
+                        &mut ctx,
+                        mm_tip as i32,
+                        max_tip_hifi as u32,
+                        drop as f32,
+                        topo_level,
+                        true,
+                        keep_raw_utg,
+                        &mut bu,
+                        &mut uu,
+                    );
+                    cnt += ulg_arc_cut_tips(
+                        &mut ctx,
+                        mm_tip as u32,
+                        max_tip_hifi as u32,
+                        double_check,
+                        &mut bu,
+                        &mut uu,
+                    );
+                }
+            }
+        }
+        {
+            let mut ctx = UlResolve {
+                cov: &mut *cov,
+                z_items,
+                iug,
+                raw,
+                store,
+                raw_unitigs,
+                read_lengths,
+                unitig_reads,
+                str_idx,
+                bub,
+                bg: &*bg,
+                telo: None,
+            };
+            ulg_pop_bubble(
+                &mut ctx,
+                None,
+                0x7fff_ffffu32,
+                max_tip_hifi as u32,
+                true,
+                &mut bu,
+                &mut uu,
+            );
+            while ulg_arc_cut_z(
+                &mut ctx,
+                0x7fff_ffffu32,
+                max_tip_hifi as u32,
+                1.5,
+                0.15,
+                100,
+                0.8,
+                true,
+                &mut bu,
+                &mut uu,
+            ) != 0
+            {}
+        }
+        max_tip_hifi <<= 1;
+    }
+    // `u2g_threading(uidx, ulopt, 3, is_bridg, &bu, &uu)` — with the
+    // `renew_ul2_utg` rebuild of `i_ug` and the coverage/bridge tables first.
+    crate::assembly::unitig::renew_utg(iug, i_g, &[]);
+    iug.graph.sequence_visited = vec![0u8; iug.graph.sequences.len() * 2];
+    crate::assembly::ul2ul::renew_u2g_cov(
+        z_items,
+        &iug.unitigs,
+        raw,
+        sources,
+        reads,
+        maximum_hang,
+        maximum_hang_rate,
+        minimum_overlap as i32,
+        cov,
+        str_idx,
+    );
+    *bg = crate::assembly::ul2ul::renew_u2g_bg(cov, str_idx, &iug.graph, raw, bub);
+    crate::assembly::ul2ul::u2g_threading(
+        iug,
+        raw,
+        sg,
+        cov,
+        str_idx,
+        store,
+        bub,
+        minimum_overlap,
+        3,
+        is_bridg,
+        &mut bu,
+        &mut uu,
+    )
+}
