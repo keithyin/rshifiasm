@@ -43,6 +43,7 @@ pub mod ul_recall;
 pub mod ul_renew;
 pub mod ul_renew_gfa;
 pub mod ul_binning;
+pub mod ul_integer;
 pub mod ul_load;
 pub mod ul_mask;
 pub mod ul_store;

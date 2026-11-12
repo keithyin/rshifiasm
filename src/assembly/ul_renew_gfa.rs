@@ -595,7 +595,7 @@ fn identify_bubbles_recal_poy(
 }
 
 /// `IF_HOM(ID, B)` (`hic.h` 89).
-fn if_hom(id: u32, bub: &BubbleType) -> bool {
+pub fn if_hom(id: u32, bub: &BubbleType) -> bool {
     bub.index[id as usize] > bub.full_bubble_count as u32 + 1
 }
 
