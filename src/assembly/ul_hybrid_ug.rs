@@ -150,3 +150,148 @@ impl Usg {
         self.arcs_of(v).iter().filter(|a| !a.deleted).count()
     }
 }
+
+/// `merge_unitig_content` (`Overlaps.cpp` 17814): concatenates the member
+/// unitigs' read lists into `collection` (reversing per orientation), then
+/// `fill_unitig` re-derives the coverage lengths. The Rust `MaUtg.reads`
+/// field already carries the packed `(vertex << 32) | offset` words.
+pub fn merge_unitig_content(
+    collection: &mut MaUtg,
+    unitigs: &[MaUtg],
+    _read_graph: &Asg,
+) {
+    if collection.reads.is_empty() {
+        return;
+    }
+    let mut index = 0usize;
+    for &packed in &collection.reads {
+        let uid = (packed >> 33) as usize;
+        index += unitigs[uid].reads.len();
+    }
+    let mut buffer: Vec<u64> = Vec::with_capacity(index);
+    for &packed in &collection.reads {
+        let uid = (packed >> 33) as usize;
+        let ori = ((packed >> 32) & 1) as usize;
+        let query = &unitigs[uid];
+        if ori == 1 {
+            for entry in query.reads.iter().rev() {
+                buffer.push(entry ^ 0x1_0000_0000);
+            }
+        } else {
+            buffer.extend_from_slice(&query.reads);
+        }
+    }
+    let circ = collection.reads.len() == 1 && unitigs[(collection.reads[0] >> 33) as usize].circular;
+    collection.reads = buffer;
+    let total_len: u64 = collection.reads.iter().map(|b| (b & 0xffff_ffff) as u64).sum();
+    collection.length = total_len as u32;
+    if !circ {
+        collection.start = (collection.reads[0] >> 32) as u32;
+        collection.end = ((collection.reads[collection.reads.len() - 1] >> 32) as u32) ^ 1;
+    } else {
+        collection.start = u32::MAX;
+        collection.end = u32::MAX;
+        collection.circular = true;
+    }
+}
+
+/// `merge_hybrid_utg_content` (`gfa_ut.cpp` 16000 region): the hybrid
+/// variant; the member ids remap through `ng.a[id].mm` first, and missing
+/// inter-unitig arcs land in `edge` for `fill_unitig`.
+pub fn merge_hybrid_utg_content(
+    collection: &mut MaUtg,
+    raw: &[MaUtg],
+    rg: &Asg,
+    ng: &crate::assembly::ul2ul::Usg,
+    edge: &mut Vec<AsgArc>,
+) {
+    if collection.reads.is_empty() {
+        return;
+    }
+    let mut index = 0usize;
+    for packed in collection.reads.iter_mut() {
+        let word = *packed;
+        let id = (word >> 33) as usize;
+        let ori = (word >> 32) & 1;
+        let z = ((u64::from(ng.a[id].mm) << 1) | u64::from(ori)) << 32;
+        *packed = z | (word & 0xffff_ffff);
+        index += ng.a[id].occ as usize;
+    }
+    let mut buffer: Vec<u64> = Vec::with_capacity(index);
+    for i in 0..collection.reads.len() {
+        let packed = collection.reads[i];
+        let uid = (packed >> 33) as usize;
+        let ori = ((packed >> 32) & 1) as usize;
+        let q = &raw[uid];
+        if ori == 1 {
+            for entry in q.reads.iter().rev() {
+                buffer.push(entry ^ 0x1_0000_0000);
+            }
+        } else {
+            buffer.extend_from_slice(&q.reads);
+        }
+        if i > 0 {
+            let prev = collection.reads[i - 1];
+            let uv = (prev >> 32) as u32;
+            let uw = (packed >> 32) as u32;
+            if crate::assembly::gfa_clean::get_real_length_one(rg, uv).is_none()
+                || !rg.arcs_of(uv).iter().any(|a| !a.deleted && a.v == uw)
+            {
+                let mut bv = endpoint(raw, uv);
+                if uv & 1 != 0 {
+                    bv ^= 1;
+                }
+                let mut bw = endpoint(raw, uw);
+                if uw & 1 != 0 {
+                    bw ^= 1;
+                }
+                edge.push(AsgArc {
+                    ul: (u64::from(bv) << 32) | u64::from(rg.sequences[(bv >> 1) as usize].length),
+                    v: bw,
+                    ..AsgArc::default()
+                });
+                let uv2 = uv ^ 1;
+                let uw2 = uw ^ 1;
+                let mut bv2 = endpoint(raw, uv2);
+                if uv2 & 1 != 0 {
+                    bv2 ^= 1;
+                }
+                let mut bw2 = endpoint(raw, uw2);
+                if uw2 & 1 != 0 {
+                    bw2 ^= 1;
+                }
+                edge.push(AsgArc {
+                    ul: (u64::from(bv2) << 32) | u64::from(rg.sequences[(bv2 >> 1) as usize].length),
+                    v: bw2,
+                    ..AsgArc::default()
+                });
+            }
+        }
+    }
+    if buffer.is_empty() {
+        return;
+    }
+    let circ =
+        collection.reads.len() == 1 && raw[(collection.reads[0] >> 33) as usize].circular;
+    collection.reads = buffer;
+    let total: u64 = collection.reads.iter().map(|b| (b & 0xffff_ffff) as u64).sum();
+    collection.length = total as u32;
+    if !circ {
+        collection.start = (collection.reads[0] >> 32) as u32;
+        collection.end = ((collection.reads[collection.reads.len() - 1] >> 32) as u32) ^ 1;
+        collection.circular = false;
+    } else {
+        collection.start = u32::MAX;
+        collection.end = u32::MAX;
+        collection.circular = true;
+    }
+}
+
+fn endpoint(unitigs: &[MaUtg], v: u32) -> u32 {
+    let unitig = &unitigs[(v >> 1) as usize];
+    if v & 1 != 0 {
+        (unitig.reads[0] >> 32) as u32
+    } else {
+        (unitig.reads[unitig.reads.len() - 1] >> 32) as u32
+    }
+}
