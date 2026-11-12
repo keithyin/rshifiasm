@@ -472,27 +472,32 @@ pub fn write_compress_base_disk(file: &mut std::fs::File, rid: u64, sequence: &[
 #[allow(clippy::too_many_arguments)]
 pub fn gen_ul_reovlps(
     options: &mut AssemblyOptions,
-    map_context: &ScallContext<'_>,
-    context: &UlRescallContext<'_>,
+    reads: &crate::reads::ReadStore,
+    sources: &[Vec<crate::overlap::paf::PafHit>],
     gfa_name: &str,
     cutoff: i64,
     unitigs: &[crate::assembly::asg::MaUtg],
     read_graph: &crate::assembly::asg::Asg,
     store: &mut AllUl,
+    sample_distance: i32,
+    rewindow_size: i32,
+    maximum_hang: i32,
+    maximum_hang_rate: f32,
+    minimum_overlap: i32,
 ) {
     let parameters = RescallParameters::new(options, cutoff);
     let index = gen_ul_idx(
         options,
         unitigs,
         read_graph,
-        context.sources,
-        &context.reads.read_lengths,
+        sources,
+        &reads.read_lengths,
     );
     let mut index_options = options.clone();
     index_options.k_mer_length = parameters.kmer_length as i32;
     index_options.minimizer_window_size = parameters.minimizer_window as i32;
     let unitig_index = if options.load_index_from_disk != 0 {
-        match uidx_load(gfa_name, None, context.reads) {
+        match uidx_load(gfa_name, None, reads) {
             Ok(Some(index)) => Some(index),
             _ => None,
         }
@@ -503,10 +508,23 @@ pub fn gen_ul_reovlps(
         Some(index) => index,
         None => {
             let built =
-                build_unitig_minimizer_index(&index_options, unitigs, context.reads, i64::from(cutoff));
+                build_unitig_minimizer_index(&index_options, unitigs, reads, i64::from(cutoff));
             let _ = uidx_write(&built, gfa_name, None);
             built
         }
+    };
+    let unitig_graph = crate::assembly::unitig::UnitigGraph {
+        unitigs: unitigs.to_vec(),
+        graph: read_graph.clone(),
+    };
+    let binning_context = UlRescallContext {
+        unitig_graph: &unitig_graph,
+        sources,
+        cc: &index.cc,
+        reads,
+        maximum_hang,
+        maximum_hang_rate,
+        minimum_overlap,
     };
     let emask_loaded = if options.load_index_from_disk != 0 {
         load_emask_table(gfa_name, unitigs)
@@ -516,19 +534,36 @@ pub fn gen_ul_reovlps(
     let emask = match emask_loaded {
         Some(table) => table,
         None => {
-            let table = graph_ovlp_binning(context, options);
+            let table = graph_ovlp_binning(&binning_context, options);
             write_emask_table(&table, gfa_name, unitigs);
             table
         }
     };
-    let _ = &index;
     let _ = UG_SKIP_GRAPH_N;
+    let context = UlRescallContext {
+        unitig_graph: &unitig_graph,
+        sources,
+        cc: &index.cc,
+        reads,
+        maximum_hang,
+        maximum_hang_rate,
+        minimum_overlap,
+    };
+    let map_context = ScallContext {
+        unitigs,
+        contain: &index.contain,
+        unitig_index: &unitig_index,
+        reads,
+        sources,
+        sample_distance,
+        rewindow_size,
+    };
     let ucr_path = format!("{}.uidx.ucr.bin", gfa_name);
     let mut ucr_file = std::fs::File::create(&ucr_path).ok();
     rescall_ul_pipeline(
         options,
-        map_context,
-        context,
+        &map_context,
+        &context,
         &parameters,
         store,
         ucr_file.as_mut(),
@@ -537,22 +572,27 @@ pub fn gen_ul_reovlps(
 }
 
 /// `ul_realignment` (`inter.cpp` 22871): the renewal entry.
+#[allow(clippy::too_many_arguments)]
 pub fn ul_realignment(
     options: &mut AssemblyOptions,
-    map_context: &ScallContext<'_>,
-    context: &UlRescallContext<'_>,
+    reads: &crate::reads::ReadStore,
     source_lists: &[crate::correction::ec_driver::PafList],
     coverage_cut: &[crate::assembly::hit::CoverageCut],
     sg: &mut crate::assembly::asg::Asg,
     bin_file: &str,
     double_check_cache: u32,
+    sample_distance: i32,
+    rewindow_size: i32,
+    maximum_hang: i32,
+    maximum_hang_rate: f32,
+    minimum_overlap: i32,
 ) -> crate::assembly::unitig::UnitigGraph {
     eprintln!("[M::ul_realignment::] ==> starting UL");
     let gfa_name = format!("{}.{}", options.output_file_name, bin_file);
     options.update_coverage(options.homozygous_coverage);
     let cutoff = i64::from(REA_ALIGN_CUTOFF);
     let mut store = AllUl::new();
-    let unitig_graph = gen_polished_ug(options, context.reads, source_lists, coverage_cut, sg);
+    let unitig_graph = gen_polished_ug(options, reads, source_lists, coverage_cut, sg);
     clear_all_ul_t(&mut store);
     let cached = load_all_ul_t(&gfa_name).ok().flatten();
     match cached {
@@ -561,21 +601,35 @@ pub fn ul_realignment(
             let _ = double_check_cache;
         }
         None => {
+            let sources: Vec<crate::overlap::paf::PafHit> = source_lists
+                .iter()
+                .flat_map(|list| list.hits.iter().cloned())
+                .collect();
+            let _ = sources;
+            let hit_lists: Vec<Vec<crate::overlap::paf::PafHit>> = source_lists
+                .iter()
+                .map(|list| list.hits.clone())
+                .collect();
             gen_ul_reovlps(
                 options,
-                map_context,
-                context,
+                reads,
+                &hit_lists,
                 &gfa_name,
                 cutoff,
                 &unitig_graph.unitigs,
                 &unitig_graph.graph,
                 &mut store,
+                sample_distance,
+                rewindow_size,
+                maximum_hang,
+                maximum_hang_rate,
+                minimum_overlap,
             );
             let _ = write_all_ul_t(&store, &gfa_name);
         }
     }
-    filter_ul_ug(&mut store, &unitig_graph, context.reads);
-    gen_ul_vec_rid_t(&mut store, context.reads.total_reads as usize);
+    filter_ul_ug(&mut store, &unitig_graph, reads);
+    gen_ul_vec_rid_t(&mut store, reads.total_reads as usize);
     let mut renewed = unitig_graph.clone();
     update_ug_arch_ul_mul(&mut renewed, &store);
     renewed
