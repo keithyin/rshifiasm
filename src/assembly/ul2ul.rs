@@ -1536,3 +1536,199 @@ pub fn renew_u2g_bg(
         a_n: Vec::new(),
     }
 }
+
+/// `clc_contain` (`gfa_ut.cpp` 16315): the contained targets of one integer
+/// vertex; UL vertices scan their `ul2ul` items, raw vertices scan the read
+/// overlaps. `buf_ul` collects UL ids and `buf_ug` raw unitig ids.
+#[allow(clippy::too_many_arguments)]
+pub fn clc_contain(
+    z: &Ul2ulIdx,
+    unitigs: &[crate::assembly::asg::MaUtg],
+    str_idx: &crate::assembly::ul_integer::UlStrIdx,
+    sources: &[Vec<crate::overlap::paf::PafHit>],
+    reads: &crate::reads::ReadStore,
+    maximum_hang: i32,
+    maximum_hang_rate: f32,
+    minimum_overlap: i32,
+    id: usize,
+    is_ul: bool,
+    buf_ul: &mut Vec<u64>,
+    buf_ug: &mut Vec<u64>,
+) {
+    if is_ul {
+        let Some(o) = z.get(id, true) else {
+            return;
+        };
+        assert!(!o.is_del);
+        for entry in o.a.iter().take(o.cn) {
+            if entry.is_del || ulg_type(z.uln, entry.hid as usize) != 0 {
+                continue;
+            }
+            if integer_hit2arc(
+                entry,
+                ulg_len(&[], unitigs, z.uln, id) as i64,
+                ulg_len(&[], unitigs, z.uln, entry.hid as usize) as i64,
+                ulg_occ(str_idx, z.uln, id) as i64,
+                ulg_occ(str_idx, z.uln, entry.hid as usize) as i64,
+                id as u64,
+                entry.hid as u64,
+                0,
+            )
+            .is_err()
+            {
+                buf_ul.push(u64::from(entry.hid));
+            }
+        }
+    } else {
+        let ru = &unitigs[id];
+        for &packed in &ru.reads {
+            let rid = (packed >> 33) as usize;
+            for hit in &sources[rid] {
+                let qn = hit.query_identifier;
+                let tn = hit.target_identifier;
+                let (result, _arc) = crate::assembly::hit::ma_hit_to_arc(
+                    hit,
+                    reads.read_length(qn as usize) as i32,
+                    reads.read_length(tn as usize) as i32,
+                    maximum_hang as i32,
+                    maximum_hang_rate,
+                    minimum_overlap,
+                );
+                if result == MA_HT_TCONT {
+                    buf_ug.push(u64::from(tn));
+                }
+            }
+        }
+    }
+}
+
+/// `renew_u2g_cov` (`gfa_ut.cpp` 16560): fills the [`UlCov`] tables.
+#[allow(clippy::too_many_arguments)]
+pub fn renew_u2g_cov(
+    z: &Ul2ulIdx,
+    iug_unitigs: &[crate::assembly::asg::MaUtg],
+    raw: &crate::assembly::unitig::UnitigGraph,
+    sources: &[Vec<crate::overlap::paf::PafHit>],
+    reads: &crate::reads::ReadStore,
+    maximum_hang: i32,
+    maximum_hang_rate: f32,
+    minimum_overlap: i32,
+    cov: &mut UlCov,
+    str_idx: &crate::assembly::ul_integer::UlStrIdx,
+) {
+    cov.uc = vec![0; iug_unitigs.len()];
+    cov.raw_uc = vec![0; iug_unitigs.len()];
+    cov.hc = vec![0; iug_unitigs.len()];
+    cov.iug_a = vec![Vec::new(); iug_unitigs.len()];
+    cov.iug_idx = vec![0; raw.unitigs.len() + 1];
+    cov.iug_b = Vec::new();
+    let mut buf_ul: Vec<u64> = Vec::new();
+    let mut buf_ug: Vec<u64> = Vec::new();
+    for (i, unitig) in iug_unitigs.iter().enumerate() {
+        let mut ul_n = 0u64;
+        let mut ug_n = 0u64;
+        buf_ul.clear();
+        buf_ug.clear();
+        for &packed in &unitig.reads {
+            let ri = (packed >> 33) as usize;
+            if ulg_type(z.uln, ri) == 1 {
+                clc_contain(
+                    z,
+                    iug_unitigs,
+                    str_idx,
+                    sources,
+                    reads,
+                    maximum_hang,
+                    maximum_hang_rate,
+                    minimum_overlap,
+                    ri,
+                    true,
+                    &mut buf_ul,
+                    &mut buf_ug,
+                );
+                ul_n += 1;
+            } else {
+                clc_contain(
+                    z,
+                    iug_unitigs,
+                    str_idx,
+                    sources,
+                    reads,
+                    maximum_hang,
+                    maximum_hang_rate,
+                    minimum_overlap,
+                    ri,
+                    false,
+                    &mut buf_ul,
+                    &mut buf_ug,
+                );
+                ug_n += u64::from(raw.unitigs[ri].reads.len() as u32);
+            }
+        }
+        cov.raw_uc[i] = ul_n as u32;
+        // `radix_sort_srt64` + distinct count
+        buf_ul.sort_unstable();
+        let mut seen = u64::MAX;
+        for &entry in &buf_ul {
+            if entry != seen {
+                ul_n += 1;
+                seen = entry;
+            }
+        }
+        buf_ug.sort_unstable();
+        let mut seen = u64::MAX;
+        for &entry in &buf_ug {
+            if entry != seen {
+                ug_n += 1;
+                seen = entry;
+            }
+        }
+        cov.uc[i] = ul_n as u32;
+        cov.hc[i] = ug_n as u32;
+    }
+    // the raw-read walks and the CSR
+    let mut iug_occ = 0usize;
+    for (k, unitig) in iug_unitigs.iter().enumerate() {
+        gen_raw_ug_seq(
+            z,
+            str_idx,
+            &[],
+            &raw.unitigs,
+            &raw.graph,
+            &reads.read_lengths,
+            &raw.unitigs.iter().map(|u| u.reads.clone()).collect::<Vec<_>>(),
+            unitig,
+            &mut cov.iug_a[k],
+        );
+        iug_occ += cov.iug_a[k].len();
+        for entry in &cov.iug_a[k] {
+            cov.iug_idx[(entry.v >> 1) as usize] += 1;
+        }
+    }
+    let mut l = 0usize;
+    for slot in cov.iug_idx.iter_mut() {
+        let m = *slot;
+        *slot = l as u64;
+        l += m as usize;
+    }
+    cov.iug_b = vec![0u64; iug_occ];
+    for (k, walk) in cov.iug_a.iter().enumerate() {
+        for (z, entry) in walk.iter().enumerate() {
+            let vertex = (entry.v >> 1) as usize;
+            let start = cov.iug_idx[vertex] as usize;
+            let end = cov.iug_idx[vertex + 1] as usize;
+            let a_n = end - start;
+            if a_n == 0 {
+                continue;
+            }
+            let last = cov.iug_b[end - 1];
+            if last == (a_n - 1) as u64 {
+                cov.iug_b[end - 1] = ((k as u64) << 32) | z as u64;
+            } else {
+                let next = last as usize;
+                cov.iug_b[next] = ((k as u64) << 32) | z as u64;
+                cov.iug_b[end - 1] = next as u64 + 1;
+            }
+        }
+    }
+}
