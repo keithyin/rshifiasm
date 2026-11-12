@@ -3504,3 +3504,33 @@ convert_usg_t + idx_a/extra 顶点 + 第一遍 scaffold 收集。缺：
    ar 分叉）。deep_clean/hic_clean_adv 仍 stub（hic.cpp 泡泡机制）。
 3. `renew_r_to_u`（ul_renew_ng.rs:673）改 PafList 原生。
 4. U7：解除 --ul parse 拒绝 + e2e 门禁。
+
+## 续十四（2026-11-12，接线完成，--ul 解锁）
+
+1. shrink 链完成（9f08611）：`shrink_1b`(7837)/`renew_ul_vec_t`(7848)/
+   `shrink_ul0`(7742)/`shrink_uls`+`rebuid_idx`(7755/7653)；
+   `renew_r_to_u` 的 clear 语义修复（C 只清 del 标志不清列表）并
+   PafList 化。
+2. `ul_realignment_gfa`(17598) + `gradually_renew_g`(39297) 完成
+   （ul_renew_driver.rs，f99771b）：PRIMARY 标记 → hic_clean →
+   ul_realignment（0 轮时只跑 shrink_uls）→ filter_sg_by_ug →
+   gen_bubble_chain → l1_ug 拷贝 + pstr → gen_ul2ul → renew_ng →
+   sg 换血 → renew_R_to_U → post_rescue（pipeline 的 pub(crate)
+   版本，min_thres = max_short_tip+1）。每轮之间
+   `ug_ext_gfa(max_short_tip*2, UG_EXT_LEN)`；hic_clean_adv /
+   deep_graph_clean 仍是 no-op（hic.cpp 泡泡机制未移植——见续十三 2）。
+3. pipeline.rs 在 ul_clean_gfa 后按 `ar` 分叉（1b80bb1）：
+   `gradually_renew_g(round=ul_clean_round, "re"→"re1"...,
+   free_uld=(round<=1), is_bridg=1→0, deep_clean=polyploidy<=2)`；
+   非 ar 保持原尾部。`build_string_graph_without_clean` 的 reads 改为
+   `&mut`（realloc_rdb_adv 扩读库）。
+4. **--ul 已解锁**（1085527：check_supported 移除拒绝）。
+
+### U7 门禁（下一会话从这里开始）
+
+参考命令：`hifiasm -t1 --ul /tmp/ul.fq -o /tmp/ulref
+/home/keith/Downloads/chr11-2M.fa.gz`。
+Rust 侧：`target/release/rshifiasm -t1 --ul /tmp/ul.fq -o /tmp/ulrsm
+/home/keith/Downloads/chr11-2M.fa.gz`，比对 8 个 GFA/BED
+（/tmp/ulref.bp*.gfa/.bed 等）+ `.re.*` 缓存字段。预期首次跑通需要
+调试（整链第一次执行）；错误多半在 renew_ng/gen_ul2ul 的断言。
