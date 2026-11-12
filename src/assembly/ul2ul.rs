@@ -1324,3 +1324,215 @@ pub fn gen_raw_ug_seq(
         let _ = unitig2;
     }
 }
+
+/// `ul_cov_t` (`gfa_ut.cpp` 136): the coverage tables over the integer
+/// unitigs and the raw-read CSR.
+#[derive(Default)]
+pub struct UlCov {
+    /// `uc`: the UL occupancy of every integer unitig (contained + free).
+    pub uc: Vec<u32>,
+    /// `raw_uc`: the free UL occupancy.
+    pub raw_uc: Vec<u32>,
+    /// `hc`: the HiFi occupancy.
+    pub hc: Vec<u32>,
+    /// `iug_a`: the raw-read walk of every integer unitig.
+    pub iug_a: Vec<Vec<UinfoSrt>>,
+    /// `iug_idx`/`iug_b`: the raw-read CSR (bit 63 of `iug_b` masks a
+    /// removed word).
+    pub iug_idx: Vec<u64>,
+    pub iug_b: Vec<u64>,
+}
+
+/// The `ul_bg_t` bridge table (`gfa_ut.cpp` 16653): the raw-read-level
+/// bridge graph with `ou` correctness flags.
+#[derive(Default)]
+pub struct UlBg {
+    /// `bg->bg`: one vertex per raw unitig.
+    pub bg: crate::assembly::asg::Asg,
+    /// `w_n`/`a_n`: the per-unitig wrong/ambiguous bridge counts.
+    pub w_n: Vec<u32>,
+    pub a_n: Vec<u32>,
+}
+
+/// `renew_u2g_bg` (`gfa_ut.cpp` 16653).
+pub fn renew_u2g_bg(
+    cov: &UlCov,
+    str_idx: &crate::assembly::ul_integer::UlStrIdx,
+    iug_graph: &crate::assembly::asg::Asg,
+    raw: &crate::assembly::unitig::UnitigGraph,
+    bub: &crate::assembly::bubble_chain::BubbleType,
+) -> UlBg {
+    let mut bg = crate::assembly::asg::Asg::new();
+    bg.sequences = raw
+        .graph
+        .sequences
+        .iter()
+        .map(|seq| crate::assembly::asg::AsgSeq {
+            length: seq.length,
+            deleted: true,
+            coverage_class: 0,
+        })
+        .collect();
+    let mut buf: Vec<u64> = Vec::new();
+    for raw_id in 0..raw.unitigs.len() {
+        if crate::assembly::ul_renew_gfa::if_hom(raw_id as u32, bub) {
+            continue;
+        }
+        let start = cov.iug_idx[raw_id] as usize;
+        let end = cov.iug_idx[raw_id + 1] as usize;
+        buf.clear();
+        for &word in &cov.iug_b[start..end] {
+            let iug_id = (word >> 32) as usize;
+            let iug_off = (word & 0xffff_ffff) as usize;
+            if iug_graph.sequences[iug_id].deleted {
+                continue;
+            }
+            let walk = &cov.iug_a[iug_id];
+            let v = walk[iug_off].v ^ 1;
+            let mut s = iug_off as i64 - 1;
+            while s >= 0 {
+                if crate::assembly::ul_renew_gfa::if_hom((walk[s as usize].v >> 1) as u32, bub) {
+                    s -= 1;
+                    continue;
+                }
+                buf.push(((u64::from(v)) << 32) | u64::from(walk[s as usize].v ^ 1));
+                break;
+            }
+            let v = walk[iug_off].v;
+            let mut s = iug_off as i64 + 1;
+            while (s as usize) < walk.len() {
+                if crate::assembly::ul_renew_gfa::if_hom((walk[s as usize].v >> 1) as u32, bub) {
+                    s += 1;
+                    continue;
+                }
+                buf.push(((u64::from(v)) << 32) | u64::from(walk[s as usize].v));
+                break;
+            }
+        }
+        bg.sequences[raw_id].deleted = buf.is_empty();
+        crate::container::ksort::radix_sort_u64(&mut buf);
+        let mut l = 0usize;
+        let mut z = 1usize;
+        while z <= buf.len() {
+            if z == buf.len() || buf[l] != buf[z] {
+                let overlap = (z - l) as u32;
+                let v = (buf[l] >> 32) as u32;
+                bg.push_arc(crate::assembly::asg::AsgArc {
+                    ul: ((u64::from(v)) << 32)
+                        | u64::from(u32::MAX - overlap),
+                    v: (buf[l] & 0xffff_ffff) as u32,
+                    overlap,
+                    deleted: false,
+                    ..crate::assembly::asg::AsgArc::default()
+                });
+                l = z;
+            }
+            z += 1;
+        }
+    }
+    // `worker_renew_integer_bridge`: the occupancy of every bridge arc by
+    // the UL strings; arcs with zero occupancy keep `ou = 0`.
+    for arc_index in 0..bg.arcs.len() {
+        let arc = bg.arcs[arc_index];
+        let v = (arc.ul >> 32) as u32;
+        let w = arc.v;
+        let mut occ = 0i64;
+        let vertex = (v >> 1) as usize;
+        let start = cov.iug_idx.get(vertex).copied().unwrap_or(0) as usize;
+        let end = cov.iug_idx.get(vertex + 1).copied().unwrap_or(0) as usize;
+        for &word in &cov.iug_b[start..end] {
+            let read_id = (word >> 32) as usize;
+            let pos = (word & 0xffff_ffff) as usize;
+            let str_ = &str_idx.str[read_id];
+            let s_n = str_.cn as usize;
+            if s_n < 2 {
+                continue;
+            }
+            debug_assert_eq!(v >> 1, str_.a[pos] as u32 >> 1);
+            let mut s = pos as i64 - 1;
+            let mut vz = (str_.a[pos] as u32) ^ 1;
+            while s >= 0 {
+                let wz = (str_.a[s as usize] as u32) ^ 1;
+                if crate::assembly::ul_renew_gfa::if_hom((wz >> 1) as u32, bub) {
+                    s -= 1;
+                    continue;
+                }
+                if (vz == v && wz == w) || (vz == (v ^ 1) && wz == (w ^ 1)) {
+                    occ += 1;
+                }
+                break;
+            }
+            let mut s = pos as i64 + 1;
+            vz = str_.a[pos] as u32;
+            while (s as usize) < s_n {
+                let wz = str_.a[s as usize] as u32;
+                if crate::assembly::ul_renew_gfa::if_hom((wz >> 1) as u32, bub) {
+                    s += 1;
+                    continue;
+                }
+                if (vz == v && wz == w) || (vz == (v ^ 1) && wz == (w ^ 1)) {
+                    occ += 1;
+                }
+                break;
+            }
+        }
+        if let Some(slot) = bg
+            .arcs
+            .iter_mut()
+            .find(|a| !a.deleted && (a.ul >> 32) as u32 == v && a.v == w)
+        {
+            slot.occurrence = occ as u16;
+        }
+    }
+    bg.cleanup();
+    bg.read_sequence_count = bg.sequences.len() as u32;
+    // the ou correctness pass (ss = 0.500001)
+    let ss = 0.500001f64;
+    let n_vtx = (bg.sequences.len() << 1) as u32;
+    for v in 0..n_vtx {
+        if bg.sequences[(v >> 1) as usize].deleted {
+            continue;
+        }
+        let nv = bg.arc_count(v) as usize;
+        if nv == 0 {
+            continue;
+        }
+        let w = bg.arcs_of(v)[0].v;
+        let mut v_occ = [u64::MAX; 2];
+        let mut w_occ = [u64::MAX; 2];
+        for (k, arc) in bg.arcs_of(v).iter().take(2).enumerate() {
+            v_occ[k] = ((u64::from(arc.overlap)) << 32) | u64::from(arc.v);
+        }
+        for (k, arc) in bg.arcs_of(w ^ 1).iter().take(2).enumerate() {
+            w_occ[k] = ((u64::from(arc.overlap)) << 32) | u64::from(arc.v);
+        }
+        if (v_occ[0] as u32) == w && (w_occ[0] as u32) == v ^ 1 {
+            let vo = [v_occ[0] >> 32, v_occ[1] >> 32];
+            let wo = [w_occ[0] >> 32, w_occ[1] >> 32];
+            if ((vo[0] as f64 * ss) >= vo[1] as f64 && (wo[0] as f64 * ss) >= wo[1] as f64)
+                || (((vo[0] + wo[0]) as f64 * ss) >= (vo[1] + wo[1]) as f64)
+            {
+                for arc in bg.arcs_of_mut(v) {
+                    arc.occurrence = 2;
+                }
+                for arc in bg.arcs_of_mut(w ^ 1) {
+                    arc.occurrence = 2;
+                }
+                bg.arcs_of_mut(v)[0].occurrence = 3;
+                bg.arcs_of_mut(w ^ 1)[0].occurrence = 3;
+            } else {
+                for arc in bg.arcs_of_mut(v) {
+                    arc.occurrence = 1;
+                }
+                for arc in bg.arcs_of_mut(w ^ 1) {
+                    arc.occurrence = 1;
+                }
+            }
+        }
+    }
+    UlBg {
+        bg,
+        w_n: Vec::new(),
+        a_n: Vec::new(),
+    }
+}
