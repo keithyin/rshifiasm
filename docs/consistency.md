@@ -3068,6 +3068,47 @@ integer_align_extention、gap_chain_check。
 （IF_HOM）只在 integer_candidate 路径用（bub 非空）；integer_chain_dp
 本身也被 integer_candidate 调用（6649 区）——默认路径同样不需要。
 
+## U6 续六（2026-11-12 第七轮，gen_ul2ul 默认路径落地）
+
+- `595dbd5` **`ul2ul.rs`**：`UsgArc`/`UsgSeq`/`Usg`、`Ul2ulIdx`
+  （get/get_mut/get_o + item_idx）、`ulg_id/type/len/occ` 宏、
+  `integer_hit2arc(_idx_contain)`（MA_HT_* 拒绝 + ul/v/l 弧打包：
+  `p->ul = u<<32|l`、`p->v = v`、`p->ol = ql-l`，strong/el/no_l_indel=1）、
+  `integer_gen_ovlp`（anchor 构建：`tn_rev_qk = tid<<34|rev<<32|k`、
+  双向 radix、组内 integer_chain、`o->cn = o->n`）、
+  `integer_normalize_ovlp`（对称化）、`clip_integer_chimeric`
+  （min_dp=1；is_left/right/middle 判定；`is_del` 时前 cn 条全 del +
+  重排 + cn=0）、`integer_append_ug_ovlp`（unitig 条目 + 镜像，
+  `z->hid = xi->hid + uln`）、`integer_node_del`、
+  `integer_containment_purge`（MA_HT_QCONT→qid 自删、TCONT→hid 删，
+  `(!keep_raw_utg)||ulg_type` 门控）、`clean_srt_integer`
+  （组内最优保留 + del 重排）、`print_integert_ovlp_stat`、
+  `integer_sg_gen`（combined 图：UL 读 + unitig，raw 弧移位
+  `ul += uln<<33; v += uln<<1`）、`gen_ul2ul` 默认路径驱动
+  （item_idx 构建 → gen_ovlp → 对称化 → chimeric → append_ug →
+  clean ×2 → containment purge ×2 → integer_sg_gen）。
+
+**剩余（renewal 尾段，待读/待移植）**：
+1. `renew_u2g_cov`(16560) ✅ 已读（clc_contain + 去重计数）→ Rust 待写；
+   `get_ulg_spec_ovlp`、`gen_raw_ug_seq`(16586 区) 部分已读。
+2. `renew_u2g_bg`(16653)、`u2g_clean`(16281) 头部已读——其依赖
+   `ulg_arc_cut_supports`/`ulg_arc_cut_tips`/`ulg_pop_bubble`/
+   `ulg_arc_cut_z`/`u2g_threading`/`asg_arc_identify_simple_bubbles_multi`
+   是一个 **~2000 行的图清理子树**（下一轮的主读单）。
+3. `convert_usg_t`(14963) ✅、`renew_ng`(15107) ✅（scaffold 节点两遍 +
+   realloc_rdb_adv + update_paf + 内部/连接弧重推）、`gen_spec_rc_edge`
+   ✅、`push_direct_scaff_node` ✅；`push_scaff_node`、
+   `reset_scaf_node_uinfo_srt_t`、`push_scaf_bases`（**待读**）。
+4. `update_paf`(inter.cpp 17164)（**待读**）；`renew_R_to_U` ✅
+   （= clear src/r_src + reset_ma_sub_t + ma_hit_contained_advance，
+   Rust 已有 ma_hit_contained_advance/reset 覆盖件）。
+5. `init_ulg_opt_t`(16906)（**待读**，ulg_opt_t 字段：clean_round/
+   min·max_path_drop_ratio/max_tip/max_tip_hifi/is_trio/b_mask_t）。
+6. `ul_realignment_gfa`(17598) 组装（清单见「U6 续三」12）；
+   `free_uld=0` 的 rlen/nid 备份恢复语义已读。
+7. `gradually_renew_g`/`renew_g` 接线 pipeline.rs（39271/39297 已读）。
+8. U7：解锁 --ul + e2e 门禁。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
