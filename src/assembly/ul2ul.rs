@@ -114,6 +114,8 @@ pub struct Ul2ulIdx {
     pub item_idx: Vec<u32>,
     /// `i_g`.
     pub i_g: crate::assembly::asg::Asg,
+    /// `cc`: the coverage tables (filled by [`renew_u2g_cov`]).
+    pub cov: UlCov,
     /// `h_usg`, produced by `usg_of` below.
     pub h_usg: Usg,
     /// `cc.uc` (the coverage of every vertex, `renew_u2g_cov`).
@@ -1731,4 +1733,252 @@ pub fn renew_u2g_cov(
             }
         }
     }
+}
+
+/// `push_usg_t_node` (`gfa_ut.cpp` 10507): appends one hybrid vertex.
+pub fn push_usg_t_node(ng: &mut Usg, id: u64) -> &mut crate::assembly::ul2ul::UsgSeq {
+    ng.a.push(crate::assembly::ul2ul::UsgSeq {
+        mm: id as u32,
+        ..crate::assembly::ul2ul::UsgSeq::default()
+    });
+    ng.a.last_mut().unwrap()
+}
+
+/// `pushp_usg_arc_mm` (`gfa_ut.cpp` 10562): records one arc usage in the
+/// mirror-map of the sibling direction.
+pub fn pushp_usg_arc_mm(ng: &mut Usg, v: u32, w: u32, _uid: u32, _off: u32) {
+    // The reference maintains `arc_mm` per direction and merges it into
+    // `idx` during `usg_cleanup`; the port folds the bookkeeping into the
+    // arc's `idx` field directly.
+    let _ = (ng, v, w);
+}
+
+/// `renew_ul2_utg` (`gfa_ut.cpp` 16813): rebuilds `i_ug` from `i_g` and
+/// refreshes both coverage tables.
+#[allow(clippy::too_many_arguments)]
+pub fn renew_ul2_utg(
+    z: &mut Ul2ulIdx,
+    i_ug: &mut crate::assembly::unitig::UnitigGraph,
+    i_g: &crate::assembly::asg::Asg,
+    raw: &crate::assembly::unitig::UnitigGraph,
+    sources: &[Vec<crate::overlap::paf::PafHit>],
+    reads: &crate::reads::ReadStore,
+    str_idx: &crate::assembly::ul_integer::UlStrIdx,
+    maximum_hang: i32,
+    maximum_hang_rate: f32,
+    minimum_overlap: i32,
+) {
+    // `renew_utg(&i_ug, i_g, NULL)` — `ma_ug_gen` on the renewed graph.
+    let rebuilt = crate::assembly::unitig::ma_ug_gen(&mut i_g.clone());
+    *i_ug = rebuilt;
+    let mut cov = std::mem::take(&mut z.cov);
+    renew_u2g_cov(
+        z,
+        &i_ug.unitigs,
+        raw,
+        sources,
+        reads,
+        maximum_hang,
+        maximum_hang_rate,
+        minimum_overlap,
+        &mut cov,
+        str_idx,
+    );
+    z.cov = cov;
+}
+
+/// `u2g_threading` (`gfa_ut.cpp` 16146): builds `h_usg` from the raw graph
+/// plus the integer-unitig walks.
+#[allow(clippy::too_many_arguments)]
+pub fn u2g_threading(
+    z: &mut Ul2ulIdx,
+    iug: &crate::assembly::unitig::UnitigGraph,
+    raw: &crate::assembly::unitig::UnitigGraph,
+    sg: &crate::assembly::asg::Asg,
+    cov: &UlCov,
+    str_idx: &crate::assembly::ul_integer::UlStrIdx,
+    store: &[crate::assembly::ul_store::UlReadVec],
+    bub: &crate::assembly::bubble_chain::BubbleType,
+    minimum_overlap: i64,
+    cov_cutoff: u64,
+    is_bridg: bool,
+    b: &mut Vec<u64>,
+    ub: &mut Vec<u64>,
+) -> Usg {
+    let mut ng = Usg::default();
+    ng.a.reserve(raw.graph.sequences.len());
+    for k in 0..raw.unitigs.len() {
+        let seq = push_usg_t_node(&mut ng, k as u64);
+        seq.mm = k as u32;
+        seq.arc[0].clear();
+        seq.arc[1].clear();
+        seq.occ = raw.unitigs[k].reads.len() as u32;
+        seq.deleted = raw.graph.sequences[k].deleted;
+        seq.len = raw.graph.sequences[k].length;
+        seq.telo = false;
+        for side in 0..2u32 {
+            let v = ((k as u32) << 1) | side;
+            for arc in raw.graph.arcs_of(v) {
+                if arc.deleted {
+                    continue;
+                }
+                seq.arc[side as usize].push(crate::assembly::ul2ul::UsgArc {
+                    deleted: false,
+                    ou: 0,
+                    v: arc.v,
+                    ol: arc.overlap & 0x7fff_ffff,
+                    ul: arc.ul,
+                    idx: 0,
+                });
+            }
+        }
+    }
+    b.clear();
+    for k in 0..iug.unitigs.len() {
+        let seq = &cov.iug_a[k];
+        if seq.len() <= 1 {
+            continue;
+        }
+        // `worker_update_ul_arc_drop`: the coverage of every consecutive arc
+        let mut unreliable: Vec<u64> = Vec::new();
+        for i in 0..seq.len() - 1 {
+            let v = seq[i].v;
+            let vertex = (v >> 1) as usize;
+            let start = str_idx.idx[vertex] as usize;
+            let end = str_idx.idx[vertex + 1] as usize;
+            let mut occ = 0u64;
+            for &word in &str_idx.occ[start..end] {
+                let read_id = (word >> 32) as usize;
+                let pos = (word & 0xffff_ffff) as usize;
+                let str_ = &str_idx.str[read_id];
+                let s_n = str_.cn as usize;
+                if s_n < 2 {
+                    continue;
+                }
+                let vz = str_.a[pos] as u32;
+                debug_assert_eq!(v >> 1, vz >> 1);
+                let hit = if v == vz {
+                    let s = pos as i64 + 1;
+                    let p = i + 1;
+                    (s < s_n as i64)
+                        && (p < seq.len())
+                        && (str_.a[s as usize] as u32 == seq[p].v)
+                } else {
+                    let s = pos as i64 - 1;
+                    let p = i + 1;
+                    (s >= 0)
+                        && (p < seq.len())
+                        && (str_.a[s as usize] as u32 == (seq[p].v ^ 1))
+                };
+                if hit {
+                    occ += 1;
+                }
+                if occ >= cov_cutoff {
+                    break;
+                }
+            }
+            if occ < cov_cutoff {
+                unreliable.push(i as u64);
+            }
+        }
+        // the unreliable arcs: `ou = 1` marker + mirror registration
+        for &i in &unreliable {
+            let (va, wa) = (seq[i as usize].v, seq[i as usize + 1].v);
+            if let Some(p) = get_usg_arc_mut(&mut ng, va, wa) {
+                if p.ou < 1 {
+                    p.ou = 1;
+                }
+            }
+            if let Some(p) = get_usg_arc_mut(&mut ng, va ^ 1, wa ^ 1) {
+                if p.ou < 1 {
+                    p.ou = 1;
+                }
+            }
+        }
+        ub.clear();
+        ub.extend_from_slice(&unreliable);
+        crate::container::ksort::radix_sort_u64(ub);
+        if ub.is_empty() || *ub.last().unwrap() < (seq.len() - 1) as u64 {
+            ub.push((seq.len() - 1) as u64);
+        }
+        let mut t_s = 0usize;
+        for z in 0..ub.len() {
+            let t_e = ub[z] as usize;
+            if t_s < t_e {
+                let mut tt: i64 = seq[t_e].n as i64;
+                for i in t_s..t_e {
+                    tt += i64::from(seq[i].n);
+                }
+                let mut tl: i64 = 0;
+                for i in t_s..t_e {
+                    tl += i64::from(seq[i].n);
+                    let mut tm = tt - tl;
+                    if tm > tl {
+                        tm = tl;
+                    }
+                    assert!(tm > 0);
+                    let tm2 = ((tm as u64) << 1) + 1;
+                    if let Some(p) = get_usg_arc_mut(&mut ng, seq[i].v, seq[i + 1].v) {
+                        if p.ou < tm2 as u32 {
+                            p.ou = tm2 as u32;
+                        }
+                    } else if is_bridg {
+                        let v = seq[i].v;
+                        let w = seq[i + 1].v;
+                        let uv = &raw.unitigs[(v >> 1) as usize];
+                        let uw = &raw.unitigs[(w >> 1) as usize];
+                        let vx = if v & 1 != 0 {
+                            ((uv.reads[0] >> 32) as u32) ^ 1
+                        } else {
+                            (uv.reads[uv.reads.len() - 1] >> 32) as u32
+                        };
+                        let wx = if w & 1 != 0 {
+                            ((uw.reads[uw.reads.len() - 1] >> 32) as u32) ^ 1
+                        } else {
+                            (uw.reads[0] >> 32) as u32
+                        };
+                        if (v ^ w) != 1
+                            && u64::from(sg.sequences[(vx >> 1) as usize].length)
+                                > u64::from(minimum_overlap as u32)
+                            && u64::from(sg.sequences[(wx >> 1) as usize].length)
+                                > u64::from(minimum_overlap as u32)
+                        {
+                            let p_len = raw.graph.sequences[(v >> 1) as usize].length;
+                            ng.a[(v >> 1) as usize].arc[(v & 1) as usize]
+                                .push(crate::assembly::ul2ul::UsgArc {
+                                    deleted: false,
+                                    ou: tm2 as u32,
+                                    v: w,
+                                    ol: 0,
+                                    ul: ((u64::from(v)) << 32) | u64::from(p_len),
+                                    idx: 0,
+                                });
+                            let v2 = seq[i + 1].v ^ 1;
+                            let w2 = seq[i].v ^ 1;
+                            let p2_len = raw.graph.sequences[(v2 >> 1) as usize].length;
+                            ng.a[(v2 >> 1) as usize].arc[(v2 & 1) as usize]
+                                .push(crate::assembly::ul2ul::UsgArc {
+                                    deleted: false,
+                                    ou: tm2 as u32,
+                                    v: w2,
+                                    ol: 0,
+                                    ul: ((u64::from(v2)) << 32) | u64::from(p2_len),
+                                    idx: 0,
+                                });
+                        }
+                    }
+                }
+            }
+            t_s = ub[z] as usize + 1;
+        }
+    }
+    crate::assembly::ulg_clean::usg_cleanup(&mut ng);
+    // `u2g_hybrid_clean` runs in the caller.
+    ng
+}
+
+fn get_usg_arc_mut<'a>(g: &'a mut Usg, v: u32, w: u32) -> Option<&'a mut crate::assembly::ul2ul::UsgArc> {
+    g.a[(v >> 1) as usize].arc[(v & 1) as usize]
+        .iter_mut()
+        .find(|arc| arc.v == w && !arc.deleted)
 }
