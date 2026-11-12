@@ -13,7 +13,6 @@ use crate::assembly::hit::ma_hit_to_arc;
 use crate::assembly::ul::{infer_rovlp_unitigs, UlOv};
 use crate::assembly::unitig::UnitigGraph;
 use crate::container::ksort::{radix_sort_by_key_32, radix_sort_u64};
-use crate::correction::ec_driver::PafList;
 use crate::correction::hc_align::{
     align_ul_ed_post_extz, gen_extend_err_exz, window_se_by_normalized_start, BitExtz,
     HcAlignParameters,
@@ -28,6 +27,7 @@ use crate::correction::ul_align::{
 };
 use crate::correction::window_chain::is_unaligned_window;
 use crate::correction::window::number_of_windows;
+use crate::overlap::paf::PafHit;
 use crate::overlap::region::{CandidatesList, ChainData, KmerHit, OverlapRegion};
 use crate::reads::read_store::ReadStore;
 
@@ -41,7 +41,7 @@ pub const N_GCHAIN_RATE: f64 = 0.04;
 /// The `ug_opt_t` slice the shared-interval pass reads.
 pub struct UlRescallContext<'a> {
     pub unitig_graph: &'a UnitigGraph,
-    pub sources: &'a [PafList],
+    pub sources: &'a [Vec<PafHit>],
     pub reads: &'a ReadStore,
     pub maximum_hang: i32,
     pub maximum_hang_rate: f32,
@@ -86,7 +86,7 @@ fn within_band(dq: i64, dt: i64, bw: i64, diff_ec_ul: f64) -> bool {
 }
 
 /// `check_connect_ug` (`Correct.cpp` 19174).
-fn check_connect_ug(graph: &Asg, v: u32, w: u32, bw: i64, diff_ec_ul: f64, dq: i64) -> bool {
+pub(crate) fn check_connect_ug(graph: &Asg, v: u32, w: u32, bw: i64, diff_ec_ul: f64, dq: i64) -> bool {
     for arc in graph.arcs_of(v) {
         if arc.deleted || arc.v != w {
             continue;
@@ -97,7 +97,7 @@ fn check_connect_ug(graph: &Asg, v: u32, w: u32, bw: i64, diff_ec_ul: f64, dq: i
 }
 
 /// `check_connect_rg` (`Correct.cpp` 19190).
-fn check_connect_rg(
+pub(crate) fn check_connect_rg(
     context: &UlRescallContext<'_>,
     uv: u32,
     uw: u32,
@@ -117,7 +117,7 @@ fn check_connect_rg(
     let rv = end_vertex(uv_unitig, uv & 1);
     let rw = end_vertex(uw_unitig, uw & 1);
     let query = (rv >> 1) as usize;
-    for hit in &context.sources[query].hits {
+    for hit in &context.sources[query] {
         let qn = hit.query_identifier;
         let tn = hit.target_identifier;
         if tn != rw >> 1 {
@@ -595,7 +595,7 @@ pub fn ul_lalign_base(
 /// `get_win_aln` (`Correct.cpp` 14917): the target coordinates and error of an
 /// aligned window, only when it is adjacent (in target space) to the previous
 /// window.
-fn get_win_aln(region: &OverlapRegion, wid: usize) -> Option<(i64, i64, i64)> {
+pub(crate) fn get_win_aln(region: &OverlapRegion, wid: usize) -> Option<(i64, i64, i64)> {
     let windows = &region.window_cigar.windows;
     if wid > 0
         && windows[wid].y_end != -1
@@ -613,7 +613,7 @@ fn get_win_aln(region: &OverlapRegion, wid: usize) -> Option<(i64, i64, i64)> {
 
 /// `ovlp_win_check` (`Correct.cpp` 22190): whether two windows of the same
 /// overlap are collinear enough to belong to one consensus chain.
-fn ovlp_win_check(
+pub(crate) fn ovlp_win_check(
     region: &OverlapRegion,
     id0: u32,
     id1: u32,
