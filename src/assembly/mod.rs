@@ -77,7 +77,7 @@ pub fn assemble(options: &mut AssemblyOptions) -> i32 {
         None
     };
 
-    let (read_store, state, write_caches) = match loaded {
+    let (mut read_store, state, write_caches) = match loaded {
         Some((store, state)) => {
             eprintln!(
                 "[M::ha_assemble::{:.3}*{:.2}] ==> loaded corrected reads and overlaps from disk",
@@ -200,7 +200,7 @@ pub fn assemble(options: &mut AssemblyOptions) -> i32 {
     // `clean_graph`: build, clean and write the assembly graphs. A run that
     // loaded the caches passes `write = 0` (`Assembly.cpp` 2190).
     if let Err(error) =
-        pipeline::build_string_graph_without_clean(options, &read_store, state, write_caches)
+        pipeline::build_string_graph_without_clean(options, &mut read_store, state, write_caches)
     {
         eprintln!("[ERROR] {}", error);
         return 1;
@@ -219,7 +219,7 @@ pub fn assemble_pair(options: &mut AssemblyOptions) -> i32 {
         None
     };
 
-    let (read_store, state, write_caches) = match loaded {
+    let (mut read_store, state, write_caches) = match loaded {
         Some((store, state)) => {
             eprintln!(
                 "[M::ha_assemble_pair::{:.3}*{:.2}] ==> loaded corrected reads and overlaps from disk",
@@ -319,7 +319,7 @@ pub fn assemble_pair(options: &mut AssemblyOptions) -> i32 {
     };
 
     if let Err(error) =
-        pipeline::build_string_graph_without_clean(options, &read_store, state, write_caches)
+        pipeline::build_string_graph_without_clean(options, &mut read_store, state, write_caches)
     {
         eprintln!("[ERROR] {}", error);
         return 1;

@@ -93,7 +93,7 @@ fn join_paf_lists(raw: Vec<Vec<PafHit>>, flags: Vec<PafFlags>) -> Vec<PafList> {
 /// an error after the read-graph and primary-unitig outputs have been written.
 pub fn build_string_graph_without_clean(
     options: &mut AssemblyOptions,
-    reads: &ReadStore,
+    reads: &mut ReadStore,
     state: CorrectionState,
     write_caches: bool,
 ) -> Result<(), String> {
@@ -284,7 +284,7 @@ pub fn build_string_graph_without_clean(
     // The cast of the corrected overlaps is over; the later stages only read
     // the lists, so they go back to the flagged representation.
     let mut sources = join_paf_lists(forward, forward_flags);
-    let reverse_sources = join_paf_lists(reverse, reverse_flags);
+    let mut reverse_sources = join_paf_lists(reverse, reverse_flags);
 
     let mut graph = initial.graph;
     let mut bubble_labels = initial.bubble_label;
@@ -332,7 +332,33 @@ pub fn build_string_graph_without_clean(
         ultra_long.as_mut().expect("the --ul flag implies a UL store"),
     )?;
 
-    // `clean_graph`, non-`ar` tail.
+    // `if(asm_opt.ar) gradually_renew_g(...)` else the non-`ar` tail.
+    if ultra_long.is_some() {
+        crate::assembly::ul_renew_driver::gradually_renew_g(
+            options,
+            reads,
+            &mut graph,
+            &mut trio_flags,
+            &mut sources,
+            &mut reverse_sources,
+            &mut coverage_cut,
+            &mut read_to_unitig,
+            &mut bubble_labels,
+            ultra_long.as_mut().expect("the --ul flag implies a UL store"),
+            &crate::assembly::ul_renew_driver::UlRenewOptions {
+                clean_round: i64::from(options.cleaning_round_count),
+                min_ovlp_drop_ratio: f64::from(options.minimum_drop_rate),
+                max_ovlp_drop_ratio: f64::from(options.maximum_drop_rate),
+                max_tip: i64::from(max_short_tip),
+                max_ul_tip: i64::from(options.maximum_short_ultra_long_tip_read_count),
+                is_trio: false,
+            },
+            options.ultra_long_cleaning_round_count,
+            UG_EXT_LEN,
+            dump_directory.as_deref(),
+            chemical_mask.as_deref(),
+        );
+    } else {
     ug_ext_gfa(
         &mut graph,
         &sources,
@@ -343,6 +369,7 @@ pub fn build_string_graph_without_clean(
         options.maximum_hang_rate,
         UG_EXT_LEN,
     );
+    }
     // `hic_clean_adv(sg, &uopt)` follows here in the reference. It needs the
     // Hi-C bubble-chain machinery that is not ported yet; the stage does not
     // change the graph on the chr11-2M corpus (probe d19 == d20).
@@ -1136,7 +1163,7 @@ fn ul_clean_gfa(
 
 /// `post_rescue`: the rescue passes that run at the end of `ul_clean_gfa`.
 #[allow(clippy::too_many_arguments)]
-fn post_rescue(
+pub(crate) fn post_rescue(
     options: &mut AssemblyOptions,
     trio_flags: &mut Vec<u8>,
     graph: &mut Asg,

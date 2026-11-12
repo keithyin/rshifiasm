@@ -37,6 +37,7 @@ pub fn ul_realignment_gfa(
     options: &mut AssemblyOptions,
     reads: &mut ReadStore,
     sg: &mut Asg,
+    trio_flags: &mut Vec<u8>,
     sources: &mut Vec<PafList>,
     reverse_sources: &mut Vec<PafList>,
     coverage_cut: &mut Vec<CoverageCut>,
@@ -48,6 +49,8 @@ pub fn ul_realignment_gfa(
     _free_uld: bool,
     is_bridg: bool,
     deep_clean: bool,
+    dump_directory: Option<&std::path::Path>,
+    chemical_mask: Option<&[u8]>,
 ) {
     for seq in sg.sequences.iter_mut() {
         if !seq.deleted {
@@ -181,7 +184,20 @@ pub fn ul_realignment_gfa(
         options.minimum_overlap_length,
         reads,
     );
-    // `post_rescue` runs in the caller.
+    // `post_rescue(uopt, (*(ropt->sg)), (*(ropt->src)), (*(ropt->r_src)), ruIndex, b_mask_t, 0, NULL)`
+    crate::assembly::pipeline::post_rescue(
+        options,
+        trio_flags,
+        sg,
+        sources,
+        reverse_sources,
+        read_to_unitig,
+        coverage_cut,
+        bubble_labels,
+        i64::from(opts.max_tip + 1),
+        dump_directory,
+        chemical_mask,
+    );
 }
 
 /// `gradually_renew_g` (`Overlaps.cpp` 39297): the renewal rounds with the
@@ -191,6 +207,7 @@ pub fn gradually_renew_g(
     options: &mut AssemblyOptions,
     reads: &mut ReadStore,
     sg: &mut Asg,
+    trio_flags: &mut Vec<u8>,
     sources: &mut Vec<PafList>,
     reverse_sources: &mut Vec<PafList>,
     coverage_cut: &mut Vec<CoverageCut>,
@@ -200,12 +217,15 @@ pub fn gradually_renew_g(
     opts: &UlRenewOptions,
     ul_aln_round: i32,
     maximum_length: u32,
+    dump_directory: Option<&std::path::Path>,
+    chemical_mask: Option<&[u8]>,
 ) {
     let bin_file = "re";
     ul_realignment_gfa(
         options,
         reads,
         sg,
+        trio_flags,
         sources,
         reverse_sources,
         coverage_cut,
@@ -217,6 +237,8 @@ pub fn gradually_renew_g(
         ul_aln_round <= 1,
         true,
         options.polyploidy <= 2,
+        dump_directory,
+        chemical_mask,
     );
     // `gen_ug_opt_t(..., (max_short_tip*2), 0.15, 3, 0.05, 0.9, ...)` then
     // `ug_ext_gfa(uopt, *sg, ug_ext_len)`
@@ -238,6 +260,7 @@ pub fn gradually_renew_g(
             options,
             reads,
             sg,
+            trio_flags,
             sources,
             reverse_sources,
             coverage_cut,
@@ -249,6 +272,8 @@ pub fn gradually_renew_g(
             (k + 1) == ul_aln_round,
             false,
             false,
+            dump_directory,
+            chemical_mask,
         );
         crate::assembly::unitig::ug_ext_gfa(
             sg,
