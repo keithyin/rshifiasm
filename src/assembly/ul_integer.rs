@@ -994,3 +994,289 @@ pub fn init_ul_str_idx(store: &[UlReadVec], unitig_count: usize) -> UlStrIdx {
     }
     str_idx
 }
+
+/// `utg_cover_read_occ_by_qs` (`gfa_ut.cpp` 4890).
+pub fn utg_cover_read_occ_by_qs(
+    oqs: i64,
+    oqe: i64,
+    x: &UcBlock,
+    read_lengths: &[u64],
+    unitig_reads: &[u64],
+) -> i64 {
+    assert!(oqs >= i64::from(x.qs) && oqs <= i64::from(x.qe));
+    assert!(oqe >= i64::from(x.qs) && oqe <= i64::from(x.qe));
+    assert!(oqe > oqs);
+    let mut s_off = crate::assembly::ul::get_offset_adjust(
+        (oqs - i64::from(x.qs)) as u32,
+        x.qe - x.qs,
+        x.te - x.ts,
+    ) as i64;
+    let mut e_off = crate::assembly::ul::get_offset_adjust(
+        (i64::from(x.qe) - oqe) as u32,
+        x.qe - x.qs,
+        x.te - x.ts,
+    ) as i64;
+    if x.rev {
+        std::mem::swap(&mut s_off, &mut e_off);
+    }
+    ug_occ_w(
+        u64::from(x.ts + s_off as u32),
+        u64::from(x.te - e_off as u32),
+        read_lengths,
+        unitig_reads,
+    ) as i64
+}
+
+/// `estimate_ul_len` (`gfa_ut.cpp` 4905): the string position at the end of
+/// a query-space extension, writing per-node coverages into `cov_buf`.
+pub fn estimate_ul_len(
+    raw: &UlReadVec,
+    str_: &UlStr,
+    idx: usize,
+    ext_len: i64,
+    cov_buf: &mut [u64],
+    read_lengths: &[u64],
+    unitig_reads: impl Fn(u32) -> Vec<u64>,
+) -> usize {
+    if ext_len == 0 {
+        return idx;
+    }
+    let str_n = str_.cn as i64;
+    let mut k = idx as i64;
+    if ext_len < 0 {
+        let mut aim_s = i64::from(raw.bb[str_.a[idx] as usize >> 32].qs) + ext_len;
+        if aim_s < 0 {
+            aim_s = 0;
+        }
+        let aim_e = i64::from(raw.bb[str_.a[idx] as usize >> 32].qe);
+        k = idx as i64 - 1;
+        while k >= 0 {
+            let block = &raw.bb[str_.a[k as usize] as usize >> 32];
+            let qs = i64::from(block.qs);
+            let qe = i64::from(block.qe);
+            let ovlp_s = aim_s.max(qs);
+            let ovlp_e = aim_e.min(qe);
+            if ovlp_e <= ovlp_s {
+                k += 1;
+                break;
+            }
+            let cov_occ = utg_cover_read_occ_by_qs(
+                ovlp_s,
+                ovlp_e,
+                block,
+                read_lengths,
+                &unitig_reads(block.hid),
+            );
+            if cov_occ == 0 {
+                k += 1;
+                break;
+            }
+            cov_buf[k as usize] = cov_occ as u64;
+            k -= 1;
+        }
+        if k < 0 {
+            k += 1;
+        }
+    } else {
+        let aim_s = i64::from(raw.bb[str_.a[idx] as usize >> 32].qs);
+        let mut aim_e = i64::from(raw.bb[str_.a[idx] as usize >> 32].qe) + ext_len;
+        if aim_e > i64::from(raw.rlen) {
+            aim_e = i64::from(raw.rlen);
+        }
+        k = idx as i64 + 1;
+        while k < str_n {
+            let block = &raw.bb[str_.a[k as usize] as usize >> 32];
+            let qs = i64::from(block.qs);
+            let qe = i64::from(block.qe);
+            let ovlp_s = aim_s.max(qs);
+            let ovlp_e = aim_e.min(qe);
+            if ovlp_e <= ovlp_s {
+                k -= 1;
+                break;
+            }
+            let cov_occ = utg_cover_read_occ_by_qs(
+                ovlp_s,
+                ovlp_e,
+                block,
+                read_lengths,
+                &unitig_reads(block.hid),
+            );
+            if cov_occ == 0 {
+                k -= 1;
+                break;
+            }
+            cov_buf[k as usize] = cov_occ as u64;
+            k += 1;
+        }
+        if k >= str_n {
+            k -= 1;
+        }
+    }
+    k as usize
+}
+
+/// `integer_align_extention` (`gfa_ut.cpp` 4977).
+#[allow(clippy::too_many_arguments)]
+pub fn integer_align_extention(
+    store: &[UlReadVec],
+    qid: usize,
+    q_str: &UlStr,
+    tid: usize,
+    t_str: &UlStr,
+    is_rev: bool,
+    q_cov_buf: &mut [u64],
+    t_cov_buf: &mut [u64],
+    aln_pair: &IntegerAln,
+    is_backward: bool,
+    read_lengths: &[u64],
+    unitig_reads: impl Fn(u32) -> Vec<u64>,
+) -> (usize, usize) {
+    let qk = aln_pair.tn_rev_qk as u32 as usize;
+    let tk = if !is_rev {
+        aln_pair.tk as usize
+    } else {
+        t_str.cn as usize - aln_pair.tk as usize - 1
+    };
+    let q_b = &store[qid].bb[q_str.a[qk] as usize >> 32];
+    let t_b = &store[tid].bb[t_str.a[tk] as usize >> 32];
+    let qlen = i64::from(store[qid].rlen);
+    let tlen = i64::from(store[tid].rlen);
+    let (qoff, toff) = if is_backward {
+        (
+            i64::from(q_b.qs),
+            if is_rev {
+                tlen - i64::from(t_b.qe)
+            } else {
+                i64::from(t_b.qs)
+            },
+        )
+    } else {
+        (
+            qlen - i64::from(q_b.qe),
+            if is_rev {
+                i64::from(t_b.qs)
+            } else {
+                tlen - i64::from(t_b.qe)
+            },
+        )
+    };
+    let ext = qoff.min(toff);
+    let (q_end, t_end) = if is_backward {
+        (
+            estimate_ul_len(&store[qid], q_str, qk, -ext, q_cov_buf, read_lengths, &unitig_reads),
+            estimate_ul_len(
+                &store[tid],
+                t_str,
+                tk,
+                if is_rev { ext } else { -ext },
+                t_cov_buf,
+                read_lengths,
+                &unitig_reads,
+            ),
+        )
+    } else {
+        (
+            estimate_ul_len(&store[qid], q_str, qk, ext, q_cov_buf, read_lengths, &unitig_reads),
+            estimate_ul_len(
+                &store[tid],
+                t_str,
+                tk,
+                if is_rev { -ext } else { ext },
+                t_cov_buf,
+                read_lengths,
+                &unitig_reads,
+            ),
+        )
+    };
+    (q_end, t_end)
+}
+
+/// `gap_chain_check` (`gfa_ut.cpp` 5005).
+#[allow(clippy::too_many_arguments)]
+pub fn gap_chain_check(
+    unitig_lengths: &[u32],
+    i0: &IntegerAln,
+    i1: &IntegerAln,
+    is_rev: bool,
+    q_str: &UlStr,
+    t_str: &UlStr,
+    q_block: &[UcBlock],
+    t_block: &[UcBlock],
+    diff_rate: f64,
+    hard_thres: i64,
+) -> bool {
+    let i0_qk_str = i0.tn_rev_qk as u32 as usize;
+    let i1_qk_str = i1.tn_rev_qk as u32 as usize;
+    let (i0_tk_str, i1_tk_str) = if !is_rev {
+        (i0.tk as usize, i1.tk as usize)
+    } else {
+        (
+            t_str.cn as usize - i0.tk as usize - 1,
+            t_str.cn as usize - i1.tk as usize - 1,
+        )
+    };
+    debug_assert!(i0_qk_str < i1_qk_str);
+    debug_assert!(i0_tk_str < i1_tk_str);
+    let mut q_near = 0u32;
+    let mut t_near = 0u32;
+    if i0_qk_str + 1 == i1_qk_str {
+        q_near = 1;
+    }
+    if i0_tk_str + 1 == i1_tk_str {
+        t_near = 1;
+    }
+    if (q_near + t_near) != 1 {
+        return false;
+    }
+    let i0_qk = q_str.a[i0_qk_str] as usize >> 32;
+    let i1_qk = q_str.a[i1_qk_str] as usize >> 32;
+    let i0_tk = t_str.a[i0_tk_str] as usize >> 32;
+    let i1_tk = t_str.a[i1_tk_str] as usize >> 32;
+    let walk = |blocks: &[UcBlock], mut k: usize, e: usize| -> Option<i64> {
+        let mut l = 0i64;
+        while k != usize::MAX && k != e {
+            if blocks[k].pidx != u32::MAX {
+                l += blocks[k].pdis as i64;
+            }
+            k = if blocks[k].pidx == u32::MAX {
+                usize::MAX
+            } else {
+                blocks[k].pidx as usize
+            };
+        }
+        if k != e {
+            None
+        } else {
+            Some(l)
+        }
+    };
+    let Some(mut lq) = walk(q_block, i1_qk, i0_qk) else {
+        return false;
+    };
+    let Some(mut lt) = walk(t_block, i1_tk, i0_tk) else {
+        return false;
+    };
+    if is_rev {
+        lt += unitig_lengths[t_block[i0_tk].hid as usize] as i64;
+        lt -= unitig_lengths[t_block[i1_tk].hid as usize] as i64;
+    }
+    if lt < 0 {
+        lt = 0;
+    }
+    let check = |min: i64, max: i64, diff_rate: f64, hard_thres: i64| -> bool {
+        let dif = max - min;
+        !((dif as f64) >= (min as f64 * diff_rate))
+    };
+    let (min, max) = if lq <= lt { (lq, lt) } else { (lt, lq) };
+    if !check(min, max, diff_rate, hard_thres) {
+        return true;
+    }
+    lq = normlize_gdis(unitig_lengths, &[], &[], &q_block[i1_qk], &q_block[i0_qk], false);
+    lt = normlize_gdis(unitig_lengths, &[], &[], &t_block[i1_tk], &t_block[i0_tk], is_rev);
+    let (min, max) = if lq <= lt { (lq, lt) } else { (lt, lq) };
+    let dif = max - min;
+    if (dif as f64) >= (min as f64 * diff_rate) || dif < hard_thres {
+        return false;
+    }
+    true
+}

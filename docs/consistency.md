@@ -3014,6 +3014,60 @@ u2g_clean(16281)、renew_u2g_cov(16560)、renew_u2g_bg(16653)、
 push_scaff_node（grep）、reset_scaf_node_uinfo_srt_t/push_scaf_bases
 （gfa_ut.cpp ~14400 区）、update_paf(inter.cpp 17164)。
 
+## U6 续五（2026-11-12 第六轮，关键路径确认 + 默认面缩小）
+
+**重要确认**：`integer_candidate`（含 `poa_cns_chain`/`refine_integer_ovlps`
+/`update_raw_integer_seq`/`dump_cns_res`/`cal_integer_*`/`poa_chain_0`/
+`gen_cns_by_poa`/`topo_srt_gen`/`integer_g_chain`/`update_poa_dp` 整个
+POA 子树，gfa_ut.cpp 4890-6460）只被 `worker_integer_correction`（6954）
+调用——即 `ul_re_correct` 的 `n_r > 0`（`--integer-correct > 0`）轮。
+`--integer-correct` 默认 0，因此**默认 --ul 路径不需要该子树**；
+`ul_re_correct(0)` = `shrink_uls`（shrink_ul0/renew_ul_vec_t/shrink_1b/
+rebuid_idx）。
+
+gen_ul2ul 的默认面（全部已读或待读清单）：
+1. `worker_integer_postprecess` → `integer_gen_ovlp` ✅ 已读（新条目构建
+   + integer_chain + update_exact_ul_ovlps，o->cn = o->n）。
+2. `gen_integer_normalize` → `integer_normalize_ovlp`(6697) ✅ 已读
+   （**对称化**：每条 o 条目镜像进对应条目，hid<qid 跳过，缺失则
+   push 反向条目并 t->cn++，重叠不一致取 span 大者/改写小者）。
+   与 `integer_normalize_ovlp_purge`(6752) 需对比差异。
+3. `chimeric_integer_deal`(7213) → `clip_integer_chimeric` ✅ 头部已读
+   （is_srt 排序去 del、qs_k/qe_k 深度扫描、is_left/right/middle 判定），
+   尾部（对 o->a[k] 的 is_del 应用）待读。
+4. `append_utg_es`(7913)：`integer_append_ug_ovlp`（**待读**）+
+   `worker_integert_clean` → `clean_srt_integer`（**待读**）+ ug 侧
+   `integer_normalize_ovlp` ✅。
+5. debug_sym ✅（纯 assert）。
+6. `print_integert_ovlp_stat`(7948)（日志行，**待读**）。
+7. `remove_integert_containment`(7935) 头部已读，尾部待读。
+8. `integer_sg_gen`(7963)（**待读**，产 usg_t；`usg_seq_t` mm/occ/len/
+   arc[2]；`usg_arc_t` ul/v/ol:31|del:1/ou/idx）。
+9. `renew_u2g_cov`(16560)/`renew_u2g_bg`(16653)/`u2g_clean`(16281)
+   （**待读**，ulg_opt_t = init_ulg_opt_t(16906)）。
+10. `convert_usg_t`(14963) ✅ + `renew_ng`(15107) ✅ + `gen_spec_rc_edge`
+    + `push_direct_scaff_node` ✅ + `push_scaff_node`（**待读**）+
+    `reset_scaf_node_uinfo_srt_t`/`push_scaf_bases`（**待读**）+
+    `realloc_rdb_adv` ✅ + `update_paf`(inter.cpp 17164)（**待读**）+
+    `renew_R_to_U` ✅（= clear src/rsrc + reset_ma_sub_t +
+    ma_hit_contained_advance）+ `push_integer_seq_exact`(7306) 头部已读。
+11. `init_ul_resolve_t`(4192)/`init_ul_str_idx_t`(4137) ✅（Rust:
+    init_ul_str_idx 已移植）。
+12. ul_realignment_gfa(17598) 组装清单见「U6 续三」；`free_uld` 备份/
+    恢复语义（bn/idn/rlen 备份 + nid 清理）已读。
+13. `gradually_renew_g`/`renew_g` 接线（39271/39297）✅ 已读。
+
+`ul_integer.rs`(730b77c) 已含：UlStr/UlStrIdx/IntegerAln/UlChain/Ul2ulT/
+Ul2ulItem、init_ul_str_idx、ug_occ_w、uc_block_qse_cutoff、
+normlize_gdis/_exact、dis_check_integer_aln_t、integer_chain、
+append_connective/connective_conform、integer_chain_dp、
+update_exact_ul_ovlps、utg_cover_read_occ_by_qs、estimate_ul_len、
+integer_align_extention、gap_chain_check。
+
+**注意**：`integer_chain_dp`/`refine_integer_ovlps` 中的 hom 掩码
+（IF_HOM）只在 integer_candidate 路径用（bub 非空）；integer_chain_dp
+本身也被 integer_candidate 调用（6649 区）——默认路径同样不需要。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
