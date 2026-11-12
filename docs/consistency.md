@@ -3367,3 +3367,96 @@ U6 门禁计划（资产已就绪）：`re.uidx.bin` 语义比对（`gen_polishe
 
 `cargo test --release`：345 passed（lib 312 + 集成 33；13 个 `--ignored`
 黄金回放不计）。
+
+## 续十二（2026-11-12，ulg 清理簇 + 混合扩展子树）
+
+本节记录 U6-3 的第 12 轮推进。C++ 参考行号均指 `gfa_ut.cpp`（除非注明）。
+
+### 本轮已迁移（全部通过 312 lib 测试，提交序列 f781e27→1e02972）
+
+1. **get_remove_hifi_occ 修正**（8499）：补上 `iug->g->seq[i].del`
+   跳过（两趟都要）、`iu->a[z].n`（此前误用 `iu.len()`）、返回值取反
+   （C 返回 `del_n <= thres`，即"可删"）、`buf` 低 32 位为 CSR 绝对下标。
+2. **ulg 弧切割簇重写**（忠实版）：`usg_topocut_aux`(8784)、
+   `get_ul_arc_supports`(9577)/`check_ul_contain_arc_supports`(9677)（共享
+   walk + `zero_on_collapse` 区分；`n_pre` 在 v^1 路径反转后捕获；sibling
+   重置后 `gen_ug_integer_seq_on_fly` 吃整个 `[b_int_s..]` 区间）、
+   `check_ulg_to_del`(9735)、`ulg_arc_cut_supports`(9757)（seq_vis 门控、
+   `worker_update_ul_arc_supports` 预排序（w_v<<32|arc_idx 后基数排序）、
+   f32 len_rat、topo_level/skip_hom；is_trio/max_drop_len 未用已删）。
+   引入 `UlResolve` 上下文（cov/z_items/iug/raw/store/raw_unitigs/
+   read_lengths/unitig_reads/str_idx/bub/bg/telo——telo 恒 None，
+   `--telo-motif` 的 `gen_utg_telo` 未移植）。
+3. **ulg_arc_cut_tips**(8673) + `get_iug_u_raw_occ`(8041) + `get_bridges`
+   (8636) + `ulg_seq_del`(8662)；`get_ul_path_info` 的 bridge 计数修复
+   （bv/bw 来自 `cc.iug_a` 端点 + ulg_type 门控；UlCov 增加 uln 字段）。
+4. **ulg 泡泡簇**：`ulg_bub_pop_cut_aux`(9865)、`ulg_bub_pop_backtrack`
+   (9887)、`ulg_bub_pop1`(9941)、`ulg_pop_bubble`(10084)（含
+   `(wc[1]<mm_c)&&(wc[1]==mm_c&&wm[1]>mm_m)` 恒假条件的原样复刻）、
+   `ulg_arc_cut_z`(10337)（kw==1 的 wt 延伸、ul_occ_check、
+   ul_homo_path_check(10198)——注意 `b->n = bn` 后仍指针读幸存项，
+   Rust 用 survivors 拷贝）。
+5. **u2g_clean**(16281) 驱动 + `gen_ul2ul` 尾部（arc_del_trans、ma_ug_gen
+   → `z.i_ug`、renew_u2g_cov/renew_u2g_bg、`Ul2ulIdx` 增加 `bg`/`i_ug`
+   字段）；`renew_ul2_utg` 改用 `renew_utg`（从 i_ug.graph 重组，
+   此前误用 i_g 拷贝）；`u2g_threading` 去掉 z 参数并初始化 `ng.mp`。
+6. **Usg 类型扩展**：`UsgArcMm`/`arc_mm[2]`/`mp`；`pushp_usg_arc_mm`
+   实装；`get_usg_arc_mm`（idx = offset<<32|count）；`usg_cleanup` 合并
+   arc_mm（worker_clean_usg，10600）；`push_usg_t_node` 改为按址创建。
+7. **混合扩展子树**（新模块 `ul_hybrid_ext.rs`）：`check_hybrid_connect`
+   (11893)、`integer_realign_g`(11918)（srt/track 双段缓冲 + 三相改写 +
+   lin 回退）、`u2g_hybrid_aln`(13754)、`get_arc_support`(13048)、
+   `get_arc_support_chain`(13130)、`ava_pass_unique_bridge_cov`(13238)、
+   `ava_pass_unique_bridge_tips`(12256)（重置走单一 work 列表）、
+   `iter_unique_arcs`(12135)、`usg_unique_arcs_cluster_adv`(12201)、
+   `remap_gen_arcs`(11635)、`update_usg_t_threading_0`(12355)、
+   `update_usg_t_threading`(12474)、`old_path_ext`(13262)、
+   `gen_hybrid_aln_idx`(13797)、`gen_sub_integer_path(_ff)`(13832/14164)、
+   `is_best_path`(13949)、`get_best_path`(14114)、`is_best_pair`(14185)、
+   `get_best_pair`(14222)、`ug_ext_0`(14301)、`ug_ext_free`(14368)、
+   `ug_ext_strict`(14410)、`renew_usg_t_bub`(13928)（identify_bubbles_recal
+   以 poy 布尔参数化，ul_renew_gfa.rs）、`u2g_hybrid_detan_iter`(15332)、
+   `u2g_hybrid_clean`(15967)、`gen_hybrid_ug`(15987)、`debug_sysm_usg_t`。
+   `UlgOptions` 增加 min/max_ovlp_drop_ratio。注意：`u2g_hybrid_clean` 与
+   `gen_unique_g_adv`/`u2g_hybrid_detan` 在参考主流程中是死代码
+   （16275 处调用被注释），已移植但不接线。
+
+### 下一轮（续十三）的精确恢复点
+
+`renew_ng`(15107) 当前是**部分移植**（ul_renew_ng.rs:355）：仅有
+convert_usg_t + idx_a/extra 顶点 + 第一遍 scaffold 收集。缺：
+
+1. `fill_scaffolds`(14932)：`reload_uu`（用 ".{bin}" 缓存 + 新 raw_g 重载
+   UL_INF）、`gen_scaffold_id` worker（填 usc 的 ulid/raw_sof/raw_eof）、
+   `dd = 4` 标记 + `load_scaf_base`(14330，读 `.uidx.ucr.bin`)。
+2. `realloc_rdb_adv`(14663)：读库扩展（N_site/read_length/read_sperate/
+   name_index/name/paf/reverse_paf/ruIndex.index），scaffold 节点走
+   `reset_scaf_node_uinfo_srt_t`(14390 三态返回) +
+   `push_scaf_bases`（材料化碱基；ff==1 时 `ng->seq[i].del = 1`）、
+   `reset_bub_label_t`。
+3. renew_ng 第二遍弧构建（15229-15325）：`push_scaff_node`(17234)、
+   `push_direct_scaff_node`(15019)、`gen_spec_edge(ng,...)` +
+   `asg_arc_pushp`、`asg_cleanup(ng)`、nocc 断言。
+4. `ul_realignment_gfa`(17598) 组装：PRIMARY 标记 → `hic_clean`(已移植
+   unitig.rs:2631) → deep_clean 分支（`deep_graph_clean`(18184) 依赖
+   hic_clean_adv/cal_bub_best_by_len —— hic.cpp 泡泡机制未移植，先按
+   非 ar 路径的 stub 处理并留探针）→ `ul_realignment`(已移植
+   ul_recall.rs:540，注意 round≥2 时 Scall/UlRescall 上下文要按新
+   unitig 图重建) → filter_sg_by_ug → gen_bubble_chain →
+   init_ul_resolve_t 等价物（copy_untig_graph + init_ul_str_idx）→
+   `ul_re_correct`（integer_correct_round=0 时确认是否 no-op）→
+   gen_ul2ul → renew_ng → 输出换血（ng 换 sg、R_INF.paf 换新）→
+   `renew_R_to_U`（已移植 ul_renew_ng.rs:486 renew_r_to_u）→
+   post_rescue（已移植）。
+5. `renew_g`(39262)/`gradually_renew_g`(39297) 循环 + pipeline.rs 在
+   ul_clean_gfa 之后按 `ar` 分叉（当前恒走非 ar 尾部）。
+   `hic_clean_adv` 在 gradually_renew_g 中无条件调用（注释掉了
+   triobin 条件）——同 deep_clean 一样先 stub。
+6. U7：解除 parse 拒绝，e2e 门禁跑 /tmp/ulref 语料。
+
+### 门禁提示
+
+- `integer_realign_g` 的 per-thread 缓冲按单线程顺序复刻
+  （res_dump 按 seq_id 升序拼接），与 hifiasm 默认 `-t 1` 一致。
+- `u2g_hybrid_aln` 输出约定：ob = 纯路径顶点拼接，ub =
+  `<offset>:32|<len>:32`（按 seq_id 排序）。
