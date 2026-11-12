@@ -2902,6 +2902,82 @@ bub_links 之前、`asg_arc_cut_chimeric` 用 `UL_COV_THRES`、循环内
    + gl_chain_refine_advance 簇）暂按 C 排查是否在默认 ul_clean_round=1
    路径上（ul_re_correct 的 integer_correct_round 默认 0）。
 
+## U6 续三（2026-11-12 第四轮，renewal 图清理完成一半）
+
+- `f6a733d` **`ul_renew_gfa.rs`**：`get_unitig_het_fly`/`deter_unitig_het_fly`
+  （C 值语义：C_bases 按 r_flag==1 全额、==2 半额；`h->el != 1` 用
+  exact_region_byte）、`reset_inner_bub_het_poy`、
+  `identify_bubbles_recal_poy`（无条件重建 list/num/path_len/index；
+  m_het_cov=het_cov+het_cov*0.333333、m_hom_cov=het_cov+het_cov*0.6；
+  bubble list 部分与 identify_bubbles 的 round0 半部同构，pathLen 用
+  `asg_bub_backtrack_primary_length`；M_het=num.len()、P_het=num.len()+1；
+  IF_HOM = index > f_bub+1；尾部 deter_unitig_het_fly(het_cov*1.15)）、
+  `dfs_subgraph_advance`+`get_bub_pop_max_dist_advance`（Overlaps.cpp
+  26098/26166）、`gen_bubble_chain`（adjust_utg_by_primary 副本上调 →
+  identify_bubbles 或 recal_poy → purge_level_primary==0 全 hom）、
+  `filter_sg_by_ug`（读图重写：unitig 内部弧 + 端点弧 + circ 弧，
+  gen_spec_edge 已 pub(crate)）。
+
+**gen_ul2ul 引擎清单（下一步的移植材料，已读关键结构）**：
+- 结构（gfa_ut.cpp 250-170）：`integer_aln_t`(255)、`ul_chain_t`(270)、
+  `integer_t`(340 区，只用到 buf.b/buf.sc/buf.u/buf.o/buf.pg)、
+  `integer_ml_t`、`ul_sub_path_t/ul_path_t/ul_path_srt_t`、
+  `ul_str_t`(cn:31|is_cir:1 + a[])、`ul_str_idx_t`(idx/occ/str)、
+  `ul_resolve_t`(384)、`ul2ul_t`(106)、`ul2ul_item_t`(119，id:31|is_del:1)、
+  `uinfo_srt_t`、`ul_cov_t`、`ul_bg_t`、`ul2ul_idx_t`(168，item_idx/
+  i_g/i_ug/h_usg/cc/bg/iug_*/telo)、`ulg_opt_t`(16906 init_ulg_opt_t)、
+  `usg_arc_t`(49：ul/v/ol:31|del:1/ou/idx)、`usg_seq_t`(mm/occ/len/
+  arc[2]/arc_mm[2]/del/telo)、`usg_t`(83)、`usc_t`(14463)/`usc_vec_t`、
+  `asg_ext_t`(36)。
+- 入口链（16827 gen_ul2ul）：item_idx 构建（cn>1 的 ul + 全部 graph 节点）
+  → `worker_integer_postprecess`(6959，ul 侧 `integer_gen_ovlp`(6596))
+  → `gen_integer_normalize`(6976，ul 侧 `integer_normalize_ovlp`(6697))
+  → `chimeric_integer_deal`(7213，`clip_integer_chimeric`(7012 区)) →
+  `append_utg_es`(7913：`integer_append_ug_ovlp` + `worker_integert_clean`
+  + ug 侧 `integer_normalize_ovlp`) → debug_sym → `print_integert_ovlp_stat`
+  (7948) → `remove_integert_containment`(7935) → `integer_sg_gen`(7963)
+  → `asg_arc_del_trans` → `ma_ug_gen` → `renew_u2g_cov`(16560) →
+  `renew_u2g_bg`(16653) → `u2g_clean`(16281)。
+- 叶子：`ug_occ_w`(4099)、`integer_chain`、`update_exact_ul_ovlps`、
+  `integer_chain_dp`、`refine_integer_ovlps`、`poa_cns_chain`、
+  `update_raw_integer_seq`、`dd_path_connect`、`get_ul_ovlp`/
+  `ulg_id`/`ulg_type` 宏、`get_real_length`(已有)。
+- renew_ng(15107) 已读完：`convert_usg_t`(14963)、`gen_spec_rc_edge`、
+  `push_direct_scaff_node`(15067 区)、`push_scaff_node`、
+  `realloc_rdb_adv`(inter.cpp 14663)、`update_paf`(17164)、
+  `renew_R_to_U`(gfa_ut.cpp 17582)。usc_t={nid,ulid,raw_sid,raw_eid,
+  raw_sof,raw_eof}。scaffold 节点：gen_spec_edge 失败时创建零长节点
+  （idx_a 追加 -1），第二遍用 push_scaff_node/push_direct_scaff_node 连接。
+- `ul_re_correct`(7892)：n_r=0（--integer-correct 默认 0）时只跑
+  `shrink_uls`(7869：`shrink_ul0`(7742) 按 pidx/弧长容差（≤8% 或 ≤512）
+  找连通 run，每个 run 拆成新读（nid 复制），末 run 原位重写，
+  `shrink_1b` + `renew_ul_vec_t`(7700) + qs/qe 平移) + `rebuid_idx`(7653：
+  filter_ul_ug + gen_ul_vec_rid_t + update_ug_arch_ul_mul + 重建 pstr)。
+  n_r>0 的 integer 簇（worker_integer_correction/update/clean 等）
+  **默认路径不可达，暂以显式 Err 拒绝**（--integer-correct>0 时）。
+- `ul_realignment_gfa`(gfa_ut.cpp 17598) 主体已读：hic_clean(sg) →
+  deep_clean 时 `deep_graph_clean`(gfa_ut.cpp 18184/402) →
+  ul_realignment → filter_sg_by_ug → gen_bubble_chain(avoid_het=
+  polyploidy>2) → init_ul_resolve_t(4192：l1_ug=copy_untig_graph +
+  init_integer_ml_t + init_ul_str_idx_t(4137)) → rlen 备份(!free_uld) →
+  ul_re_correct → init_ulg_opt_t(16906) → gen_ul2ul(0, is_bridg) →
+  renew_ng(h_usg, init_ug, sg, uopt, cov, ruIndex, 16, bin_file) →
+  清理 → 替换 sg/sources/指针 → renew_R_to_U → post_rescue(0, NULL)。
+  `free_uld=1` 时 destory_all_ul_t（UL_INF 清空）。
+
+**待移植（下一轮按序）**：① ug_occ_w + integer 引擎叶子簇
+（integer_chain/update_exact_ul_ovlps/integer_chain_dp/refine_integer_
+ovlps/poa_cns_chain/update_raw_integer_seq/integer_gen_ovlp/
+integer_normalize_ovlp/clip_integer_chimeric/chimeric_integer_deal/
+integer_append_ug_ovlp/worker_integert_clean/remove_integert_containment/
+integer_sg_gen）→ ② u2g_clean/renew_u2g_cov/renew_u2g_bg/usg 构建 →
+③ convert_usg_t/renew_ng 全体 + realloc_rdb_adv/update_paf/renew_R_to_U →
+④ init_ul_resolve_t/init_ul_str_idx_t/shrink_ul0/rebuid_idx →
+⑤ ul_realignment_gfa 组装 + deep_graph_clean →
+⑥ gradually_renew_g/renew_g 接入 pipeline.rs clean_graph 尾部 →
+⑦ U7 解锁 --ul + e2e 门禁（re.ul.msk.bin 逐字节 → re.ul.ovlp.bin 字段 →
+8 个 GFA/BED 逐字节）。Hi-C（task 5）在其后。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
