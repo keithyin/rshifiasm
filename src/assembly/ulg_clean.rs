@@ -1219,10 +1219,12 @@ pub fn idx_check_rate(a: &[u64], tot: u64, winlen: u64, match_rate: f32) -> bool
 }
 
 /// `get_remove_hifi_occ` (`gfa_ut.cpp` 8499): masks the raw-read words of
-/// the candidate vertices in the CSR and reports whether the deleted span
-/// exceeds `thres`; `del_occ` carries the deleted base count.
+/// the candidate vertices in the CSR and reports whether the deletion is
+/// acceptable — the reference returns 1 when `del_n <= thres`. `del_occ`
+/// carries the deleted base count.
 pub fn get_remove_hifi_occ(
     cov: &mut crate::assembly::ul2ul::UlCov,
+    iug_g: &Asg,
     thres: u64,
     v_a: &[u64],
     ub: &mut Vec<u64>,
@@ -1245,6 +1247,9 @@ pub fn get_remove_hifi_occ(
                 let word = cov.iug_b[m];
                 let iug_id = ((word << 1) >> 33) as usize;
                 let iug_off = (word & 0x7fff_ffff) as usize;
+                if iug_g.sequences[iug_id].deleted {
+                    continue;
+                }
                 if (word >> 63) != 0 {
                     n_mask += 1;
                     continue;
@@ -1271,9 +1276,9 @@ pub fn get_remove_hifi_occ(
             let ie = raw_len - keep_ns[1] as u64;
             if ie > is {
                 let (ms, me) = if item.v & 1 == 0 {
-                    (0u64, iu.len() as u64)
+                    (0u64, u64::from(item.n))
                 } else {
-                    (raw_len - iu.len() as u64, raw_len)
+                    (raw_len - u64::from(item.n), raw_len)
                 };
                 if is.max(ms) < ie.min(me) {
                     del_n += (ie.min(me) - is.max(ms)) as u64;
@@ -1302,6 +1307,9 @@ pub fn get_remove_hifi_occ(
                     let word = cov.iug_b[m];
                     let iug_id = ((word << 1) >> 33) as usize;
                     let iug_off = (word & 0x7fff_ffff) as usize;
+                    if iug_g.sequences[iug_id].deleted {
+                        continue;
+                    }
                     let entry = &cov.iug_a[iug_id][iug_off];
                     if (word >> 63) != 0 {
                         if entry.v & 1 == 0 {
@@ -1355,7 +1363,7 @@ pub fn get_remove_hifi_occ(
         *out = del_n as u32;
     }
     ub.clear();
-    del_n > thres
+    del_n <= thres
 }
 
 /// `gen_ug_integer_seq_on_fly` (`gfa_ut.cpp` 9203): the raw-read sequence of
@@ -1679,7 +1687,7 @@ pub fn usg_topocut_aux(
     let mut hit = false;
     if n_ext < max_ext {
         let tail: Vec<u64> = b[pn..].to_vec();
-        if get_remove_hifi_occ(cov, u64::from(max_ext_hifi), &tail, ub, None) {
+        if get_remove_hifi_occ(cov, g, u64::from(max_ext_hifi), &tail, ub, None) {
             b.truncate(pn);
             return true;
         }
@@ -1689,10 +1697,12 @@ pub fn usg_topocut_aux(
     hit
 }
 
-/// `get_ul_arc_supports` (`gfa_ut.cpp` 9577): the query/target support
-/// split of one arc against its siblings; returns the collapse flag.
+/// The shared walk of `get_ul_arc_supports` / `check_ul_contain_arc_supports`
+/// (`gfa_ut.cpp` 9577 / 9677): the query/target support split of one arc
+/// against its siblings; returns the collapse flag. The two reference
+/// variants differ only in zeroing `min_w_v` on collapse.
 #[allow(clippy::too_many_arguments)]
-pub fn get_ul_arc_supports(
+fn ul_arc_supports_walk(
     cov: &mut crate::assembly::ul2ul::UlCov,
     z_items: &crate::assembly::ul2ul::Ul2ulIdx,
     iug: &crate::assembly::unitig::UnitigGraph,
@@ -1709,6 +1719,7 @@ pub fn get_ul_arc_supports(
     skip_hom: bool,
     return_w_v: &mut u64,
     return_w_r: &mut u64,
+    zero_on_collapse: bool,
 ) -> u32 {
     let b_int_s = b_int.len();
     let b_raw_s = b_raw.len();
@@ -1717,16 +1728,7 @@ pub fn get_ul_arc_supports(
     let mut is_collapse = false;
     let v = (ve.ul >> 32) as u32;
     get_ul_path_info(
-        &iug.graph,
-        cov,
-        None,
-        v ^ 1,
-        None,
-        None,
-        None,
-        None,
-        None,
-        b_int,
+        &iug.graph, cov, None, v ^ 1, None, None, None, None, None, b_int,
     );
     let nv = b_int.len() - b_int_s;
     for k in 0..nv / 2 {
@@ -1738,18 +1740,12 @@ pub fn get_ul_arc_supports(
     if nv & 1 != 0 {
         b_int[b_int_s + nv / 2] ^= 1;
     }
+    // `n_pre` is captured right after the reversed `v^1` path: the per-sibling
+    // reset keeps that prefix and drops the `ve->v` path with it.
+    let n_pre = b_int.len();
     let mut v_occ = 0u32;
     get_ul_path_info(
-        &iug.graph,
-        cov,
-        None,
-        ve.v,
-        None,
-        Some(&mut v_occ),
-        None,
-        None,
-        None,
-        b_int,
+        &iug.graph, cov, None, ve.v, None, Some(&mut v_occ), None, None, None, b_int,
     );
     let v_path: Vec<u64> = b_int[b_int_s..].to_vec();
     gen_ug_integer_seq_on_fly(cov, z_items, raw, &v_path, b_raw);
@@ -1757,7 +1753,6 @@ pub fn get_ul_arc_supports(
     let av: Vec<AsgArc> = iug.graph.arcs_of(v).to_vec();
     let mut min_w_v = u64::MAX;
     let mut min_w_r = u64::MAX;
-    let n_pre = b_int.len();
     for arc in &av {
         if arc.deleted || arc.v == ve.v {
             continue;
@@ -1766,18 +1761,9 @@ pub fn get_ul_arc_supports(
         b_raw.truncate(b_raw_s + l_v);
         let mut r_occ = 0u32;
         get_ul_path_info(
-            &iug.graph,
-            cov,
-            None,
-            arc.v,
-            None,
-            Some(&mut r_occ),
-            None,
-            None,
-            None,
-            b_int,
+            &iug.graph, cov, None, arc.v, None, Some(&mut r_occ), None, None, None, b_int,
         );
-        let r_path: Vec<u64> = b_int[n_pre..].to_vec();
+        let r_path: Vec<u64> = b_int[b_int_s..].to_vec();
         gen_ug_integer_seq_on_fly(cov, z_items, raw, &r_path, b_raw);
         let l_r = b_raw.len() - b_raw_s - l_v;
         let zn = l_v.min(l_r);
@@ -1790,7 +1776,8 @@ pub fn get_ul_arc_supports(
             skip_hom_local = is_het_bridge(bub, &b_raw[b_raw_s..b_raw_s + l_v], z as i64 - 1);
         }
         if skip_hom_local && z < l_r {
-            skip_hom_local = is_het_bridge(bub, &b_raw[b_raw_s + l_v..b_raw_s + l_v + l_r], z as i64 - 1);
+            skip_hom_local =
+                is_het_bridge(bub, &b_raw[b_raw_s + l_v..b_raw_s + l_v + l_r], z as i64 - 1);
         }
         assert!(z > 0);
         let mut w_v = u64::MAX;
@@ -1843,11 +1830,13 @@ pub fn get_ul_arc_supports(
             }
         }
     }
-    if is_collapse {
+    if zero_on_collapse && is_collapse {
         min_w_v = 0;
     }
     *return_w_v = min_w_v;
     *return_w_r = min_w_r;
+    b_int.truncate(b_int_s);
+    b_raw.truncate(b_raw_s);
     if is_collapse {
         1
     } else {
@@ -1855,8 +1844,34 @@ pub fn get_ul_arc_supports(
     }
 }
 
-/// `check_ul_contain_arc_supports` (`gfa_ut.cpp` 9677): identical walk to
-/// [`get_ul_arc_supports`] without the collapse zeroing.
+/// `get_ul_arc_supports` (`gfa_ut.cpp` 9577).
+#[allow(clippy::too_many_arguments)]
+pub fn get_ul_arc_supports(
+    cov: &mut crate::assembly::ul2ul::UlCov,
+    z_items: &crate::assembly::ul2ul::Ul2ulIdx,
+    iug: &crate::assembly::unitig::UnitigGraph,
+    raw: &crate::assembly::unitig::UnitigGraph,
+    store: &[crate::assembly::ul_store::UlReadVec],
+    raw_unitigs: &[crate::assembly::asg::MaUtg],
+    read_lengths: &[u64],
+    unitig_reads: &[Vec<u64>],
+    str_idx: &crate::assembly::ul_integer::UlStrIdx,
+    bub: &BubbleType,
+    ve: &AsgArc,
+    b_int: &mut Vec<u64>,
+    b_raw: &mut Vec<u64>,
+    skip_hom: bool,
+    return_w_v: &mut u64,
+    return_w_r: &mut u64,
+) -> u32 {
+    ul_arc_supports_walk(
+        cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads, str_idx, bub,
+        ve, b_int, b_raw, skip_hom, return_w_v, return_w_r, true,
+    )
+}
+
+/// `check_ul_contain_arc_supports` (`gfa_ut.cpp` 9677): the identical walk
+/// without the collapse zeroing of `min_w_v`.
 #[allow(clippy::too_many_arguments)]
 pub fn check_ul_contain_arc_supports(
     cov: &mut crate::assembly::ul2ul::UlCov,
@@ -1876,14 +1891,10 @@ pub fn check_ul_contain_arc_supports(
     return_w_v: &mut u64,
     return_w_r: &mut u64,
 ) -> u32 {
-    let collapse = get_ul_arc_supports(
-        cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads, str_idx,
-        bub, ve, b_int, b_raw, skip_hom, return_w_v, return_w_r,
-    );
-    // The reference's variant skips the final `min_w_v = 0` zeroing; the
-    // caller consumes `w_v/w_r` before the collapse flag, so the shared walk
-    // is equivalent up to that assignment.
-    collapse
+    ul_arc_supports_walk(
+        cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads, str_idx, bub,
+        ve, b_int, b_raw, skip_hom, return_w_v, return_w_r, false,
+    )
 }
 
 /// `check_ulg_to_del` (`gfa_ut.cpp` 9735).
@@ -1899,13 +1910,13 @@ pub fn check_ulg_to_del(
     max_ext_hifi: u64,
     mut topo_level: u32,
     collapse: bool,
+    b: &mut Vec<u64>,
     ub: &mut Vec<u64>,
 ) -> bool {
     let mut to_del = false;
     if collapse {
         topo_level = 3;
     }
-    let mut b: Vec<u64> = Vec::new();
     if topo_level == 0 {
         to_del = true;
     } else if topo_level == 2 {
@@ -1915,17 +1926,18 @@ pub fn check_ulg_to_del(
     } else if kv > 1 && kw > 1 {
         to_del = true;
     } else if kw == 1 {
-        if usg_topocut_aux(cov, g, w ^ 1, max_ext, max_ext_hifi, &mut b, ub) {
+        if usg_topocut_aux(cov, g, w ^ 1, max_ext, max_ext_hifi, b, ub) {
             to_del = true;
         }
-    } else if kv == 1 && usg_topocut_aux(cov, g, v ^ 1, max_ext, max_ext_hifi, &mut b, ub) {
+    } else if kv == 1 && usg_topocut_aux(cov, g, v ^ 1, max_ext, max_ext_hifi, b, ub) {
         to_del = true;
     }
     to_del
 }
 
 /// `ulg_arc_cut_supports` (`gfa_ut.cpp` 9757): the support-driven weak-arc
-/// cut over the integer unitig graph.
+/// cut over the integer unitig graph. `is_trio`/`max_drop_len` are unused in
+/// the reference body and dropped here.
 #[allow(clippy::too_many_arguments)]
 pub fn ulg_arc_cut_supports(
     cov: &mut crate::assembly::ul2ul::UlCov,
@@ -1939,8 +1951,10 @@ pub fn ulg_arc_cut_supports(
     str_idx: &crate::assembly::ul_integer::UlStrIdx,
     bub: &BubbleType,
     max_ext: i32,
-    max_ext_hifi: u64,
+    max_ext_hifi: u32,
     len_rat: f32,
+    topo_level: u32,
+    skip_hom: bool,
     collapse_check: bool,
     b: &mut Vec<u64>,
     ub: &mut Vec<u64>,
@@ -1951,11 +1965,22 @@ pub fn ulg_arc_cut_supports(
         if iug.graph.sequences[(v >> 1) as usize].deleted {
             continue;
         }
+        // `g->seq_vis[v] == 0`: the bubble vertices marked by
+        // `asg_arc_identify_simple_bubbles_multi` are skipped.
+        if iug.graph.sequence_visited[v as usize] != 0 {
+            continue;
+        }
         let nv = iug.graph.arcs_of(v).len();
         if nv < 2 {
             continue;
         }
-        let kv = iug.graph.arcs_of(v).iter().filter(|a| !a.deleted).count();
+        let kv = iug
+            .graph
+            .arcs_of(v)
+            .iter()
+            .filter(|a| !a.deleted)
+            .take(2)
+            .count();
         if kv < 2 {
             continue;
         }
@@ -1966,17 +1991,34 @@ pub fn ulg_arc_cut_supports(
             b.push(i as u64);
         }
     }
-    let arc_list: Vec<u64> = b.clone();
+    // `worker_update_ul_arc_supports`: the sequential form of the kt_for
+    // pre-pass; every arc word grows its query support in the high half so
+    // the radix sort orders the cuts weakest-support first.
+    let mut scratch_int: Vec<u64> = Vec::new();
+    let mut scratch_raw: Vec<u64> = Vec::new();
+    for entry in b.iter_mut() {
+        let arc_index = *entry as usize;
+        let ve = iug.graph.arcs[arc_index];
+        let mut w_v = 0u64;
+        let mut w_r = 0u64;
+        get_ul_arc_supports(
+            cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads, str_idx,
+            bub, &ve, &mut scratch_int, &mut scratch_raw, true, &mut w_v, &mut w_r,
+        );
+        *entry |= w_v << 32;
+    }
     radix_sort_u64(b);
     let mut cnt = 0u32;
-    for &arc_id in &arc_list {
-        let arc_index = arc_id as usize;
+    for k in 0..b.len() {
+        let arc_index = (b[k] & 0xffff_ffff) as usize;
         if iug.graph.arcs[arc_index].deleted {
             continue;
         }
         let v = (iug.graph.arcs[arc_index].ul >> 32) as u32;
         let w = iug.graph.arcs[arc_index].v ^ 1;
-        if iug.graph.sequences[(v >> 1) as usize].deleted || iug.graph.sequences[(w >> 1) as usize].deleted {
+        if iug.graph.sequences[(v >> 1) as usize].deleted
+            || iug.graph.sequences[(w >> 1) as usize].deleted
+        {
             continue;
         }
         let nv = iug.graph.arcs_of(v).len();
@@ -1985,50 +2027,60 @@ pub fn ulg_arc_cut_supports(
             continue;
         }
         let ve = iug.graph.arcs[arc_index];
-        let kv = iug.graph.arcs_of(v).iter().filter(|a| !a.deleted).count() as u32;
+        let kv = iug
+            .graph
+            .arcs_of(v)
+            .iter()
+            .filter(|a| !a.deleted)
+            .count() as u32;
         let we = iug
             .graph
             .arcs_of(w)
             .iter()
             .find(|a| !a.deleted && a.v == v ^ 1)
             .copied();
-        let kw = iug.graph.arcs_of(w).iter().filter(|a| !a.deleted).count() as u32;
+        let kw = iug
+            .graph
+            .arcs_of(w)
+            .iter()
+            .filter(|a| !a.deleted)
+            .count() as u32;
         if kv <= 1 && kw <= 1 {
             continue;
         }
         let mut collapse = false;
         if collapse_check {
             if kv > 1 {
-                let mut w_v = 0u64;
-                let mut w_r = 0u64;
+                let mut w_q = 0u64;
+                let mut w_t = 0u64;
                 collapse = check_ul_contain_arc_supports(
                     cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads,
-                    str_idx, bub, &ve, b, ub, true, &mut w_v, &mut w_r,
+                    str_idx, bub, &ve, b, ub, skip_hom, &mut w_q, &mut w_t,
                 ) != 0;
             }
             if !collapse && kw > 1 {
                 if let Some(we) = we {
-                    let mut w_v = 0u64;
-                    let mut w_r = 0u64;
+                    let mut w_q = 0u64;
+                    let mut w_t = 0u64;
                     collapse = check_ul_contain_arc_supports(
                         cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads,
-                        str_idx, bub, &we, b, ub, true, &mut w_v, &mut w_r,
+                        str_idx, bub, &we, b, ub, skip_hom, &mut w_q, &mut w_t,
                     ) != 0;
                 }
             }
         }
         if !collapse {
             if kv > 1 {
-                let mut w_v = 0u64;
-                let mut w_r = 0u64;
+                let mut w_q = 0u64;
+                let mut w_t = 0u64;
                 get_ul_arc_supports(
                     cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads,
-                    str_idx, bub, &ve, b, ub, true, &mut w_v, &mut w_r,
+                    str_idx, bub, &ve, b, ub, skip_hom, &mut w_q, &mut w_t,
                 );
-                if w_v == u64::MAX {
+                if w_q == u64::MAX {
                     continue;
                 }
-                if (w_v as f64) > (w_r as f64 * f64::from(len_rat)) {
+                if (w_q as f32) > (w_t as f32 * len_rat) {
                     continue;
                 }
             }
@@ -2036,40 +2088,39 @@ pub fn ulg_arc_cut_supports(
                 let Some(we) = we else {
                     continue;
                 };
-                let mut w_v = 0u64;
-                let mut w_r = 0u64;
+                let mut w_q = 0u64;
+                let mut w_t = 0u64;
                 get_ul_arc_supports(
                     cov, z_items, iug, raw, store, raw_unitigs, read_lengths, unitig_reads,
-                    str_idx, bub, &we, b, ub, true, &mut w_v, &mut w_r,
+                    str_idx, bub, &we, b, ub, skip_hom, &mut w_q, &mut w_t,
                 );
-                if w_v == u64::MAX {
+                if w_q == u64::MAX {
                     continue;
                 }
-                if (w_v as f64) > (w_r as f64 * f64::from(len_rat)) {
+                if (w_q as f32) > (w_t as f32 * len_rat) {
                     continue;
                 }
             }
         }
         let to_del = check_ulg_to_del(
-            cov, &iug.graph, v, w, kv, kw, max_ext as u32, max_ext_hifi, 1, collapse, ub,
+            cov,
+            &iug.graph,
+            v,
+            w,
+            kv,
+            kw,
+            max_ext as u32,
+            u64::from(max_ext_hifi),
+            topo_level,
+            collapse,
+            b,
+            ub,
         );
         if to_del {
-            if let Some(arc) = iug
-                .graph
-                .arcs
-                .iter_mut()
-                .find(|a| !a.deleted && (a.ul >> 32) as u32 == v && a.v == ve.v)
-            {
-                arc.deleted = true;
-            }
-            if let Some(arc) = iug
-                .graph
-                .arcs
-                .iter_mut()
-                .find(|a| !a.deleted && (a.ul >> 32) as u32 == w && a.v == v ^ 1)
-            {
-                arc.deleted = true;
-            }
+            // `ve->del = we->del = 1` (the mirror arcs are left intact,
+            // exactly like the reference).
+            iug.graph.arcs[arc_index].deleted = true;
+            iug.graph.delete_first_arc(w, v ^ 1);
             cnt += 1;
         }
     }

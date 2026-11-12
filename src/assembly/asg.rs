@@ -342,6 +342,18 @@ impl Asg {
         }
     }
 
+    /// `we->del = 1`: marks the first live `v -> w` arc deleted.
+    pub fn delete_first_arc(&mut self, v: u32, w: u32) -> bool {
+        let (start, count) = self.arc_range(v);
+        for arc in &mut self.arcs[start..start + count] {
+            if !arc.deleted && arc.v == w {
+                arc.deleted = true;
+                return true;
+            }
+        }
+        false
+    }
+
     /// `asg_arc_del_multi`: removes duplicate outgoing arcs to the same target.
     pub fn delete_multi_arcs(&mut self) -> u32 {
         let vertex_count = self.sequences.len() * 2;
