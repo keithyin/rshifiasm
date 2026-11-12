@@ -122,8 +122,7 @@ pub fn gen_spec_rc_edge(
 /// `push_scaff_node` (`gfa_ut.cpp` 17234): a `min_ovlp`-long fake overlap
 /// between two reads, appended to both sides.
 pub fn push_scaff_node(
-    sources: &mut [Vec<PafHit>],
-    flags: &mut [()],
+    sources: &mut [PafList],
     v: u64,
     w: u64,
     ol: u64,
@@ -146,15 +145,9 @@ pub fn push_scaff_node(
         exact_region_byte: 0,
         deleted: false,
     };
-    add_hit(sources, flags, (v >> 1) as usize, &hit);
+    sources[(v >> 1) as usize].hits.push(hit);
     let reverse = reverse_hit(&hit);
-    hit = reverse;
-    add_hit(sources, flags, (w >> 1) as usize, &hit);
-}
-
-/// `add_ma_hit_t_alloc`.
-fn add_hit(sources: &mut [Vec<PafHit>], _flags: &mut [()], id: usize, hit: &PafHit) {
-    sources[id].push(hit.clone());
+    sources[(w >> 1) as usize].hits.push(reverse);
 }
 
 /// `set_reverse_overlap` (`Overlaps.cpp`).
@@ -206,8 +199,7 @@ fn dup_paf_check(x: &[PafHit], p: &PafHit) -> bool {
 /// `renew_paf0` (`gfa_ut.cpp` 17079): duplicates the qn<->tn overlap onto
 /// every (copy, copy) pair of the two groups.
 fn renew_paf0(
-    paf: &mut [Vec<PafHit>],
-    flags: &mut [()],
+    paf: &mut [PafList],
     a0: &[u64],
     a1: &[u64],
     buf: &mut Vec<u64>,
@@ -222,17 +214,17 @@ fn renew_paf0(
         sf = true;
     }
     buf.clear();
-    let q_list: Vec<usize> = (0..paf[qn0].len())
-        .filter(|&i| paf[qn0][i].target_identifier as usize == tn0)
+    let q_list: Vec<usize> = (0..paf[qn0].hits.len())
+        .filter(|&i| paf[qn0].hits[i].target_identifier as usize == tn0)
         .collect();
-    let t_list: Vec<usize> = (0..paf[tn0].len())
-        .filter(|&i| paf[tn0][i].target_identifier as usize == qn0)
+    let t_list: Vec<usize> = (0..paf[tn0].hits.len())
+        .filter(|&i| paf[tn0].hits[i].target_identifier as usize == qn0)
         .collect();
     assert!(!q_list.is_empty() && !t_list.is_empty());
     for &qi in &q_list {
-        let mut e01 = paf[qn0][qi].clone();
+        let mut e01 = paf[qn0].hits[qi].clone();
         for &ti in &t_list {
-            let mut e10 = paf[tn0][ti].clone();
+            let mut e10 = paf[tn0].hits[ti].clone();
             for (i, &qn) in a0.iter().enumerate() {
                 for (k, &tn) in a1.iter().enumerate() {
                     if i == 0 && k == 0 {
@@ -241,12 +233,12 @@ fn renew_paf0(
                     let qn = (qn as u32) as usize;
                     let tn = (tn as u32) as usize;
                     update_qtn(&mut e01, qn as u64, tn as u64);
-                    if !sf || dup_paf_check(&paf[qn], &e01) {
-                        add_hit(paf, flags, qn, &e01);
+                    if !sf || dup_paf_check(&paf[qn].hits, &e01) {
+                        paf[qn].hits.push(e01.clone());
                     }
                     update_qtn(&mut e10, tn as u64, qn as u64);
-                    if !sf || dup_paf_check(&paf[tn], &e10) {
-                        add_hit(paf, flags, tn, &e10);
+                    if !sf || dup_paf_check(&paf[tn].hits, &e10) {
+                        paf[tn].hits.push(e10.clone());
                     }
                 }
             }
@@ -255,7 +247,7 @@ fn renew_paf0(
 }
 
 /// `renew_paf1` (`gfa_ut.cpp` 17147): all-pairs fake overlaps inside one group.
-fn renew_paf1(paf: &mut [Vec<PafHit>], _flags: &mut [()], a: &[u64], len: u64) {
+fn renew_paf1(paf: &mut [PafList], a: &[u64], len: u64) {
     let mut arc = PafHit {
         query_start: 0,
         query_end: len as u32,
@@ -270,7 +262,7 @@ fn renew_paf1(paf: &mut [Vec<PafHit>], _flags: &mut [()], a: &[u64], len: u64) {
             let tn = (ti as u32) as usize;
             update_qtn(&mut arc, qi, ti);
             arc.target_identifier = tn as u32;
-            add_hit(paf, _flags, qn, &arc);
+            paf[qn].hits.push(arc.clone());
         }
     }
 }
@@ -279,13 +271,12 @@ fn renew_paf1(paf: &mut [Vec<PafHit>], _flags: &mut [()], a: &[u64], len: u64) {
 /// read-store growth (every old read gained copies; scaffold reads dropped).
 #[allow(clippy::too_many_arguments)]
 pub fn update_paf(
-    sources: &mut [Vec<PafHit>],
-    flags: &mut [()],
-    reverse_sources: &mut [Vec<PafHit>],
-    reverse_flags: &mut [()],
+    sources: &mut [PafList],
+    reverse_sources: &mut [PafList],
     rmap: &[u64],
     rid_n: usize,
     pre_gn: usize,
+    ng: &Asg,
 ) {
     let mut clus: Vec<u64> = Vec::with_capacity(rid_n);
     for (k, &map) in rmap.iter().enumerate().take(rid_n) {
@@ -313,33 +304,32 @@ pub fn update_paf(
         let a0: Vec<u64> = clus[(idx_word >> 32) as usize..idx_word as u32 as usize].to_vec();
         let a0n = a0.len();
         debug_assert!(a0n > 0 && (a0[0] as u32) as usize == k);
-        for j in 0..sources[k].len() {
-            let tn = sources[k][j].target_identifier as usize;
+        for j in 0..sources[k].hits.len() {
+            let tn = sources[k].hits[j].target_identifier as usize;
             if tn >= dn {
                 continue;
             }
-            if (sources[k][j].query_identifier as usize) > tn {
+            if (sources[k].hits[j].query_identifier as usize) > tn {
                 continue;
             }
             let idx1 = idx[tn];
             let a1: Vec<u64> = clus[(idx1 >> 32) as usize..idx1 as u32 as usize].to_vec();
-            renew_paf0(sources, flags, &a0, &a1, &mut buf);
+            renew_paf0(sources, &a0, &a1, &mut buf);
         }
-        for j in 0..reverse_sources[k].len() {
-            let tn = reverse_sources[k][j].target_identifier as usize;
+        for j in 0..reverse_sources[k].hits.len() {
+            let tn = reverse_sources[k].hits[j].target_identifier as usize;
             if tn >= dn {
                 continue;
             }
-            if (reverse_sources[k][j].query_identifier as usize) > tn {
+            if (reverse_sources[k].hits[j].query_identifier as usize) > tn {
                 continue;
             }
             let idx1 = idx[tn];
             let a1: Vec<u64> = clus[(idx1 >> 32) as usize..idx1 as u32 as usize].to_vec();
-            renew_paf0(reverse_sources, reverse_flags, &a0, &a1, &mut buf);
+            renew_paf0(reverse_sources, &a0, &a1, &mut buf);
         }
         if a0n > 1 {
-            let len = 0; // `ng->seq[k].len` is threaded by the caller
-            renew_paf1(reverse_sources, reverse_flags, &a0, len as u64);
+            renew_paf1(reverse_sources, &a0, u64::from(ng.sequences[k].length));
         }
     }
 }
@@ -348,19 +338,28 @@ pub fn update_paf(
 /// carries the `usc_t` records of the scaffold nodes (one per failed
 /// `gen_spec_edge`); `h_usg` comes from `u2g_threading`.
 ///
-/// The reference also calls `realloc_rdb_adv`/`update_paf` mid-way; the port
-/// splits those into follow-up calls because the Rust read store owns its
-/// buffers.
+/// The scaffold/materialisation phases live in this module as well
+/// (`fill_scaffolds`, `realloc_rdb_adv`, `update_paf`); the whole reference
+/// body runs inside this call.
 #[allow(clippy::too_many_arguments)]
 pub fn renew_ng(
     h_usg: &crate::assembly::ul2ul::Usg,
     raw_unitigs: &UnitigGraph,
     sg: &Asg,
-    sources: &[PafList],
+    sources: &mut [PafList],
+    reverse_sources: &mut [PafList],
+    coverage_cut: &mut Vec<crate::assembly::hit::CoverageCut>,
+    read_to_unitig: &mut crate::assembly::hit::ReadToUnitig,
+    reads: &mut crate::reads::ReadStore,
+    ul_store: &mut AllUl,
     maximum_hang: i32,
     max_hang_rate: f32,
-    minimum_overlap: i32,
-) -> (Asg, Vec<Usc>, Vec<u64>) {
+    minimum_overlap: i64,
+    scaffold_len: u64,
+    output_file_name: &str,
+    bin_file: &str,
+    b_mask: &mut crate::assembly::bubble::BubbleLabel,
+) -> Asg {
     let ug1 = convert_usg_t(h_usg, raw_unitigs);
     let mut ng = Asg::new();
     let mut idx_a: Vec<u64> = vec![u64::MAX; sg.sequences.len()];
@@ -446,13 +445,19 @@ pub fn renew_ng(
                     sources,
                     maximum_hang,
                     max_hang_rate,
-                    minimum_overlap,
+                    minimum_overlap as i32,
                     raw_v,
                     raw_w,
                 ) {
                     Some(_) => {}
                     None => {
                         first_pass.push((v, w, i as i64));
+                        // `asg_seq_set(ng, nocc, 0, 0)`: a scaffold node
+                        ng.sequences.push(AsgSeq {
+                            length: 0,
+                            deleted: false,
+                            coverage_class: 0,
+                        });
                         scaffold.push(Usc {
                             nid: nocc as u32,
                             ulid: u32::MAX,
@@ -467,7 +472,199 @@ pub fn renew_ng(
             }
         }
     }
-    (ng, scaffold, idx_a)
+    // `ng->seq_vis`
+    ng.sequence_visited = vec![0u8; ng.sequences.len() * 2];
+
+    // `if(sa.n > 0) fill_scaffolds(...)`
+    let hifi_read_count = reads.total_reads as usize;
+    if !scaffold.is_empty() {
+        fill_scaffolds(
+            &mut scaffold,
+            ul_store,
+            reads,
+            raw_unitigs,
+            minimum_overlap,
+            output_file_name,
+            bin_file,
+            hifi_read_count,
+        );
+    }
+    // `realloc_rdb_adv(&(R_INF), &UL_INF, cov, ruI, ext.idx_a.a, ...)`
+    realloc_rdb_adv(
+        reads,
+        ul_store,
+        coverage_cut,
+        read_to_unitig,
+        &idx_a,
+        scaffold_len,
+        "scaf",
+        &mut ng,
+        minimum_overlap,
+        raw_unitigs,
+        &scaffold,
+        b_mask,
+    );
+    // `update_paf(R_INF.paf, R_INF.reverse_paf, ext.idx_a.a, ext.idx_a.n, sg->n_seq, ng)`
+    update_paf(
+        sources,
+        reverse_sources,
+        &idx_a,
+        idx_a.len(),
+        sg.sequences.len(),
+        &ng,
+    );
+
+    // the arc-building pass
+    let mut nocc = ng.read_sequence_count as u64;
+    for (i, seq) in h_usg.a.iter().enumerate() {
+        if ug1.graph.sequences[i].deleted {
+            continue;
+        }
+        let u = &ug1.unitigs[i];
+        for m in 1..u.reads.len() {
+            let v = (u.reads[m - 1] >> 32) as u32;
+            let w = (u.reads[m] >> 32) as u32;
+            let t = crate::assembly::unitig::gen_spec_edge(
+                &ng,
+                sources,
+                maximum_hang,
+                max_hang_rate,
+                minimum_overlap as i32,
+                v,
+                w,
+            )
+            .expect("the unitig-internal edge must exist");
+            ng.arcs.push(t);
+            let t = crate::assembly::unitig::gen_spec_edge(
+                &ng,
+                sources,
+                maximum_hang,
+                max_hang_rate,
+                minimum_overlap as i32,
+                w ^ 1,
+                v ^ 1,
+            )
+            .expect("the unitig-internal edge must exist");
+            ng.arcs.push(t);
+        }
+
+        for side in 0..2u32 {
+            let v = ((i as u32) << 1) | side;
+            for arc in &seq.arc[side as usize] {
+                if arc.deleted || h_usg.a[(arc.v >> 1) as usize].deleted {
+                    continue;
+                }
+                let w = arc.v;
+                let u_v = &ug1.unitigs[(v >> 1) as usize];
+                let u_w = &ug1.unitigs[(w >> 1) as usize];
+                let vx = if v & 1 != 0 {
+                    ((u_v.reads[0] >> 32) as u32) ^ 1
+                } else {
+                    (u_v.reads[u_v.reads.len() - 1] >> 32) as u32
+                };
+                let wx = if w & 1 != 0 {
+                    ((u_w.reads[u_w.reads.len() - 1] >> 32) as u32) ^ 1
+                } else {
+                    (u_w.reads[0] >> 32) as u32
+                };
+                if vx > wx {
+                    continue;
+                }
+                if vx == wx && (vx & 1) != 0 {
+                    continue;
+                }
+                match crate::assembly::unitig::gen_spec_edge(
+                    &ng,
+                    sources,
+                    maximum_hang,
+                    max_hang_rate,
+                    minimum_overlap as i32,
+                    vx,
+                    wx,
+                ) {
+                    Some(t) => {
+                        ng.arcs.push(t);
+                        let t = crate::assembly::unitig::gen_spec_edge(
+                            &ng,
+                            sources,
+                            maximum_hang,
+                            max_hang_rate,
+                            minimum_overlap as i32,
+                            wx ^ 1,
+                            vx ^ 1,
+                        )
+                        .expect("the mirrored edge must exist");
+                        ng.arcs.push(t);
+                    }
+                    None => {
+                        let psa = &scaffold[(nocc - ng.read_sequence_count as u64) as usize];
+                        let z = nocc << 1;
+                        debug_assert_eq!(psa.nid as u64, nocc);
+                        debug_assert_eq!(
+                            psa.raw_sid,
+                            (h_usg.a[(v >> 1) as usize].mm << 1) | (v & 1)
+                        );
+                        debug_assert_eq!(
+                            psa.raw_eid,
+                            (h_usg.a[(w >> 1) as usize].mm << 1) | (w & 1)
+                        );
+                        if ng.sequences[nocc as usize].deleted {
+                            push_direct_scaff_node(
+                                psa,
+                                sources,
+                                reverse_sources,
+                                &mut ng,
+                                maximum_hang,
+                                max_hang_rate,
+                                minimum_overlap,
+                                vx as u64,
+                                wx as u64,
+                            );
+                        } else {
+                            push_scaff_node(sources, vx as u64, z as u64, minimum_overlap as u64, &ng);
+                            push_scaff_node(sources, z as u64, wx as u64, minimum_overlap as u64, &ng);
+                            let t = crate::assembly::unitig::gen_spec_edge(
+                                &ng, sources, maximum_hang, max_hang_rate,
+                                minimum_overlap as i32, vx, z as u32,
+                            )
+                            .expect("the scaffold edge must exist");
+                            ng.arcs.push(t);
+                            let t = crate::assembly::unitig::gen_spec_edge(
+                                &ng, sources, maximum_hang, max_hang_rate,
+                                minimum_overlap as i32, z as u32 ^ 1, vx ^ 1,
+                            )
+                            .expect("the scaffold edge must exist");
+                            ng.arcs.push(t);
+                            let t = crate::assembly::unitig::gen_spec_edge(
+                                &ng, sources, maximum_hang, max_hang_rate,
+                                minimum_overlap as i32, z as u32, wx,
+                            )
+                            .expect("the scaffold edge must exist");
+                            ng.arcs.push(t);
+                            let t = crate::assembly::unitig::gen_spec_edge(
+                                &ng, sources, maximum_hang, max_hang_rate,
+                                minimum_overlap as i32, wx ^ 1, z as u32 ^ 1,
+                            )
+                            .expect("the scaffold edge must exist");
+                            ng.arcs.push(t);
+                        }
+                        nocc += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    ng.cleanup();
+    ng.read_sequence_count = ng.sequences.len() as u32;
+    eprintln!(
+        "[M::renew_ng] nocc::{}, ng->n_seq::{}, sg->n_seq::{}",
+        nocc,
+        ng.sequences.len(),
+        sg.sequences.len()
+    );
+    assert_eq!(nocc as usize, ng.sequences.len());
+    ng
 }
 
 /// `renew_R_to_U` (`gfa_ut.cpp` 17582): clears the overlap lists, resets the
@@ -509,4 +706,526 @@ pub fn renew_r_to_u(
 /// `realloc_rdb_adv` reads the name length only.
 pub fn ul_name_length(store: &AllUl, ulid: usize) -> usize {
     store.nid.get(ulid).map(|n| n.len()).unwrap_or(0)
+}
+
+/// `get_end_hifi` (`gfa_ut.cpp` 14400): the terminal `len` bases of the read
+/// behind vertex `v`, in the vertex orientation.
+pub fn get_end_hifi(reads: &crate::reads::ReadStore, v: u32, len: i64) -> Vec<u8> {
+    let rid = (v >> 1) as usize;
+    let rlen = reads.read_length(rid) as i64;
+    assert!(rlen >= len);
+    let seq = reads.sequences[rid].unpack();
+    let start = if len < rlen {
+        if v & 1 == 0 { (rlen - len) as usize } else { 0 }
+    } else {
+        0
+    };
+    let mut out: Vec<u8> = seq[start..start + len as usize].to_vec();
+    if v & 1 != 0 {
+        out.reverse();
+        for base in out.iter_mut() {
+            *base = crate::correction::target::complement_base(*base);
+        }
+    }
+    out
+}
+
+/// `get_ul_subregion` (`gfa_ut.cpp` 14563): the ASCII bases of
+/// `[ssp, sep)` of UL read `id`, with the N sites restored.
+pub fn get_ul_subregion(
+    store: &AllUl,
+    id: u32,
+    rev: bool,
+    ssp: i64,
+    sep: i64,
+    reset_ns: bool,
+) -> Vec<u8> {
+    let z = &store.reads[id as usize];
+    let sl = (sep - ssp) as usize;
+    let mut des = vec![0u8; sl];
+    // `r_base` packs four bases per byte, most significant pair first.
+    for (i, out) in des.iter_mut().enumerate() {
+        let src_i = ssp as usize + i;
+        let code = (z.r_base[src_i >> 2] >> (6 - 2 * (src_i & 3))) & 3;
+        *out = match code {
+            0 => b'A',
+            1 => b'C',
+            2 => b'G',
+            _ => b'T',
+        };
+    }
+    for &site in &z.n_site {
+        if (site as i64) >= ssp && (site as i64) < sep {
+            des[(site as i64 - ssp) as usize] = b'N';
+        } else if (site as i64) >= sep {
+            break;
+        }
+    }
+    if reset_ns {
+        // `seq_nt4_table >= 4` is impossible in the two-bit packing; the
+        // reference resets any leftover ambiguity to `A`.
+        for out in des.iter_mut() {
+            if !matches!(*out, b'A' | b'C' | b'G' | b'T') {
+                *out = b'A';
+            }
+        }
+    }
+    if rev {
+        des.reverse();
+        for base in des.iter_mut() {
+            *base = crate::correction::target::complement_base(*base);
+        }
+    }
+    des
+}
+
+/// `push_scaf_bases` (`gfa_ut.cpp` 14620): materialises the scaffold node
+/// bases; returns `(packed, ff)`.
+#[allow(clippy::too_many_arguments)]
+pub fn push_scaf_bases(
+    reads: &crate::reads::ReadStore,
+    store: &AllUl,
+    z: &Usc,
+    min_arc_len: i64,
+    scaf_len: i64,
+    nlen: i64,
+    raw_g: &UnitigGraph,
+    n_site: &mut Vec<u32>,
+) -> (Vec<u8>, i64) {
+    let (ff, nlen0) = reset_scaf_node_uinfo(z, min_arc_len, scaf_len);
+    debug_assert_eq!(nlen0, nlen);
+    if ff == 1 {
+        return (vec![0u8; (nlen / 4 + 1) as usize], ff as i64);
+    }
+    let uv = z.raw_sid;
+    let uw = z.raw_eid;
+    let u_v = &raw_g.unitigs[(uv >> 1) as usize];
+    let u_w = &raw_g.unitigs[(uw >> 1) as usize];
+    let sv = if uv & 1 != 0 {
+        ((u_v.reads[0] >> 32) as u32) ^ 1
+    } else {
+        (u_v.reads[u_v.reads.len() - 1] >> 32) as u32
+    };
+    let sw = if uw & 1 != 0 {
+        ((u_w.reads[u_w.reads.len() - 1] >> 32) as u32) ^ 1
+    } else {
+        (u_w.reads[0] >> 32) as u32
+    };
+    let mut da: Vec<u8> = vec![0u8; nlen as usize];
+    assert!(reads.read_length((sv >> 1) as usize) as i64 > min_arc_len);
+    assert!(reads.read_length((sw >> 1) as usize) as i64 > min_arc_len);
+    if ff == 2 {
+        let s = i64::from(z.raw_sof);
+        let e = i64::from(z.raw_eof);
+        let ul = e - s;
+        assert!(ul >= -min_arc_len);
+        da[..min_arc_len as usize].copy_from_slice(&get_end_hifi(reads, sv, min_arc_len));
+        da[(min_arc_len + ul) as usize..(min_arc_len + ul + min_arc_len) as usize]
+            .copy_from_slice(&get_end_hifi(reads, sw, min_arc_len));
+        if ul > 0 {
+            let mid = get_ul_subregion(store, z.ulid >> 1, z.ulid & 1 != 0, s, e, true);
+            da[min_arc_len as usize..(min_arc_len + ul) as usize].copy_from_slice(&mid);
+        }
+    } else {
+        da[..min_arc_len as usize].copy_from_slice(&get_end_hifi(reads, sv, min_arc_len));
+        for base in da[min_arc_len as usize..(min_arc_len + scaf_len) as usize].iter_mut() {
+            *base = b'A';
+        }
+        da[(min_arc_len + scaf_len) as usize..]
+            .copy_from_slice(&get_end_hifi(reads, sw, min_arc_len));
+    }
+    let mut packed = vec![0u8; (nlen / 4 + 1) as usize];
+    n_site.clear();
+    crate::assembly::ul_store::encode_base_public(&mut packed, &da, n_site);
+    (packed, ff as i64)
+}
+
+/// `load_scaf_base` (`gfa_ut.cpp` 14330): restores the `dd == 4` UL reads'
+/// bases from the `.uidx.ucr.bin` cache.
+pub fn load_scaf_base(store: &mut AllUl, output_file_name: &str, bin_file: &str) -> bool {
+    use std::io::Read;
+    let path = format!("{}.{}.uidx.ucr.bin", output_file_name, bin_file);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return false;
+    };
+    let mut ucr_path = path.clone();
+    let _ = &mut ucr_path;
+    let mut len_buf = [0u8; 8];
+    loop {
+        if file.read_exact(&mut len_buf).is_err() {
+            break;
+        }
+        let rid = u64::from_le_bytes(len_buf);
+        let mut word4 = [0u8; 4];
+        if file.read_exact(&mut word4).is_err() {
+            break;
+        }
+        let len = u32::from_le_bytes(word4);
+        if (rid as usize) >= store.reads.len() {
+            break;
+        }
+        let z = &mut store.reads[rid as usize];
+        debug_assert_eq!(z.rlen, len);
+        let mut n_word = [0u8; 8];
+        if file.read_exact(&mut n_word).is_err() {
+            break;
+        }
+        let n_site_n = u64::from_le_bytes(n_word) as usize;
+        let mut sites = vec![0u32; n_site_n];
+        for site in sites.iter_mut() {
+            let mut w = [0u8; 4];
+            if file.read_exact(&mut w).is_err() {
+                return false;
+            }
+            *site = u32::from_le_bytes(w);
+        }
+        let base_n = ((len as usize) / 4) + (((len as usize) & 3 != 0) as usize);
+        let mut packed = vec![0u8; base_n];
+        if file.read_exact(&mut packed).is_err() {
+            return false;
+        }
+        if z.dd != 4 {
+            continue;
+        }
+        z.n_site = sites;
+        z.r_base = packed;
+    }
+    true
+}
+
+/// `reload_uu` (`gfa_ut.cpp` 14921): reloads the UL store from the round
+/// cache against the renewed raw graph.
+pub fn reload_uu(
+    store: &mut AllUl,
+    raw_g: &UnitigGraph,
+    output_file_name: &str,
+    bin_file: &str,
+    hifi_read_count: usize,
+) {
+    let gfa_name = format!("{}.{}", output_file_name, bin_file);
+    crate::assembly::ul_renew::clear_all_ul_t(store);
+    if let Ok(Some(cached)) = crate::assembly::ul_store::load_all_ul_t(&gfa_name) {
+        *store = cached;
+    }
+    crate::assembly::ul_store::gen_ul_vec_rid_t(store, hifi_read_count);
+    let _ = raw_g;
+}
+
+/// `gen_scaffold_id` (`gfa_ut.cpp` 14837): assigns `(ulid, raw_sof,
+/// raw_eof)` to one scaffold record from the UL chains.
+#[allow(clippy::too_many_arguments)]
+pub fn gen_scaffold_id(
+    store: &AllUl,
+    reads: &crate::reads::ReadStore,
+    raw_g: &UnitigGraph,
+    z: &mut Usc,
+) {
+    let v = z.raw_sid;
+    let w = z.raw_eid;
+    let u_v = &raw_g.unitigs[(v >> 1) as usize];
+    let u_w = &raw_g.unitigs[(w >> 1) as usize];
+    let sv = if v & 1 != 0 {
+        ((u_v.reads[0] >> 32) as u32) ^ 1
+    } else {
+        (u_v.reads[u_v.reads.len() - 1] >> 32) as u32
+    };
+    let sw = if w & 1 != 0 {
+        ((u_w.reads[u_w.reads.len() - 1] >> 32) as u32) ^ 1
+    } else {
+        (u_w.reads[0] >> 32) as u32
+    };
+    let sv_len = reads.read_length((sv >> 1) as usize) as i64;
+    let sw_len = reads.read_length((sw >> 1) as usize) as i64;
+    let max_ql = -sv_len.min(sw_len);
+
+    let start = store.ridx.idx[(v >> 1) as usize] as usize;
+    let end = store.ridx.idx[((v >> 1) + 1) as usize] as usize;
+    let mut mmql = i64::MAX;
+    let mut rev = 0u32;
+    let mut id = u32::MAX;
+    let mut m0: Option<crate::assembly::ul_store::UcBlock> = None;
+    let mut m1: Option<crate::assembly::ul_store::UcBlock> = None;
+    for &word in &store.ridx.occ[start..end] {
+        let read_id = (word >> 32) as usize;
+        let slot = (word & 0xffff_ffff) as usize;
+        let p = &store.reads[read_id].bb[slot];
+        debug_assert_eq!(p.hid, v >> 1);
+        if store.reads[read_id].dd != 3 {
+            continue;
+        }
+        if p.base || !p.el || p.pchain == 0 {
+            continue;
+        }
+        let uv = (p.hid << 1) | u32::from(p.rev);
+        if uv == v && p.aidx == u32::MAX && slot + 1 < store.reads[read_id].bb.len() {
+            let n = &store.reads[read_id].bb[slot + 1];
+            if n.base || !n.el || n.pchain == 0 || n.pidx != u32::MAX {
+                continue;
+            }
+            let uw2 = (n.hid << 1) | u32::from(n.rev);
+            if uw2 == w {
+                let ql = i64::from(n.qs) - i64::from(p.qe);
+                if ql > max_ql && n.qe > p.qe && n.qs > p.qs && ql < mmql {
+                    mmql = ql;
+                    rev = 0;
+                    m0 = Some(*p);
+                    m1 = Some(*n);
+                    id = read_id as u32;
+                }
+            }
+        }
+        if (uv ^ 1) == v && p.pidx == u32::MAX && slot > 0 {
+            let n = &store.reads[read_id].bb[slot - 1];
+            if n.base || !n.el || n.pchain == 0 || n.aidx != u32::MAX {
+                continue;
+            }
+            let uw2 = ((n.hid << 1) | u32::from(n.rev)) ^ 1;
+            if uw2 == w {
+                let ql = i64::from(p.qs) - i64::from(n.qe);
+                if ql > max_ql && n.qe < p.qe && n.qs < p.qs && ql < mmql {
+                    mmql = ql;
+                    rev = 1;
+                    m0 = Some(*n);
+                    m1 = Some(*p);
+                    id = read_id as u32;
+                }
+            }
+        }
+    }
+    if let (Some(m0), Some(m1)) = (m0, m1) {
+        if id != u32::MAX {
+            z.ulid = (id << 1) | rev;
+            z.raw_sof = m0.qe;
+            z.raw_eof = m1.qs;
+        }
+    }
+}
+
+/// `fill_scaffolds` (`gfa_ut.cpp` 14932).
+pub fn fill_scaffolds(
+    a: &mut [Usc],
+    store: &mut AllUl,
+    reads: &crate::reads::ReadStore,
+    raw_g: &UnitigGraph,
+    min_arc_len: i64,
+    output_file_name: &str,
+    bin_file: &str,
+    hifi_read_count: usize,
+) {
+    reload_uu(store, raw_g, output_file_name, bin_file, hifi_read_count);
+    for z in a.iter_mut() {
+        gen_scaffold_id(store, reads, raw_g, z);
+    }
+    let mut occ = 0usize;
+    for z in a.iter() {
+        if z.ulid == u32::MAX {
+            continue;
+        }
+        if z.raw_eof <= z.raw_sof {
+            continue;
+        }
+        store.reads[(z.ulid >> 1) as usize].dd = 4;
+        occ += 1;
+    }
+    if occ > 0 {
+        load_scaf_base(store, output_file_name, bin_file);
+    }
+}
+
+/// `push_direct_scaff_node` (`gfa_ut.cpp` 15019): the direct link between
+/// two vertices bridged by a scaffold record whose UL gap is short enough.
+#[allow(clippy::too_many_arguments)]
+pub fn push_direct_scaff_node(
+    psa: &Usc,
+    sources: &mut [PafList],
+    reverse_sources: &mut [PafList],
+    ng: &mut Asg,
+    maximum_hang: i32,
+    max_hang_rate: f32,
+    minimum_overlap: i64,
+    vx: u64,
+    wx: u64,
+) {
+    let uol = i64::from(psa.raw_sof) - i64::from(psa.raw_eof);
+    assert!(uol >= minimum_overlap);
+    let mut r = 1i32;
+    let mut t0 = None;
+    let mut rc0: Option<(AsgArc, usize)> = None;
+    let mut t1 = None;
+    let mut rc1: Option<(AsgArc, usize)> = None;
+    if let Some(hit) = gen_spec_rc_edge(
+        ng,
+        reverse_sources,
+        maximum_hang,
+        max_hang_rate,
+        minimum_overlap as i32,
+        vx as u32,
+        wx as u32,
+    ) {
+        let t = hit.0;
+        let dif = if uol > i64::from(t.overlap) {
+            uol - i64::from(t.overlap)
+        } else {
+            i64::from(t.overlap) - uol
+        };
+        if (dif as f64 > uol as f64 * 0.05) || (dif as f64 > t.overlap as f64 * 0.05) {
+            if dif > 16 {
+                r = -1;
+            }
+        }
+        if r >= 0 {
+            t0 = Some(t);
+            rc0 = Some(hit);
+        }
+    } else {
+        r = -1;
+    }
+    if r >= 0 {
+        if let Some(hit) = gen_spec_rc_edge(
+            ng,
+            reverse_sources,
+            maximum_hang,
+            max_hang_rate,
+            minimum_overlap as i32,
+            (wx ^ 1) as u32,
+            (vx ^ 1) as u32,
+        ) {
+            let t = hit.0;
+            let dif = if uol > i64::from(t.overlap) {
+                uol - i64::from(t.overlap)
+            } else {
+                i64::from(t.overlap) - uol
+            };
+            if (dif as f64 > uol as f64 * 0.05) || (dif as f64 > t.overlap as f64 * 0.05) {
+                if dif > 16 {
+                    r = -1;
+                }
+            }
+            if r >= 0 {
+                t1 = Some(t);
+                rc1 = Some(hit);
+            }
+        } else {
+            r = -1;
+        }
+    }
+
+    if r >= 0 {
+        let (t0, rc0) = t0.zip(rc0).expect("the first edge must exist");
+        ng.arcs.push(t0);
+        let (t1, rc1) = t1.zip(rc1).expect("the second edge must exist");
+        ng.arcs.push(t1);
+        // `add_ma_hit_t_alloc(&(R_INF.paf[Get_qn((*rc0))]), rc0)`: rc0 is
+        // the hit found in the reverse list, copied onto the forward list.
+        let hit0 = reverse_sources[(vx >> 1) as usize].hits[rc0.1].clone();
+        sources[hit0.query_identifier as usize].hits.push(hit0);
+        let hit1 = reverse_sources[((wx ^ 1) >> 1) as usize].hits[rc1.1].clone();
+        sources[hit1.query_identifier as usize].hits.push(hit1);
+    } else {
+        push_scaff_node(sources, vx, wx, uol as u64, ng);
+        let t = crate::assembly::unitig::gen_spec_edge(
+            ng,
+            sources,
+            maximum_hang,
+            max_hang_rate,
+            minimum_overlap as i32,
+            vx as u32,
+            wx as u32,
+        )
+        .expect("the pushed edge must exist");
+        ng.arcs.push(t);
+        let t = crate::assembly::unitig::gen_spec_edge(
+            ng,
+            sources,
+            maximum_hang,
+            max_hang_rate,
+            minimum_overlap as i32,
+            (wx ^ 1) as u32,
+            (vx ^ 1) as u32,
+        )
+        .expect("the pushed edge must exist");
+        ng.arcs.push(t);
+    }
+}
+
+/// `realloc_rdb_adv` (`gfa_ut.cpp` 14663): extends the read store with the
+/// scaffold pseudo-reads and resets the coverage/label tables.
+#[allow(clippy::too_many_arguments)]
+pub fn realloc_rdb_adv(
+    reads: &mut crate::reads::ReadStore,
+    ul_store: &AllUl,
+    coverage_cut: &mut Vec<crate::assembly::hit::CoverageCut>,
+    read_to_unitig: &mut crate::assembly::hit::ReadToUnitig,
+    rmap: &[u64],
+    scaf_len: u64,
+    scaf_id: &str,
+    ng: &mut Asg,
+    min_ovlp: i64,
+    raw_g: &UnitigGraph,
+    a: &[Usc],
+    b_mask: &mut crate::assembly::bubble::BubbleLabel,
+) {
+    let rid_n0 = reads.total_reads as usize;
+    let rid_n = rmap.len();
+    reads.total_reads = rid_n as u64;
+    eprintln!("+[M::realloc_rdb_adv] rid_n0::{}, rid_n::{}", rid_n0, rid_n);
+    for i in rid_n0..rid_n {
+        if rmap[i] != u64::MAX {
+            let src = rmap[i] as usize;
+            let name = reads.read_names[src].clone();
+            let length = reads.read_lengths[src];
+            let sequence = reads.sequences[src].clone();
+            let trio = reads.trio_labels[src];
+            let cut = coverage_cut[src];
+            reads.read_names.push(name);
+            reads.read_lengths.push(length);
+            reads.sequences.push(sequence);
+            reads.trio_labels.push(trio);
+            coverage_cut.push(cut);
+        } else {
+            let z = &a[i - ng.read_sequence_count as usize];
+            debug_assert_eq!(z.nid as usize, i);
+            let (ff, nlen) = reset_scaf_node_uinfo(z, min_ovlp, scaf_len as i64);
+            let name = if ff == 2 {
+                let ulid = (z.ulid >> 1) as usize;
+                String::from_utf8_lossy(&ul_store.nid[ulid]).to_string()
+            } else {
+                scaf_id.to_string()
+            };
+            reads.read_names.push(name);
+            reads.read_lengths.push(nlen as u64);
+            reads.trio_labels.push(crate::assembly::unitig::AMBIGU);
+            coverage_cut.push(crate::assembly::hit::CoverageCut {
+                start: 0,
+                end: nlen as u32,
+                deleted: false,
+                class: 0,
+            });
+            ng.sequences[i].length = nlen as u32;
+            let mut n_site: Vec<u32> = Vec::new();
+            let (packed, ff) = push_scaf_bases(
+                reads,
+                ul_store,
+                z,
+                min_ovlp,
+                scaf_len as i64,
+                nlen,
+                raw_g,
+                &mut n_site,
+            );
+            reads.sequences.push(crate::sequence::encoding::PackedSequence {
+                packed_bases: packed,
+                length: nlen as u64,
+                ambiguous_positions: n_site.iter().map(|&s| u64::from(s)).collect(),
+            });
+            if ff == 1 {
+                ng.sequences[i].deleted = true;
+            }
+        }
+        reads.total_bases += reads.read_lengths[i];
+        ng.sequences[i].length = reads.read_lengths[i] as u32;
+    }
+    *read_to_unitig = crate::assembly::hit::ReadToUnitig::from_entries(vec![u32::MAX; rid_n]);
+    b_mask.reset(ng.sequences.len(), 0, 0);
+    eprintln!("-[M::realloc_rdb_adv] rid_n0::{}, rid_n::{}", rid_n0, rid_n);
 }

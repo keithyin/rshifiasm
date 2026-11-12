@@ -146,7 +146,7 @@ pub(crate) fn unitig_sub_region(
 
 /// `RC_CHAR`: `rc_Table[seq_nt6_table[base]]` — ACGT complement, and every
 /// other letter (including `N`) maps to `N`.
-fn complement_base(base: u8) -> u8 {
+pub fn complement_base(base: u8) -> u8 {
     match base {
         b'A' => b'T',
         b'C' => b'G',
