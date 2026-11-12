@@ -3181,6 +3181,37 @@ ul_rescall/ul.rs 基础件)。测试：ul_scall_golden、ul_raw_chain_golden、
 ul_load_golden(ul_load_golden+ul_clean_gfa_smoke, ignored)、
 ul_store_golden、ul_reference_probe。
 
+## U6 续九（2026-11-12 第十轮，gen_raw_ug_seq 落地）
+
+- `a5edf0f` **`ul2ul.rs` 追加**：`UinfoSrt`（v/s/e/n 四元组）、
+  `get_ul_spec_ovlp`（`o->cn` 范围内查 hid）、`gen_raw_ug_seq`
+  （raw unitig 的读段游走：UL 读走 c_str（前驱 get_ul_spec_ovlp
+  定 cs/ce，反向镜像），raw 节点直接 push [0,len)；相邻重叠合并
+  os/oe；尾部 ug_occ_w 填 n）。**注意**：gen_raw_ug_seq 里的
+  重叠合并块 C 是 `os=MIN(xi->ts,last.s); oe=MAX(xi->te,last.e)`
+  先 assert `MIN>MAX` 有序再取 max/min——Rust 版已按「先判后改」
+  顺序合并为单步（在断言失败路径上语义一致，需在门禁时复核）。
+
+**U6-3 剩余（当前精确清单）**：
+1. `renew_u2g_cov` Rust 版（worker + iug_a/iug_idx/iug_b CSR 构建，
+   C 已全读 ✅ — gen_raw_ug_seq 已有，CSR 半可写）。
+2. `renew_u2g_bg`（C 已全读 ✅ — bridge 弧 + ou 标注）。
+3. `u2g_clean` 的 ulg 子树（8673 tips ✅已读、9757 supports ❌、
+   10084 pop_bubble ❌、10337 cut_z ❌；get_remove_hifi_occ ✅已读、
+   get_bridges 半读、usg_bub_* ❌）。约 2000 行。
+4. `u2g_threading`（C 已全读 ✅）+ `worker_update_ul_arc_drop` ❌ +
+   `pushp_usg_arc_mm`/`get_usg_arc`/`usg_cleanup` ❌ +
+   `u2g_hybrid_clean` ❌。
+5. `ul_realignment_gfa` 组装 + realloc_rdb_adv（C ✅）+ 接线。
+6. U7 解锁 + e2e。
+
+**Hi-C（task 5）**：完全未开始。
+
+**会话已完成且可验证**（全部编译绿 + 312 lib tests）：
+U1-U5 已有门禁；U6 的 phase/gl_chain/mask/binning/rescall/ul2ul/
+renew_ng/gen_raw_ug_seq 九大块已移植并提交（ee59902..a5edf0f 十一个
+提交）；每块的 C 行号与语义陷阱均在上述各「续N」节。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
