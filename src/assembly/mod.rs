@@ -47,6 +47,7 @@ pub mod ul2ul;
 pub mod ulg_clean;
 pub mod ul_binning;
 pub mod ul_hybrid_ug;
+pub mod ul_hybrid_ext;
 pub mod ul_integer;
 pub mod ul_load;
 pub mod ul_mask;

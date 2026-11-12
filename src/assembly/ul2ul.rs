@@ -74,6 +74,15 @@ pub struct UsgArc {
     pub idx: u64,
 }
 
+/// `usg_arc_mm_t` (`gfa_ut.cpp` 36): one `(uid, off)` usage of an arc by an
+/// integer-unitig walk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsgArcMm {
+    pub v: u32,
+    pub uid: u32,
+    pub off: u32,
+}
+
 /// `usg_seq_t` (`gfa_ut.cpp` 58).
 #[derive(Clone, Debug, Default)]
 pub struct UsgSeq {
@@ -81,6 +90,7 @@ pub struct UsgSeq {
     pub occ: u32,
     pub len: u32,
     pub arc: [Vec<UsgArc>; 2],
+    pub arc_mm: [Vec<UsgArcMm>; 2],
     pub deleted: bool,
     pub telo: bool,
 }
@@ -89,6 +99,8 @@ pub struct UsgSeq {
 #[derive(Clone, Debug, Default)]
 pub struct Usg {
     pub a: Vec<UsgSeq>,
+    /// `mp`: the usg nodes mapped to every initial-graph vertex.
+    pub mp: Vec<Vec<u32>>,
 }
 
 impl Usg {
@@ -1843,20 +1855,29 @@ pub fn renew_u2g_cov(
 
 /// `push_usg_t_node` (`gfa_ut.cpp` 10507): appends one hybrid vertex.
 pub fn push_usg_t_node(ng: &mut Usg, id: u64) -> &mut crate::assembly::ul2ul::UsgSeq {
-    ng.a.push(crate::assembly::ul2ul::UsgSeq {
-        mm: id as u32,
-        ..crate::assembly::ul2ul::UsgSeq::default()
-    });
-    ng.a.last_mut().unwrap()
+    if id as usize >= ng.a.len() {
+        ng.a.resize(id as usize + 1, UsgSeq::default());
+    }
+    &mut ng.a[id as usize]
 }
 
 /// `pushp_usg_arc_mm` (`gfa_ut.cpp` 10562): records one arc usage in the
 /// mirror-map of the sibling direction.
-pub fn pushp_usg_arc_mm(ng: &mut Usg, v: u32, w: u32, _uid: u32, _off: u32) {
-    // The reference maintains `arc_mm` per direction and merges it into
-    // `idx` during `usg_cleanup`; the port folds the bookkeeping into the
-    // arc's `idx` field directly.
-    let _ = (ng, v, w);
+pub fn pushp_usg_arc_mm(ng: &mut Usg, v: u32, w: u32, uid: u32, off: u32) {
+    ng.a[(v >> 1) as usize].arc_mm[(v & 1) as usize].push(UsgArcMm { v: w, uid, off });
+}
+
+/// `get_usg_arc_mm` (`gfa_ut.cpp` 11467): the `(uid, off)` usages recorded
+/// for one arc; `arc.idx` packs `<offset>:32 | <count>:32`.
+pub fn get_usg_arc_mm<'a>(g: &'a Usg, z: &UsgArc) -> &'a [UsgArcMm] {
+    let v = (z.ul >> 32) as u32;
+    let count = (z.idx & 0xffff_ffff) as usize;
+    if count == 0 {
+        return &[];
+    }
+    let start = (z.idx >> 32) as usize;
+    let entries = &g.a[(v >> 1) as usize].arc_mm[(v & 1) as usize];
+    &entries[start..start + count]
 }
 
 /// `renew_ul2_utg` (`gfa_ut.cpp` 16813): rebuilds `i_ug` from `i_g` and
@@ -1915,6 +1936,8 @@ pub fn u2g_threading(
 ) -> Usg {
     let mut ng = Usg::default();
     ng.a.reserve(raw.graph.sequences.len());
+    // `ng->mp`: the identity mapping of every raw unitig to its usg node.
+    ng.mp = (0..raw.unitigs.len()).map(|k| vec![k as u32]).collect();
     for k in 0..raw.unitigs.len() {
         let seq = push_usg_t_node(&mut ng, k as u64);
         seq.mm = k as u32;

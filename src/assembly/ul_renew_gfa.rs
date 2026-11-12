@@ -304,9 +304,11 @@ pub fn get_bub_pop_max_dist_advance(graph: &mut Asg) -> u64 {
     m_len
 }
 
-/// The bubble-list half of `identify_bubbles_recal_poy` (`hic.cpp` 2913):
-/// rebuilds `bub.list/num/path_len/index` from the unitig graph.
-fn identify_bubbles_recal_poy(
+/// The bubble-list half of `identify_bubbles_recal` / `identify_bubbles_recal_poy`
+/// (`hic.cpp` 2607 / 2913): rebuilds `bub.list/num/path_len/index` from the
+/// unitig graph. The two reference variants differ only in the coverage
+/// thresholds (`poy = false` reproduces `identify_bubbles_recal`).
+fn identify_bubbles_recal_impl(
     read_graph: &Asg,
     unitig_graph: &mut crate::assembly::unitig::UnitigGraph,
     bub: &mut BubbleType,
@@ -314,6 +316,7 @@ fn identify_bubbles_recal_poy(
     sources: &[Vec<PafHit>],
     read_to_unitig: &ReadToUnitig,
     options: &AssemblyOptions,
+    poy: bool,
 ) {
     let n_vtx = (unitig_graph.graph.sequences.len() * 2) as u32;
     let graph = &mut unitig_graph.graph;
@@ -333,8 +336,17 @@ fn identify_bubbles_recal_poy(
         (f64::from(options.global_homozygous_coverage) / HOM_PEAK_RATE) as u64
     };
     let het_cov = hom_cov / options.polyploidy as u64;
-    let m_het_cov = het_cov + ((het_cov as f64 * 0.333333) as u64);
-    let m_hom_cov = het_cov + ((het_cov as f64 * 0.6) as u64);
+    let (m_het_cov, m_hom_cov) = if poy {
+        (
+            het_cov + ((het_cov as f64 * 0.333333) as u64),
+            het_cov + ((het_cov as f64 * 0.6) as u64),
+        )
+    } else {
+        (
+            (hom_cov - het_cov) + ((het_cov as f64 * 0.333333) as u64),
+            (hom_cov - het_cov) + ((het_cov as f64 * 0.6) as u64),
+        )
+    };
 
     let mut buffer = BubbleBuffer {
         info: (0..n_vtx).map(|_| Default::default()).collect(),
@@ -918,4 +930,48 @@ pub fn filter_sg_by_ug(
     read_graph.is_sorted = false;
     read_graph.cleanup();
     read_graph.symmetrize();
+}
+
+/// `identify_bubbles_recal` (`hic.cpp` 2607).
+pub fn identify_bubbles_recal(
+    read_graph: &Asg,
+    unitig_graph: &mut crate::assembly::unitig::UnitigGraph,
+    bub: &mut BubbleType,
+    r_het_flag: &mut [u8],
+    sources: &[Vec<PafHit>],
+    read_to_unitig: &ReadToUnitig,
+    options: &AssemblyOptions,
+) {
+    identify_bubbles_recal_impl(
+        read_graph,
+        unitig_graph,
+        bub,
+        r_het_flag,
+        sources,
+        read_to_unitig,
+        options,
+        false,
+    )
+}
+
+/// `identify_bubbles_recal_poy` (`hic.cpp` 2913).
+pub fn identify_bubbles_recal_poy(
+    read_graph: &Asg,
+    unitig_graph: &mut crate::assembly::unitig::UnitigGraph,
+    bub: &mut BubbleType,
+    r_het_flag: &mut [u8],
+    sources: &[Vec<PafHit>],
+    read_to_unitig: &ReadToUnitig,
+    options: &AssemblyOptions,
+) {
+    identify_bubbles_recal_impl(
+        read_graph,
+        unitig_graph,
+        bub,
+        r_het_flag,
+        sources,
+        read_to_unitig,
+        options,
+        true,
+    )
 }

@@ -412,6 +412,41 @@ pub fn usg_cleanup(g: &mut Usg) {
                 &|arc: &UsgArc| arc.v,
             );
         }
+        // `worker_clean_usg`: fold the sorted `arc_mm` usages into the live
+        // arcs' `idx` (`<offset>:32 | <count>:32`), dropping the usages of
+        // deleted arcs.
+        for side in 0..2usize {
+            crate::container::ksort::radix_sort_by_key_32(
+                &mut seq.arc_mm[side],
+                &|entry: &crate::assembly::ul2ul::UsgArcMm| entry.v,
+            );
+            let mut mm: Vec<crate::assembly::ul2ul::UsgArcMm> = Vec::new();
+            let mut k = 0usize;
+            let mut l = 0usize;
+            let arcs = &mut seq.arc[side];
+            while k < seq.arc_mm[side].len() && l < arcs.len() {
+                let mm_v = seq.arc_mm[side][k].v;
+                let arc_v = arcs[l].v;
+                if mm_v < arc_v {
+                    k += 1;
+                } else if mm_v > arc_v {
+                    l += 1;
+                } else {
+                    let entry_v = seq.arc_mm[side][k].v;
+                    let last_v = mm.last().map(|e| e.v);
+                    if last_v == Some(entry_v) {
+                        arcs[l].idx += 1;
+                    } else {
+                        arcs[l].idx = (mm.len() as u64) << 32;
+                        arcs[l].idx += 1;
+                    }
+                    mm.push(seq.arc_mm[side][k]);
+                    mm.last_mut().unwrap().v = entry_v;
+                    k += 1;
+                }
+            }
+            seq.arc_mm[side] = mm;
+        }
     }
 }
 
@@ -3121,6 +3156,10 @@ pub struct UlgOptions {
     pub max_tip_hifi: i64,
     /// `is_trio`.
     pub is_trio: bool,
+    /// `min_ovlp_drop_ratio` (used by `u2g_hybrid_clean`).
+    pub min_ovlp_drop_ratio: f64,
+    /// `max_ovlp_drop_ratio` (used by `u2g_hybrid_clean`).
+    pub max_ovlp_drop_ratio: f64,
 }
 
 /// `u2g_clean` (`gfa_ut.cpp` 16281): the whole integer-unitig cleanup —
