@@ -798,3 +798,231 @@ pub fn usg_bub_identify(
     }
     None
 }
+
+/// `usg_arc_cut_srt_length` (`gfa_ut.cpp` 11104): the length-sorted weak-arc
+/// cut with the double-ended topological check.
+pub fn usg_arc_cut_srt_length(
+    g: &mut Usg,
+    max_ext: i32,
+    len_rat: f32,
+    is_topo: bool,
+    max_drop_len: Option<&mut u32>,
+    b: &mut Vec<u64>,
+    ub: &mut Vec<u64>,
+) -> u32 {
+    let n_vtx = (g.a.len() << 1) as u32;
+    let mut f = vec![0u8; g.a.len()];
+    b.clear();
+    ub.clear();
+    for v in 0..n_vtx {
+        if g.a[(v >> 1) as usize].deleted || f[(v >> 1) as usize] != 0 {
+            continue;
+        }
+        let arcs: Vec<UsgArc> = g.arcs_of(v).to_vec();
+        if arcs.len() < 2 {
+            continue;
+        }
+        let mut kv = 0usize;
+        let mut kocc = [0usize; 2];
+        for arc in &arcs {
+            if arc.deleted {
+                continue;
+            }
+            kv += 1;
+            if (arc.ou >> 1) > 0 {
+                kocc[1] = kocc[1].max((arc.ou >> 1) as usize);
+            } else if arc.ou == 0 {
+                kocc[0] += 1;
+            }
+        }
+        if kv < 2 || kocc[0] == 0 || kocc[1] == 0 {
+            continue;
+        }
+        for (i, arc) in arcs.iter().enumerate() {
+            if arc.deleted || arc.ou != 0 {
+                continue;
+            }
+            if let Some(limit) = max_drop_len.as_deref() {
+                if arc.ol >= *limit {
+                    continue;
+                }
+            }
+            let x = (u64::from(arc.ol)) << 32;
+            b.push(x | ub.len() as u64);
+            ub.push(((u64::from(v)) << 32) | i as u64);
+        }
+    }
+    crate::container::ksort::radix_sort_u64(b);
+    let mut cnt = 0u32;
+    for k in 0..b.len() {
+        let slot = (b[k] & 0xffff_ffff) as usize;
+        let v = (ub[slot] >> 32) as u32;
+        let arc_index = (ub[slot] & 0xffff_ffff) as usize;
+        let ve = g.a[(v >> 1) as usize].arc[(v & 1) as usize][arc_index];
+        let w = ve.v ^ 1;
+        if ve.deleted
+            || g.a[(v >> 1) as usize].deleted
+            || g.a[(w >> 1) as usize].deleted
+            || ve.ou != 0
+        {
+            continue;
+        }
+        let nv = g.arcs_of(v).len();
+        let nw = g.arcs_of(w).len();
+        if nv <= 1 && nw <= 1 {
+            continue;
+        }
+        let Some(we_index) = g.arcs_of(w).iter().position(|a| a.v == v ^ 1) else {
+            continue;
+        };
+        let we = g.a[(w >> 1) as usize].arc[(w & 1) as usize][we_index];
+        let mm_ol = ve.ol.min(we.ol);
+        let mut kocc = [0usize; 2];
+        let mut kv = 0usize;
+        let mut ol_max = 0u32;
+        for arc in g.arcs_of(v) {
+            if arc.deleted {
+                continue;
+            }
+            kv += 1;
+            if arc.ou != 1 {
+                kocc[usize::from(arc.ou != 0)] += 1;
+            }
+            if ol_max < arc.ol {
+                ol_max = arc.ol;
+            }
+        }
+        if kv < 1 || kocc[0] < 1 || kocc[1] < 1 {
+            continue;
+        }
+        if kv >= 2 && (mm_ol as f32) > ol_max as f32 * len_rat {
+            continue;
+        }
+        let mut kw = 0usize;
+        let mut ol_max = 0u32;
+        for arc in g.arcs_of(w) {
+            if arc.deleted {
+                continue;
+            }
+            kw += 1;
+            if ol_max < arc.ol {
+                ol_max = arc.ol;
+            }
+        }
+        if kw < 1 {
+            continue;
+        }
+        if kw >= 2 && (mm_ol as f32) > ol_max as f32 * len_rat {
+            continue;
+        }
+        if kv <= 1 && kw <= 1 {
+            continue;
+        }
+        let mut to_del = true;
+        if is_topo {
+            to_del = false;
+            if kv > 1 && kw > 1 {
+                to_del = true;
+            } else if kw == 1 {
+                let mut z_a: Vec<u32> = Vec::new();
+                let mut z_b: Vec<u32> = Vec::new();
+                if usg_naive_topocut_aux(g, w ^ 1, max_ext, &mut f, &mut z_a, &mut z_b) < max_ext {
+                    to_del = true;
+                }
+            } else if kv == 1 {
+                let mut z_a: Vec<u32> = Vec::new();
+                let mut z_b: Vec<u32> = Vec::new();
+                if usg_naive_topocut_aux(g, v ^ 1, max_ext, &mut f, &mut z_a, &mut z_b) < max_ext {
+                    to_del = true;
+                }
+            }
+        }
+        if to_del {
+            set_arc_deleted(g, v, ve.v, true);
+            set_arc_deleted(g, w, v ^ 1, true);
+            if usg_naive_topocut_aux_sec(g, v, max_ext) < max_ext
+                && usg_naive_topocut_aux_sec(g, w, max_ext) < max_ext
+            {
+                cnt += 1;
+            } else {
+                set_arc_deleted(g, v, ve.v, false);
+                set_arc_deleted(g, w, v ^ 1, false);
+            }
+        }
+    }
+    if cnt > 0 {
+        usg_cleanup(g);
+    }
+    cnt
+}
+
+fn set_arc_deleted(g: &mut Usg, v: u32, w: u32, del: bool) {
+    if let Some(arc) = g
+        .a[(v >> 1) as usize]
+        .arc[(v & 1) as usize]
+        .iter_mut()
+        .find(|a| a.v == w)
+    {
+        arc.deleted = del;
+    }
+}
+
+/// `usg_naive_topocut_aux_sec` (`gfa_ut.cpp` 10902): the both-direction walk.
+pub fn usg_naive_topocut_aux_sec(g: &Usg, v0: u32, max_ext: i32) -> i32 {
+    let mut n_ext = 0i32;
+    let mut tip = [false; 2];
+    let mut v = v0;
+    loop {
+        let arcs: Vec<u32> = g
+            .arcs_of(v)
+            .iter()
+            .filter(|a| !a.deleted)
+            .map(|a| a.v)
+            .collect();
+        let kv = arcs.len();
+        n_ext += g.a[(v >> 1) as usize].occ as i32;
+        if kv != 1 {
+            if kv == 0 {
+                tip[0] = true;
+            }
+            break;
+        }
+        v = arcs[0];
+        let kv = g.arcs_of(v ^ 1).iter().filter(|a| !a.deleted).count();
+        if kv != 1 {
+            break;
+        }
+        if v == v0 {
+            return 0; // circle, it is ok to remove it
+        }
+    }
+    let mut v = v0 ^ 1;
+    loop {
+        let arcs: Vec<u32> = g
+            .arcs_of(v)
+            .iter()
+            .filter(|a| !a.deleted)
+            .map(|a| a.v)
+            .collect();
+        let kv = arcs.len();
+        n_ext += g.a[(v >> 1) as usize].occ as i32;
+        if kv != 1 {
+            if kv == 0 {
+                tip[1] = true;
+            }
+            break;
+        }
+        v = arcs[0];
+        let kv = g.arcs_of(v ^ 1).iter().filter(|a| !a.deleted).count();
+        if kv != 1 {
+            break;
+        }
+        if v == v0 ^ 1 {
+            return 0;
+        }
+    }
+    if n_ext < max_ext && tip[0] && tip[1] {
+        return n_ext;
+    }
+    max_ext
+}
