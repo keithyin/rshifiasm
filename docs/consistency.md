@@ -3109,6 +3109,39 @@ integer_align_extention、gap_chain_check。
 7. `gradually_renew_g`/`renew_g` 接线 pipeline.rs（39271/39297 已读）。
 8. U7：解锁 --ul + e2e 门禁。
 
+## U6 续七（2026-11-12 第八轮，renew_ng 尾段落地）
+
+- `595dbd5` ul2ul.rs（见续六）。
+- `db6f813` **`ul_renew_ng.rs`**：`Usc`、`reset_scaf_node_uinfo`
+  （0/1/2 三态 + nlen）、`convert_usg_t`、`gen_spec_rc_edge`、
+  `push_scaff_node`（min_ovlp 假重叠 + set_reverse_overlap）、
+  `renew_paf0`/`renew_paf1`（update_qtn/dup_paf_check；sf 分支）、
+  `update_paf`（rmap→clus→idx 分组 + dn 日志行）、`renew_ng`
+  （idx_a 重建 + extra 顶点 + 两遍弧处理；第一遍收集失败对并登记
+  scaffold Usc，nid 从 ng.r_seq 起）、`renew_r_to_u`（清空 +
+  ma_hit_contained_advance）。
+  `update_paf` 的 `renew_paf1(len)` 用 `ng->seq[k].len`——调用方需
+  传 ng 长度（当前以 0 占位，接线时补）。
+
+**剩余（按序）**：
+1. `renew_ul2_utg`（gen_raw_ug_seq/get_ul_spec_ovlp/get_ulg_spec_ovlp/
+   ulg_len_check/update_l_coord 等，gfa_ut.cpp ~15800-16146）→
+   `u2g_threading`(16146) + `worker_update_ul_arc_drop`(10519) +
+   `pushp_usg_arc_mm`/`get_usg_arc`/`usg_cleanup`(10663) +
+   `u2g_hybrid_clean` → **h_usg**。
+2. `u2g_clean` 的 ulg 弧清理子树（8673 ulg_arc_cut_tips、9757
+   ulg_arc_cut_supports、10084 ulg_pop_bubble、10337 ulg_arc_cut_z、
+   `asg_arc_identify_simple_bubbles_multi` 已有）+ init_ulg_opt_t。
+3. ul_realignment_gfa 组装（ul_realignment → filter_sg_by_ug →
+   gen_bubble_chain → init_ul_resolve_t → shrink → gen_ul2ul →
+   u2g_clean → renew_ng → realloc_rdb_adv → update_paf → 内部弧重推 →
+   renew_R_to_U → post_rescue）。
+4. `realloc_rdb_adv`（已读 ✅，需 Rust 读段存储扩展 API：复制读段/
+   scaffold 基因组 push_scaf_bases/get_end_hifi/get_ul_subregion 已读 ✅，
+   ha_compress_base 对应 encode_base）。
+5. gradually_renew_g/renew_g 接线 pipeline.rs。
+6. U7：解锁 --ul + e2e 门禁（见「U6 续三」门禁顺序）。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
