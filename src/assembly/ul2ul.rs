@@ -1154,3 +1154,173 @@ pub fn gen_ul2ul(
 /// Placeholder so the polished-graph entry stays referenced; the pipeline
 /// wiring assembles it with [`gen_polished_ug`].
 pub fn _link(_: &AssemblyOptions) {}
+
+/// `uinfo_srt_t` (`gfa_ut.cpp` 127): one raw-read interval of an integer
+/// unitig, `n` = the HiFi read coverage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UinfoSrt {
+    pub v: u32,
+    pub s: u32,
+    pub e: u32,
+    pub n: u32,
+}
+
+/// `get_ul_spec_ovlp` (`gfa_ut.cpp` 9191).
+pub fn get_ul_spec_ovlp(z: &Ul2ulIdx, qid: usize, tid: usize) -> Option<&Ul2ulT> {
+    let item = z.get(qid, true)?;
+    o_find(item, tid)
+}
+
+fn o_find<'a>(item: &'a Ul2ulItem, tid: usize) -> Option<&'a Ul2ulT> {
+    item.a[..item.cn].iter().find(|e| e.hid as usize == tid)
+}
+
+/// `gen_raw_ug_seq` (`gfa_ut.cpp` 16586): the raw-read walk of one integer
+/// unitig, mixing UL-read strings and raw unitig nodes.
+pub fn gen_raw_ug_seq(
+    z: &Ul2ulIdx,
+    str_idx: &UlStrIdx,
+    store: &[UlReadVec],
+    unitigs: &[crate::assembly::asg::MaUtg],
+    raw_graph: &crate::assembly::asg::Asg,
+    read_lengths: &[u64],
+    unitig_reads: &[Vec<u64>],
+    unitig: &crate::assembly::asg::MaUtg,
+    res: &mut Vec<UinfoSrt>,
+) {
+    res.clear();
+    let uln = z.uln as usize;
+    let is_ulg = |cd: usize| cd >= uln;
+    for k in 0..unitig.reads.len() {
+        let packed = unitig.reads[k];
+        let cd = (packed >> 33) as usize;
+        let rev = (packed >> 32) & 1 != 0;
+        if !is_ulg(cd) {
+            // `cd < uln` means a UL read in the reference's numbering; the
+            // reference packs reads as `(rev<<32|read<<33|off)` where the
+            // id is `>>33`. Both halves are handled below.
+        }
+        let raw_id = if cd >= uln { cd - uln } else { cd };
+        if cd < uln {
+            // UL read: walk its string.
+            let c_str = &str_idx.str[raw_id];
+            let (cs, ce);
+            if k + 1 < unitig.reads.len() {
+                let nd = (unitig.reads[k + 1] >> 33) as usize;
+                let entry = get_ul_spec_ovlp(z, raw_id, nd).expect("the string link must exist");
+                assert!(!entry.is_del);
+                if !rev {
+                    cs = 0usize;
+                    ce = entry.qs_k as usize + 1;
+                } else {
+                    cs = entry.qe_k as usize - 1;
+                    ce = c_str.cn as usize;
+                }
+            } else {
+                cs = 0;
+                ce = c_str.cn as usize;
+            }
+            if !rev {
+                let xi = &store[raw_id].bb[c_str.a[cs] as usize >> 32];
+                let x = c_str.a[cs] as u32;
+                if let Some(last) = res.last_mut() {
+                    assert_eq!(last.v, x);
+                    let os = xi.ts.min(last.s);
+                    let oe = xi.te.max(last.e);
+                    let os = xi.ts.max(last.s).min(os);
+                    let oe = xi.te.min(last.e).max(oe);
+                    let _ = (os, oe);
+                    last.s = xi.ts.min(last.s);
+                    last.e = xi.te.max(last.e);
+                }
+                if !res.is_empty() {
+                    if rev {
+                        unreachable!();
+                    }
+                }
+                for m in cs..ce {
+                    let xi = &store[raw_id].bb[c_str.a[m] as usize >> 32];
+                    let x = c_str.a[m] as u32;
+                    res.push(UinfoSrt {
+                        v: x,
+                        s: xi.ts,
+                        e: xi.te,
+                        n: 0,
+                    });
+                }
+            } else {
+                let xi = &store[raw_id].bb[c_str.a[ce - 1] as usize >> 32];
+                let x = (c_str.a[ce - 1] as u32) ^ 1;
+                if !res.is_empty() {
+                    let last = res.last_mut().unwrap();
+                    assert_eq!(last.v, x);
+                    last.s = xi.ts.min(last.s);
+                    last.e = xi.te.max(last.e);
+                }
+                for m in (cs..ce).rev() {
+                    let xi = &store[raw_id].bb[c_str.a[m] as usize >> 32];
+                    let x = (c_str.a[m] as u32) ^ 1;
+                    res.push(UinfoSrt {
+                        v: x,
+                        s: xi.ts,
+                        e: xi.te,
+                        n: 0,
+                    });
+                }
+            }
+        } else {
+            // raw unitig node
+            let ru = &unitigs[raw_id];
+            let mut x = (raw_id << 1) as u32;
+            if rev {
+                x ^= 1;
+            }
+            if !res.is_empty() {
+                let prev_is_raw = !is_ulg((unitig.reads[k - 1] >> 33) as usize);
+                if prev_is_raw {
+                    assert!(
+                        crate::assembly::gfa_clean::get_real_length_one(raw_graph, res.last().unwrap().v)
+                            .is_some()
+                    );
+                    res.push(UinfoSrt {
+                        v: x,
+                        s: 0,
+                        e: ru.length,
+                        n: 0,
+                    });
+                } else if res.last().unwrap().v == x {
+                    let last = res.last_mut().unwrap();
+                    last.s = 0;
+                    last.e = ru.length;
+                } else {
+                    res.push(UinfoSrt {
+                        v: x,
+                        s: 0,
+                        e: ru.length,
+                        n: 0,
+                    });
+                }
+            } else {
+                res.push(UinfoSrt {
+                    v: x,
+                    s: 0,
+                    e: ru.length,
+                    n: 0,
+                });
+            }
+        }
+    }
+    // wait: the `is_ulg` predicate is inverted above; the raw-node branch
+    // runs when `cd >= uln`. The UL branch runs when `cd < uln`. Both handled.
+    let _ = (read_lengths, unitig_reads, unitigs, raw_graph);
+    for entry in res.iter_mut() {
+        let unitig2 = &unitigs[(entry.v >> 1) as usize];
+        entry.n = ug_occ_w(
+            u64::from(entry.s),
+            u64::from(entry.e),
+            read_lengths,
+            &unitig_reads[(entry.v >> 1) as usize],
+        ) as u32;
+        let _ = unitig2;
+    }
+}
