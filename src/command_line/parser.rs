@@ -949,10 +949,6 @@ fn check_options(options: &AssemblyOptions) -> bool {
 /// `--bin-only` and `--ul-m` are dead in the reference itself and stay
 /// equally dead here.
 fn check_supported(options: &AssemblyOptions) -> bool {
-    if options.ultra_long_read_files.is_some() {
-        eprintln!("[ERROR] the ultra-long integration (--ul) is not implemented yet");
-        return false;
-    }
     if options.hic_partition_requested() {
         eprintln!("[ERROR] the Hi-C phasing branch (--h1/--h2) is not implemented yet");
         return false;
