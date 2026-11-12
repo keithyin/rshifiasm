@@ -2764,6 +2764,85 @@ bub_links 之前、`asg_arc_cut_chimeric` 用 `UL_COV_THRES`、循环内
 `gen_ul2ul`/`renew_ng` 清单与门禁计划见下一节「迁移状态总览」的 U6 小节。
 
 
+## U6 续（2026-11-12 第二轮会话，进行中）
+
+本轮按依赖顺序继续 U6/U7。已提交：
+
+- `ee59902` **`ul_phase.rs`（mask/phase 子系统，Correct.cpp 18050–22426）**：
+  `rphase_rr`+`gen_region_phase_robust_rr`+`extract_sub_cigar_err(_rr)`
+  （游标三元组在 `UlOv` 的 qn/qs/qe，bd 在 sec）、`is_mask_ov`、
+  `push_sec_aln_robust`、`push_emask_flt`/`is_ul_ov_pe`/`is_exact_ov`/
+  `is_cover_ul_ov_t`/`dedup_src_shared1`/`cal_x_ul_ovlp`/`check_mask_exist`/
+  `push_consist_ul_ovlps`/`cal_no_bd_coor`、`retrieve_cigar_xcoord`/
+  `extract_xcoordates(0)`/`cal_xerr`/`update_masks`/`cal_paired_distance`/
+  `gen_mask_ovlp0`/`if_direct_mask`/`mask_ovlps`、`push_rphase`/`refine_rphase`/
+  `rphase_hl`、`gen_src_shared_interval_simple`、`gen_commen_sketch`/
+  `update_sketch_trace`。次级窗口表示：`SecondaryWindows = Vec<Vec<WindowList>>`
+  （参考存放在 `w_list.a[w_list.n..n+align_length)`），rphase_hl 的压缩交换
+  同时交换 regions 与 slots。死代码跳过：`gen_region_phase`、`region_phase`、
+  `refine_rphase_back`、`get_pe_diff`、`dedup_src_shared`。
+  `UlRescallContext.sources` 从 `&[PafList]` 改为 `&[Vec<PafHit>]`，
+  并新增 `cc: &[Vec<u32>]`（ma_hit_t::cc 的并行数组）。
+
+- `d1eb4f7` **`ul_glchain.rs`（gl_chain 簇，inter.cpp 2412–7290）**：
+  `update_ava_het_site`/`gl_chain_gen`/`get_chain_x`/`es_win_err`/
+  `gen_contain_chain`/`get_het_occ`/`rescue_contain_ul_chains`/
+  `rescue_trans_ul_chains`/`dedup_sort_ul_ov_t`/`check_contain_pair`/
+  `push_sc_pre`/`pop_sc`/`pop_pre`/`find_ul_ov_max`/`max_ovlp_src`/
+  `get_ecov_adv_full`（mode 0/1 + contain_off，OU_MASK 回退走
+  `get_ug_edge_src`→cc）/`get_ecov_el`/`get_overlap_region_sub_err`/
+  `cal_gl_chain_lin_sc`/`gl_chain_lin`/`gen_gl_aln`/`gen_gg_aln`/
+  `regen_ul_ov_t_lst`/`l2g_res_chain_sc`/`g_adjacent_dis`/`hc_target_len`/
+  `set_ul_ov_t_by_mg_lchain_t`/`mg_log2`/`cal_gchain_sc_adv`/
+  `gl_chain_graph_adv`/`comput_sc_partial_cigar`/`ed_dp_c`/`get_num_wins`/
+  `set_sec_e_min`/`cal_sec_e_min`/`set_w_e`/`ck_w_err`/`filter_sec`/
+  `gl_chain_flter`/`introsort_overlaps_by_xe`(ks_introsort_or_xe)/
+  `check_trans_rate`/`ff_chain`/`fill_unaligned_alignments`/
+  `update_ul_vec_t_ug`/`filter_topN`/`GdpChain`/`gl_chain`/`ul_lalign`。
+  新增 `ksort::radix_sort_i64`（gfa64i 的算术移位 MSD radix）；
+  `UlIndex` 新增 `cc: Vec<Vec<u32>>`（gen_r_contain 返回并保存）；
+  `ul.rs` 的 UG_SKIP_N/UG_ITER_N/UG_DIS_N/UG_SKIP_GRAPH_N 改 pub；
+  `select_max_gchain` 改 pub(crate)；`ul_store` 重导出 `UcBlock`。
+  死代码跳过：trav_rate 版 `gl_chain_advance`（注释块）、
+  `gl_chain_refine`、`gl_chain_refine_advance_combine_with_trans` +
+  `gl_chain_advance_back`+`determine_containment_chain`、`infer_read_ovlp`、
+  `get_het_site`、`gl_exact_chain`、`dump_all_chain`、`ins_merge_ul_ov`、
+  `save_tmp_chains`、debug/prt 打印。关键映射：gl_chain_graph_adv 的
+  `bf`(dst_done)=调用方 `sps`（gl_chain 里 C 传同一个 st_mt_t），
+  `out`(Vec<usize>)=hc_shortest_k 的访问序（gen_gchain_track 消费），
+  select_max_gchain 的 idx=sps、dst_done=gdp.dst_done。
+
+**下一批（U6-1 剩余，按序）**：
+1. push_graph_bin 子树（inter.cpp 12297：`gen_src_shared_interval_adv`、
+   `trans_ovlp_connect`、`cal_exact_batch`、`get_mask_interval`(已读 11766)、
+   `push_emask_lst`、`srt_kv_emask_t`）+ `worker_for_graph_bin` 依赖的
+   `ug_map_lchain_simple`（anchor.cpp 3621 = mz2_ha_sketch +
+   `minimizers_qgen_input`(qgen_input.rs 已有 `SeedInput`) +
+   `lchain_qgen_mcopy`(qgen_chain.rs 1527 已有)）与 `ug_lalign`
+   （correction/ug_lalign.rs 已有，私有需改 pub(crate)）。
+2. `cal_graph_ovlp_binning`(22789) + `graph_ovlp_binning`(22860) +
+   `write_emask_t`(21515)/`load_emask_t`(21488)（`.re.ul.msk.bin`，
+   字节级门禁）+ 常量（diff_bin/diff_ov/min_bin_len/max_diff/mini_cut/
+   chain_cut 的取值来源在 gen_UL_reovlps 调用点）。
+3. `gen_ul_idx`(21261，ul_index.rs 已有全部部件，需 pub 包装) +
+   `gen_UL_reovlps`(21537) + `ul_v_recall`(20583)/`rescall_ul_pipeline`(20018)
+   + `worker_ul_rescall_pipeline`(13031) + `worker_for_ul_rescall_alignment`(9299
+   ：ul_map_lchain → ul_lalign(第一遍 aln=NULL) → gen_aux_ovlp →
+   gl_chain_flter → gen_shared_intervals → filter_topN →
+   update_sketch_trace（b0/b1/b2 = hap.snp_srt/sps/r_buf 的存取舞步，
+   idx=b0/dp=b1/trace=b2）→ ul_lalign(第二遍 aln=bl->lo) → 恢复对齐循环
+   （ton 回填单窗口 w_list）→ `gl_chain`）。
+   注意 worker 的 step3：`UL_INF.a[rid].dd == 3 && ucr_s->flag == 1` 时把
+   读序列写进 ucr 文件（`write_compress_base_disk`）。
+4. 门禁：`.re.ul.msk.bin` 逐字节、`.re.ul.ovlp.bin` 字段、
+   `/tmp/ulref_run.log` 的 rescall 日志锚点。
+
+**U6-3（renewal）与 U7 见上文总览表。recorrect 侧还需
+`gl_chain_refine_advance`(4334) + `dump_all_chain_simple` +
+`assgin_primary_chains`/`quick_primary_assgin` +
+`comput_sc_partial_cigar`(已有) + `check_trans_rate_gap` 簇 +
+`worker_for_ul_recorrect_alignment`(12550 区) + `recorrect_ul_pipeline`(20047)。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）

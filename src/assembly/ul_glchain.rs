@@ -2784,3 +2784,108 @@ pub fn gl_chain(
     }
     1
 }
+
+/// `ul_lalign` (`Correct.cpp` 22427): the rescall alignment driver. The first
+/// pass (`aln = None`) aligns every overlap against the unitig graph; the
+/// second pass fills the coverage gaps and runs the phase/masking pass.
+#[allow(clippy::too_many_arguments)]
+pub fn ul_lalign(
+    context: &UlRescallContext<'_>,
+    regions: &mut [OverlapRegion],
+    candidates: &mut crate::overlap::region::CandidatesList,
+    targets: &crate::correction::target::TargetSource<'_>,
+    query: &[u8],
+    extz: &mut crate::correction::hc_align::BitExtz,
+    dummy: &mut crate::correction::interval::IntervalBuffer,
+    v_idx: &mut Vec<u64>,
+    auxiliary: &mut OverlapRegion,
+    error_rate: f64,
+    wl: i64,
+    aln: Option<&mut Vec<UlOv>>,
+    khit: i64,
+    snp_srt: &mut Vec<u64>,
+    stb: &mut Vec<u64>,
+    mm: &mut crate::assembly::ul_phase::EmaskTable,
+    mk: &mut crate::assembly::ul_phase::MaskUlOv,
+    slots: &mut crate::assembly::ul_phase::SecondaryWindows,
+) {
+    if let Some(aln) = aln {
+        if regions.len() <= 1 {
+            if regions.len() == 1 {
+                let z = &mut regions[0];
+                z.window_cigar.windows.clear();
+                z.window_cigar.windows.push(crate::correction::window::WindowList {
+                    x_start: z.x_position_start as i32,
+                    x_end: z.x_position_end as i32 + 1,
+                    y_start: 0,
+                    y_end: 0,
+                    extra_begin: 0,
+                    extra_end: 0,
+                    error: 0,
+                    error_threshold: 0,
+                    cigar_start: 0,
+                    cigar_length: 0,
+                });
+                z.alignment_length = z.x_position_end + 1 - z.x_position_start;
+                z.overlap_length = z.alignment_length;
+                z.non_homopolymer_errors = 0;
+            }
+            return;
+        }
+        let ql = query.len() as i64;
+        let mut iidx = std::mem::take(snp_srt);
+        let mut buf = std::mem::take(v_idx);
+        let mut buf1 = std::mem::take(stb);
+        crate::assembly::ul_rescall::ul_gap_filling_adv(
+            regions,
+            candidates,
+            aln,
+            wl,
+            targets,
+            query,
+            extz,
+            auxiliary,
+            &mut buf,
+            &iidx,
+            error_rate,
+            ql,
+            khit as u64,
+            1,
+            crate::assembly::ul_phase::max_lgap(ql),
+        );
+        *snp_srt = iidx;
+        *v_idx = buf;
+        *stb = buf1;
+
+        let mut iidx = std::mem::take(snp_srt);
+        let mut buf = std::mem::take(v_idx);
+        let mut buf1 = std::mem::take(stb);
+        crate::assembly::ul_phase::rphase_hl(
+            context,
+            regions,
+            slots,
+            aln,
+            mk,
+            mm,
+            error_rate,
+            64,
+            ql,
+        );
+        *snp_srt = iidx;
+        *v_idx = buf;
+        *stb = buf1;
+    } else {
+        let kept = crate::assembly::ul_rescall::ul_lalign_base(
+            regions,
+            targets,
+            query,
+            extz,
+            dummy,
+            v_idx,
+            error_rate,
+            wl,
+            query.len() as i64,
+        );
+        let _ = kept;
+    }
+}
