@@ -163,8 +163,9 @@ pub fn rescall_one_read(
     buffers.overlaps = mapped.overlaps;
     buffers.candidates = mapped.candidates;
 
-    // first `ul_lalign` pass with `aln = NULL`
-    ul_lalign(
+    // first `ul_lalign` pass with `aln = NULL`; it compacts the survivors to
+    // the front (`ol->length = k`).
+    let kept = ul_lalign(
         context,
         &mut buffers.overlaps,
         &mut buffers.candidates,
@@ -184,6 +185,7 @@ pub fn rescall_one_read(
         &mut buffers.mk,
         slots,
     );
+    buffers.overlaps.truncate(kept);
     let ton = buffers.overlaps.len();
     buffers.auxiliary = gen_aux_ovlp(&buffers.overlaps, buffers.overlaps.len());
     let mut live = ton;
@@ -193,7 +195,8 @@ pub fn rescall_one_read(
         context,
         &mut buffers.overlaps,
         &mut live,
-        &mut Vec::new(),
+        // `dumy->overlapID` (sized by `clear_Correct_dumy` in `ul_lalign`).
+        &mut buffers.dummy.overlap_identifiers,
         &mut buffers.ll_srt,
         &mut buffers.sps,
         &mut buffers.tk,
@@ -337,6 +340,9 @@ pub fn rescall_ul_pipeline<'a>(
         .unwrap_or(&[]);
     let mut chunk: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut chunk_bases = 0u64;
+    // `p->total_pair`: the global read counter across chunks; each read
+    // rewrites its pre-existing slot `UL_INF.a[rid]` in place.
+    let mut total_reads = 0usize;
     for file in files {
         let mut reader = match FastxReader::open(file) {
             Ok(reader) => reader,
@@ -357,6 +363,7 @@ pub fn rescall_ul_pipeline<'a>(
             if chunk_bases >= CHUNK_SIZE {
                 flush_rescall_chunk(
                     &chunk,
+                    total_reads,
                     store,
                     &mut buffers,
                     map_context,
@@ -367,6 +374,7 @@ pub fn rescall_ul_pipeline<'a>(
                     emask,
                     &mut slots,
                 );
+                total_reads += chunk.len();
                 chunk.clear();
                 chunk_bases = 0;
             }
@@ -375,6 +383,7 @@ pub fn rescall_ul_pipeline<'a>(
     if !chunk.is_empty() {
         flush_rescall_chunk(
             &chunk,
+            total_reads,
             store,
             &mut buffers,
             map_context,
@@ -385,6 +394,7 @@ pub fn rescall_ul_pipeline<'a>(
             emask,
             &mut slots,
         );
+        total_reads += chunk.len();
     }
 
     eprintln!(
@@ -396,14 +406,16 @@ pub fn rescall_ul_pipeline<'a>(
         store.reads.len(),
         buffers.num_correct_base
     );
-    gen_ul_vec_rid_t(store, context.reads.total_reads as usize);
 }
 
-/// One chunk of the rescall pipeline: register, align, push, and dump the
-/// `dd == 3` sequences to the ucr file.
+/// One chunk of the rescall pipeline: align and refill the pre-existing read
+/// slots, then dump the `dd == 3` sequences to the ucr file. The reference's
+/// step 0 does not register reads here (the `append_ul_t` call is commented
+/// out); the slots come from the first scall pass.
 #[allow(clippy::too_many_arguments)]
 fn flush_rescall_chunk(
     chunk: &[(Vec<u8>, Vec<u8>)],
+    chunk_base_id: usize,
     store: &mut AllUl,
     buffers: &mut RescallBuffers,
     map_context: &ScallContext<'_>,
@@ -414,19 +426,8 @@ fn flush_rescall_chunk(
     emask: &EmaskTable,
     slots: &mut SecondaryWindows,
 ) {
-    for (name, _) in chunk {
-        let append = AppendParameters {
-            sources: context.sources,
-            read_lengths: &context.reads.read_lengths,
-            maximum_hang_rate: parameters.maximum_hang_rate,
-            maximum_hang: parameters.maximum_hang,
-            minimum_overlap: parameters.minimum_overlap,
-        };
-        append_ul_t(store, None, Some(name), None, &mut [], P_CHAIN_RATE, false, &append);
-    }
-    let chunk_len = chunk.len();
     for (local_id, (_, sequence)) in chunk.iter().enumerate() {
-        let read_id = store.reads.len() - chunk_len + local_id;
+        let read_id = chunk_base_id + local_id;
         if read_id >= store.reads.len() {
             continue;
         }
@@ -469,6 +470,10 @@ pub fn write_compress_base_disk(file: &mut std::fs::File, rid: u64, sequence: &[
 }
 
 /// `gen_UL_reovlps` (`inter.cpp` 21537) with `is_emask = 1`.
+///
+/// `unitig_graph` is the polished `ma_ug_t` (`ug`) — `gen_ul_idx` updates its
+/// arc `ou` fields in place — and `sg` the string graph the indices are built
+/// against (`gen_ul_idx(sl->uopt, ug, sg)` / `graph_ovlp_binning(ug, sg, ...)`).
 #[allow(clippy::too_many_arguments)]
 pub fn gen_ul_reovlps(
     options: &mut AssemblyOptions,
@@ -476,8 +481,8 @@ pub fn gen_ul_reovlps(
     sources: &[Vec<crate::overlap::paf::PafHit>],
     gfa_name: &str,
     cutoff: i64,
-    unitigs: &[crate::assembly::asg::MaUtg],
-    read_graph: &crate::assembly::asg::Asg,
+    unitig_graph: &mut crate::assembly::unitig::UnitigGraph,
+    sg: &crate::assembly::asg::Asg,
     store: &mut AllUl,
     sample_distance: i32,
     rewindow_size: i32,
@@ -486,13 +491,8 @@ pub fn gen_ul_reovlps(
     minimum_overlap: i32,
 ) {
     let parameters = RescallParameters::new(options, cutoff);
-    let index = gen_ul_idx(
-        options,
-        unitigs,
-        read_graph,
-        sources,
-        &reads.read_lengths,
-    );
+    let index = gen_ul_idx(options, unitig_graph, sg, sources, &reads.read_lengths);
+    let unitigs = &*unitig_graph.unitigs;
     let mut index_options = options.clone();
     index_options.k_mer_length = parameters.kmer_length as i32;
     index_options.minimizer_window_size = parameters.minimizer_window as i32;
@@ -513,12 +513,8 @@ pub fn gen_ul_reovlps(
             built
         }
     };
-    let unitig_graph = crate::assembly::unitig::UnitigGraph {
-        unitigs: unitigs.to_vec(),
-        graph: read_graph.clone(),
-    };
     let binning_context = UlRescallContext {
-        unitig_graph: &unitig_graph,
+        unitig_graph: &*unitig_graph,
         sources,
         cc: &index.cc,
         reads,
@@ -541,7 +537,7 @@ pub fn gen_ul_reovlps(
     };
     let _ = UG_SKIP_GRAPH_N;
     let context = UlRescallContext {
-        unitig_graph: &unitig_graph,
+        unitig_graph: &*unitig_graph,
         sources,
         cc: &index.cc,
         reads,
@@ -579,6 +575,7 @@ pub fn ul_realignment(
     source_lists: &[crate::correction::ec_driver::PafList],
     coverage_cut: &[crate::assembly::hit::CoverageCut],
     sg: &mut crate::assembly::asg::Asg,
+    store: &mut AllUl,
     bin_file: &str,
     double_check_cache: u32,
     sample_distance: i32,
@@ -591,13 +588,18 @@ pub fn ul_realignment(
     let gfa_name = format!("{}.{}", options.output_file_name, bin_file);
     options.update_coverage(options.homozygous_coverage);
     let cutoff = i64::from(REA_ALIGN_CUTOFF);
-    let mut store = AllUl::new();
-    let unitig_graph = gen_polished_ug(options, reads, source_lists, coverage_cut, sg);
-    clear_all_ul_t(&mut store);
+    let mut unitig_graph = gen_polished_ug(options, reads, source_lists, coverage_cut, sg);
+    // The reference operates on the global `UL_INF`: `clear_all_ul_t` zeroes
+    // every entry but keeps the read count, and the rescall pass refills the
+    // same slots in place.
+    clear_all_ul_t(store);
     let cached = load_all_ul_t(&gfa_name).ok().flatten();
     match cached {
         Some(cached_store) => {
-            store = cached_store;
+            *store = cached_store;
+            // The reference frees `UL_INF.ridx` after a cache load; the index
+            // is rebuilt by `gen_ul_vec_rid_t` below.
+            store.ridx = Default::default();
             let _ = double_check_cache;
         }
         None => {
@@ -616,21 +618,21 @@ pub fn ul_realignment(
                 &hit_lists,
                 &gfa_name,
                 cutoff,
-                &unitig_graph.unitigs,
-                &unitig_graph.graph,
-                &mut store,
+                &mut unitig_graph,
+                sg,
+                store,
                 sample_distance,
                 rewindow_size,
                 maximum_hang,
                 maximum_hang_rate,
                 minimum_overlap,
             );
-            let _ = write_all_ul_t(&store, &gfa_name);
+            let _ = write_all_ul_t(store, &gfa_name);
         }
     }
-    filter_ul_ug(&mut store, &unitig_graph, reads);
-    gen_ul_vec_rid_t(&mut store, reads.total_reads as usize);
+    filter_ul_ug(store, &unitig_graph, reads);
+    gen_ul_vec_rid_t(store, reads.total_reads as usize);
     let mut renewed = unitig_graph.clone();
-    update_ug_arch_ul_mul(&mut renewed, &store);
+    update_ug_arch_ul_mul(&mut renewed, store);
     renewed
 }

@@ -304,12 +304,12 @@ fn ul_clean_gfa_smoke() {
         file_names: vec!["/tmp/ul.fq".to_string()],
         name_lengths: vec!["/tmp/ul.fq".len()],
     });
-    let (reads, state) = read_cache::load_all_data_from_disk(&mut options).expect("caches");
+    let (mut reads, state) = read_cache::load_all_data_from_disk(&mut options).expect("caches");
     options.output_file_name = "/tmp/ulclean_smoke".to_string();
     options.update_coverage_with_minimum(options.homozygous_coverage, MINIMUM_CHAIN_COUNT);
     rshifiasm::assembly::pipeline::build_string_graph_without_clean(
         &mut options,
-        &reads,
+        &mut reads,
         state,
         false,
     )

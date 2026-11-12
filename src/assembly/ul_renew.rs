@@ -61,6 +61,30 @@ pub fn gen_polished_ug(
     coverage_cut: &[CoverageCut],
     sg: &mut Asg,
 ) -> UnitigGraph {
+    {
+        let mut h: u64 = 1469598103934665603;
+        for seq in sg.sequences.iter() {
+            h = (h ^ seq.length as u64).wrapping_mul(1099511628211);
+            h = (h ^ u64::from(seq.deleted)).wrapping_mul(1099511628211);
+            h = (h ^ u64::from(seq.coverage_class)).wrapping_mul(1099511628211);
+        }
+        for arc in sg.arcs.iter() {
+            h = (h ^ arc.ul).wrapping_mul(1099511628211);
+            h = (h ^ u64::from(arc.v)).wrapping_mul(1099511628211);
+            h = (h ^ u64::from(arc.overlap)).wrapping_mul(1099511628211);
+            h = (h ^ u64::from(arc.deleted)).wrapping_mul(1099511628211);
+            h = (h ^ u64::from(arc.occurrence)).wrapping_mul(1099511628211);
+            h = (h ^ u64::from(arc.strong)).wrapping_mul(1099511628211);
+            h = (h ^ u64::from(arc.without_large_indel)).wrapping_mul(1099511628211);
+            h = (h ^ u64::from(arc.exact_region)).wrapping_mul(1099511628211);
+        }
+        eprintln!(
+            "[SGCHK] n_seq={} n_arc={} h={}",
+            sg.sequences.len(),
+            sg.arcs.len(),
+            h
+        );
+    }
     let mut unitig_graph = ma_ug_gen(sg);
     let edges: Vec<AsgArc> = Vec::new();
     let mut new_edges: Vec<AsgArc> = Vec::new();
@@ -68,11 +92,17 @@ pub fn gen_polished_ug(
     let minimum_overlap = options.minimum_overlap_length;
     let max_hang_rate = options.maximum_hang_rate;
 
-    for unitig in unitig_graph.unitigs.iter_mut() {
+    for (unitig_index, unitig) in unitig_graph.unitigs.iter_mut().enumerate() {
         if unitig.reads.is_empty() {
             continue;
         }
-        polish_unitig_scaf(
+        eprintln!(
+            "[POLUG] {} n0={} len0={}",
+            unitig_index,
+            unitig.reads.len(),
+            unitig.length
+        );
+        let r1 = polish_unitig_scaf(
             unitig,
             sg,
             sources,
@@ -83,7 +113,14 @@ pub fn gen_polished_ug(
             minimum_overlap,
             max_hang_rate,
         );
-        polish_unitig_advance_scaf(
+        eprintln!(
+            "[POLUG] {} n1={} len1={} r1={}",
+            unitig_index,
+            unitig.reads.len(),
+            unitig.length,
+            r1
+        );
+        let r2 = polish_unitig_advance_scaf(
             unitig,
             sg,
             sources,
@@ -94,6 +131,13 @@ pub fn gen_polished_ug(
             maximum_hang,
             minimum_overlap,
             max_hang_rate,
+        );
+        eprintln!(
+            "[POLUG] {} n2={} len2={} r2={}",
+            unitig_index,
+            unitig.reads.len(),
+            unitig.length,
+            r2
         );
     }
     for (i, unitig) in unitig_graph.unitigs.iter().enumerate() {

@@ -524,6 +524,15 @@ pub fn ul_lalign_base(
     window_length: i64,
     query_length: i64,
 ) -> usize {
+    // `clear_Correct_dumy(dumy, ol, km)`: the identifier buffer holds one slot
+    // per overlap and the window scan restarts from the front.
+    if dummy.overlap_identifiers.len() < regions.len() {
+        dummy.overlap_identifiers.resize(regions.len(), 0);
+    }
+    dummy.length = 0;
+    dummy.partial_length = 0;
+    dummy.start_index = 0;
+
     let overlap_count = regions.len();
     let parameters = HcAlignParameters {
         error_rate,
@@ -792,6 +801,18 @@ pub fn dp_commen_sketch(
     win_n as u64
 }
 
+/// `kv_pushp_cl(k_mer_hit, *cl, &p)`: write at the logical length
+/// (`cl.length`), overwriting any stale scratch beyond it, then extend.
+fn push_kmer_hit_at_length(cl: &mut CandidatesList, hit: KmerHit) {
+    let index = cl.length as usize;
+    if index < cl.list.len() {
+        cl.list[index] = hit;
+    } else {
+        cl.list.push(hit);
+    }
+    cl.length = index as i64 + 1;
+}
+
 /// `push_adp_k_hits` (`Correct.cpp` 14758): push the anchor hits of one
 /// `[qs, qs)` / `[ts, te)` bracket plus its two `readID = 0x7fffffff`
 /// sentinels onto `cl`, returning the next scan position.
@@ -830,34 +851,46 @@ fn push_adp_k_hits(
         }
         let mut pushed = hit;
         pushed.read_identifier = hit.count;
-        cl.list.push(pushed);
-        cl.length = cl.list.len() as i64;
+        push_kmer_hit_at_length(cl, pushed);
+    }
+    if cln == 6008 {
+        eprintln!(
+            "[PSH] ci_in={} k_out={} len={} m={}",
+            ci,
+            k,
+            cl.length,
+            previous
+        );
     }
     if qs == u64::MAX || qe == u64::MAX {
         return k;
     }
-    cl.list.push(KmerHit {
-        read_identifier: ALNW_SENTINEL,
-        count: u32::MAX,
-        reverse_strand: false,
-        self_offset: qs as u32,
-        offset: ts as u32,
-    });
-    cl.length = cl.list.len() as i64;
+    push_kmer_hit_at_length(
+        cl,
+        KmerHit {
+            read_identifier: ALNW_SENTINEL,
+            count: u32::MAX,
+            reverse_strand: false,
+            self_offset: qs as u32,
+            offset: ts as u32,
+        },
+    );
     while k < cln
         && cl.list[k as usize].read_identifier == read_id
         && (cl.list[k as usize].self_offset as u64) < qe
     {
         k += 1;
     }
-    cl.list.push(KmerHit {
-        read_identifier: ALNW_SENTINEL,
-        count: u32::MAX,
-        reverse_strand: true,
-        self_offset: (qe - 1) as u32,
-        offset: (te - 1) as u32,
-    });
-    cl.length = cl.list.len() as i64;
+    push_kmer_hit_at_length(
+        cl,
+        KmerHit {
+            read_identifier: ALNW_SENTINEL,
+            count: u32::MAX,
+            reverse_strand: true,
+            self_offset: (qe - 1) as u32,
+            offset: (te - 1) as u32,
+        },
+    );
     k
 }
 
@@ -871,7 +904,13 @@ fn gen_weight_khits0(
     mut k: i64,
     dp: i64,
 ) -> i64 {
-    while k >= 0 && hits[k as usize].self_offset >= qs {
+    // The reference scans `a[k]` with `k == an` after a full window; the
+    // out-of-bounds read either stops immediately or walks back to the last
+    // hit, and both branches leave `k` unchanged in effect — guard it here.
+    while k >= 0
+        && (k as usize) < hits.len()
+        && hits[k as usize].self_offset >= qs
+    {
         k -= 1;
     }
     if k < 0 {
@@ -929,6 +968,38 @@ pub fn gen_cns_chain(
     let window_count = regions[region_index].window_cigar.windows.len() as i64;
     if window_count <= 0 {
         return 0;
+    }
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALL: AtomicU32 = AtomicU32::new(0);
+        let call = CALL.fetch_add(1, Ordering::Relaxed);
+        if call == 0 {
+            let region = &regions[region_index];
+            eprintln!(
+                "[GCE] y_id={} wn={} rcn={} seed={}",
+                region.y_identifier,
+                window_count,
+                cl.length,
+                region.shared_seed
+            );
+            for (k, m) in region
+                .window_cigar
+                .windows
+                .iter()
+                .enumerate()
+                .take(300)
+            {
+                eprintln!(
+                    "[GCEW] w={} x=[{},{}] y=[{},{}] anchor={}",
+                    k,
+                    m.x_start,
+                    m.x_end,
+                    m.y_start,
+                    m.y_end,
+                    (m.extra_end < 0 && m.y_end != -1) as i32
+                );
+            }
+        }
     }
     let target_identifier = regions[region_index].y_identifier as i64;
     let mut query_start: i64 = -1;
@@ -998,7 +1069,11 @@ pub fn gen_cns_chain(
     );
     let hit_count = cl.length - chain_start;
     if let Some(iidx) = iidx {
-        gen_weight_khits(iidx, &mut cl.list[chain_start as usize..]);
+        // The reference bounds the chain hits: `gen_weight_khits(iidx, ka, kn)`.
+        gen_weight_khits(
+            iidx,
+            &mut cl.list[chain_start as usize..(chain_start + hit_count) as usize],
+        );
     }
     let _ = (aligned, need_filter_khit);
     cl.length = chain_start;
@@ -1306,6 +1381,12 @@ pub fn refine_khits(
         small_gap_rate,
         minimum_gap,
     );
+    eprintln!(
+        "[RK] seed={} cmi={} kept={}",
+        region.shared_seed,
+        copy_index,
+        copy_index - region.shared_seed as i64
+    );
     for k in copy_index..cursor {
         candidates.list[k as usize].read_identifier = ALNW_SENTINEL;
     }
@@ -1331,6 +1412,38 @@ pub fn count_k_hits_adv(
         refine_khits(&mut regions[k], candidates, small_gap_rate);
     }
     radix_sort_u64(index);
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CHECK: AtomicU32 = AtomicU32::new(0);
+        let call = CHECK.fetch_add(1, Ordering::Relaxed);
+        if call == 0 && overlap_count == 5 {
+            for (k, region) in regions.iter().enumerate() {
+                let mut cursor = region.shared_seed as i64;
+                let pid = candidates.list[cursor as usize].read_identifier;
+                let mut count = 0i64;
+                while cursor < candidates.length
+                    && candidates.list[cursor as usize].read_identifier == pid
+                    && candidates.list[cursor as usize].read_identifier != ALNW_SENTINEL
+                {
+                    count += 1;
+                    cursor += 1;
+                }
+                let first = &candidates.list[region.shared_seed as usize];
+                let last = &candidates.list[(cursor - 1) as usize];
+                eprintln!(
+                    "[SLC] k={} seed={} pid={} n={} first=[{},{}] last=[{},{}]",
+                    k,
+                    region.shared_seed,
+                    pid,
+                    count,
+                    first.self_offset,
+                    first.offset,
+                    last.self_offset,
+                    last.offset
+                );
+            }
+        }
+    }
 
     let mut write = 0usize;
     for k in 0..overlap_count {
@@ -1564,6 +1677,25 @@ pub fn ul_gap_filling_adv(
                 error_rate,
                 false,
             );
+            if query_length == 73261 {
+                eprintln!(
+                    "[CNS] qn={} ch_n={} rcn={} len={}",
+                    qn,
+                    chain_count,
+                    candidates.length - chain_count,
+                    candidates.length
+                );
+                for c in (candidates.length - chain_count)..candidates.length {
+                    let hit = &candidates.list[c as usize];
+                    eprintln!(
+                        "[CNSC] c={} readID={} self_off={} off={}",
+                        c,
+                        hit.read_identifier,
+                        hit.self_offset,
+                        hit.offset
+                    );
+                }
+            }
             if chain_count != 0 {
                 let chain_index = candidates.length;
                 cigar_gen_by_chain_adv(
@@ -1582,6 +1714,7 @@ pub fn ul_gap_filling_adv(
                     khit as i64,
                 );
             }
+
             group_start = k;
         }
         k += 1;

@@ -2637,6 +2637,11 @@ pub fn hic_clean(read_graph: &mut Asg) {
     };
     let bubble_distance = get_s_bub_pop_max_dist_advance(&unitig_graph.graph, &mut buffer);
     let mut bubble_flag = vec![0u8; vertex_count];
+    eprintln!(
+        "[HICC] ug_n={} tLen={}",
+        unitig_graph.unitigs.len(),
+        bubble_distance
+    );
 
     // Every live unitig becomes primary; `EvaluateLen` is the unitig's
     // `start` field, which is set to its read count.
@@ -2675,6 +2680,12 @@ pub fn hic_clean(read_graph: &mut Asg) {
         ) != 0
         {
             let end = buffer.sources[0];
+            eprintln!(
+                "[HICC] bub v={} end={} bn={}",
+                v,
+                end,
+                buffer.visited.len()
+            );
             for &node in &buffer.visited {
                 if node == v || node == end {
                     continue;
@@ -2764,6 +2775,10 @@ pub fn hic_clean(read_graph: &mut Asg) {
                 if alternative_unitigs > 2 {
                     continue;
                 }
+                eprintln!(
+                    "[HICC] pop u={} uocc={} vocc={} utgocc={}",
+                    u, alternative_reads, primary_reads, alternative_unitigs
+                );
                 // The reference ignores the return value here; the pop is
                 // recorded in the graph through `asg_bub_backtrack_primary`.
                 asg_bub_pop1_primary_trio(
@@ -2801,6 +2816,10 @@ pub fn hic_clean(read_graph: &mut Asg) {
         }
     }
 
+    eprintln!(
+        "[HICC] del_n={}",
+        read_graph.sequences.iter().filter(|s| s.deleted).count()
+    );
     read_graph.cleanup();
 }
 

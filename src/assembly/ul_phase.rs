@@ -387,6 +387,39 @@ fn extract_sub_cigar_err_impl(
         xk = i64::from(windows[wk as usize].x_start);
         ck = 0;
     }
+    if tot != 0 {
+        eprintln!(
+            "[ETOT] tot={} s={} e={} y_id={} x=[{},{}] p=[ts={},te={},sec={},rev={}] minw={} maxw={} curwid={}",
+            tot,
+            s,
+            e,
+            region.y_identifier,
+            region.x_position_start,
+            region.x_position_end,
+            p.ts,
+            p.te,
+            p.sec,
+            p.rev as u32,
+            min_w,
+            max_w,
+            wk
+        );
+        for w in min_w..=max_w.min(windows.len() as i64 - 1) {
+            let m = &windows[w as usize];
+            eprintln!(
+                "[ETOTW] w={} x=[{},{}] y=[{},{}] err={} clen={} ualn={} est={}",
+                w,
+                m.x_start,
+                m.x_end,
+                m.y_start,
+                m.y_end,
+                m.error,
+                m.cigar_length,
+                is_ualn_win(m) as i32,
+                is_est_aln(m) as i32
+            );
+        }
+    }
     assert_eq!(tot, 0);
     p.qn = wk as u32;
     p.qs = xk as u32;
@@ -519,7 +552,7 @@ fn gen_region_phase_robust_rr(
         }
         let _ = mn;
         for k in 0..mn {
-            let oid = ovlp_id(&c_idx[buf[k] as usize]) as usize;
+            let oid = ovlp_id(&c_idx[buf[k] as u32 as usize]) as usize;
             buf[k] = u64::from(buf[k] as u32);
             push_sec_aln_robust(slots, oid, s as i64, e as i64, 0);
         }
@@ -527,7 +560,7 @@ fn gen_region_phase_robust_rr(
             None => {
                 for k in mn..buf_n {
                     let err = ((buf[k] & 0x7fff_ffff_ffff_ffff) >> 32) as i64 - msc;
-                    let oid = ovlp_id(&c_idx[buf[k] as usize]) as usize;
+                    let oid = ovlp_id(&c_idx[buf[k] as u32 as usize]) as usize;
                     push_sec_aln_robust(slots, oid, s as i64, e as i64, err);
                 }
             }
@@ -606,6 +639,10 @@ pub fn rphase_rr(
         regions[k].alignment_length = 0;
         regions[k].overlap_length = u32::MAX;
         regions[k].non_homopolymer_errors = 0;
+        // The reference resets `align_length` here, which makes the secondary
+        // windows pushed by the previous pass invisible; the slot accumulates
+        // from scratch.
+        slots[k].clear();
         if zwn == 0 {
             continue;
         }
@@ -623,8 +660,8 @@ pub fn rphase_rr(
                 w[1] = i;
             } else {
                 if started {
-                    let mut q0 = q[0] + bd;
-                    let mut q1 = q[1] - bd;
+                    let q0 = q[0] + bd;
+                    let q1 = q[1] - bd;
                     if q1 >= q0 {
                         let mut m = (q0 as u64) << 1;
                         m <<= 32;
@@ -644,8 +681,6 @@ pub fn rphase_rr(
                             ..UlOv::default()
                         });
                     }
-                    let _ = &mut q0;
-                    let _ = &mut q1;
                 }
                 q[0] = i64::from(windows[i].x_start);
                 q[1] = i64::from(windows[i].x_end);
@@ -2345,6 +2380,10 @@ fn push_rphase(
                 last.cigar_start = is_pri as u32;
                 last.x_end = ze as i32;
             }
+        } else {
+            // If current is not primary: extend the last window.
+            let last = windows.last_mut().unwrap();
+            last.x_end = ze as i32;
         }
     } else if is_pri != 0 {
         if p_pri == 0 {
@@ -2528,6 +2567,42 @@ pub fn rphase_hl(
 ) {
     let on0 = regions.len();
     let mut active = 0usize;
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALL: AtomicU32 = AtomicU32::new(0);
+        let call = CALL.fetch_add(1, Ordering::Relaxed);
+        if call == 0 {
+            for (k, region) in regions.iter().enumerate() {
+                eprintln!(
+                    "[RHL] k={} y_id={} x=[{},{}] y=[{},{}] n={}",
+                    k,
+                    region.y_identifier,
+                    region.x_position_start,
+                    region.x_position_end,
+                    region.y_position_start,
+                    region.y_position_end,
+                    region.window_cigar.windows.len()
+                );
+                for (w, m) in region.window_cigar.windows.iter().enumerate() {
+                    eprintln!(
+                        "[RHLW] k={} w={} x=[{},{}] y=[{},{}] err={} clen={} ualn={} est={} eb={} ee={}",
+                        k,
+                        w,
+                        m.x_start,
+                        m.x_end,
+                        m.y_start,
+                        m.y_end,
+                        m.error,
+                        m.cigar_length,
+                        is_ualn_win(m) as i32,
+                        is_est_aln(m) as i32,
+                        m.extra_begin,
+                        m.extra_end
+                    );
+                }
+            }
+        }
+    }
     for k in 0..on0 {
         {
             let z = &mut regions[k];
@@ -2668,6 +2743,15 @@ pub fn rphase_hl(
         }
         windows.truncate(slots[k].len());
         z.x_strand = 0;
+        eprintln!(
+            "[RPH] k={} y_id={} ol={} zwn={} al={} n={}",
+            k,
+            z.y_identifier,
+            z.overlap_length,
+            zwn,
+            slots[k].len(),
+            windows.len()
+        );
         assert!(zwn <= u64::from(z.overlap_length));
         z.alignment_length = z.overlap_length - zwn as u32;
     }

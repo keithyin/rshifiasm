@@ -58,15 +58,40 @@ pub fn ul_realignment_gfa(
         }
     }
     crate::assembly::unitig::hic_clean(sg);
-    let _ = deep_clean;
+    // `if(deep_clean) deep_graph_clean(uopt, sg, 1, is_trio, asm_opt.max_short_tip,
+    // asm_opt.min_drop_rate, MIN(asm_opt.max_drop_rate, 0.7), 0.75, 1,
+    // asm_opt.clean_round, 10)`.
+    if deep_clean {
+        crate::assembly::ug_clean::deep_graph_clean(
+            options,
+            sg,
+            trio_flags,
+            sources,
+            reverse_sources,
+            read_to_unitig,
+            coverage_cut,
+            Some(&mut *bubble_labels),
+            true,
+            opts.is_trio,
+            i64::from(options.maximum_short_tip_read_count),
+            f64::from(options.minimum_drop_rate),
+            f64::from(options.maximum_drop_rate).min(0.7),
+            0.75,
+            1,
+            i64::from(options.cleaning_round_count),
+            10,
+        );
+    }
 
-    // `init_ug = ul_realignment(uopt, sg, 0, bin_file)`
+    // `init_ug = ul_realignment(uopt, sg, 0, bin_file)` — operates on the
+    // pipeline's global UL store (`UL_INF`).
     let mut init_ug = crate::assembly::ul_recall::ul_realignment(
         options,
         reads,
         sources,
         coverage_cut,
         sg,
+        ul_store,
         bin_file,
         0,
         options.minimizer_sample_distance,
@@ -241,7 +266,7 @@ pub fn gradually_renew_g(
         chemical_mask,
     );
     // `gen_ug_opt_t(..., (max_short_tip*2), 0.15, 3, 0.05, 0.9, ...)` then
-    // `ug_ext_gfa(uopt, *sg, ug_ext_len)`
+    // `ug_ext_gfa(uopt, *sg, ug_ext_len)` then `hic_clean_adv(*sg, uopt)`.
     crate::assembly::unitig::ug_ext_gfa(
         sg,
         sources,
@@ -252,7 +277,15 @@ pub fn gradually_renew_g(
         options.maximum_hang_rate,
         maximum_length,
     );
-    // `hic_clean_adv(*sg, uopt)` — not ported (see the module comment).
+    crate::assembly::ug_clean::hic_clean_adv(
+        options,
+        sg,
+        sources,
+        reverse_sources,
+        read_to_unitig,
+        coverage_cut,
+        Some(&mut *bubble_labels),
+    );
 
     for k in 1..ul_aln_round {
         let id = format!("{}{}", bin_file, k);
@@ -284,6 +317,15 @@ pub fn gradually_renew_g(
             options.minimum_overlap_length,
             options.maximum_hang_rate,
             maximum_length,
+        );
+        crate::assembly::ug_clean::hic_clean_adv(
+            options,
+            sg,
+            sources,
+            reverse_sources,
+            read_to_unitig,
+            coverage_cut,
+            Some(&mut *bubble_labels),
         );
     }
 }

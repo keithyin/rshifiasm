@@ -48,6 +48,7 @@ pub mod ulg_clean;
 pub mod ul_binning;
 pub mod ul_hybrid_ug;
 pub mod ul_hybrid_ext;
+pub mod ug_clean;
 pub mod ul_renew_driver;
 pub mod ul_integer;
 pub mod ul_load;

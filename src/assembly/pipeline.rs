@@ -369,10 +369,19 @@ pub fn build_string_graph_without_clean(
         options.maximum_hang_rate,
         UG_EXT_LEN,
     );
+    // `if(!ha_opt_triobin(&asm_opt)) hic_clean_adv(sg, &uopt)`.
+    if !options.trio_binning_requested() {
+        crate::assembly::ug_clean::hic_clean_adv(
+            options,
+            &mut graph,
+            &sources,
+            &reverse_sources,
+            &mut read_to_unitig,
+            &mut coverage_cut,
+            Some(&mut bubble_labels),
+        );
     }
-    // `hic_clean_adv(sg, &uopt)` follows here in the reference. It needs the
-    // Hi-C bubble-chain machinery that is not ported yet; the stage does not
-    // change the graph on the chr11-2M corpus (probe d19 == d20).
+    }
     probe::try_dump_stage(
         dump_directory.as_deref(),
         "d20_after_hic_clean",

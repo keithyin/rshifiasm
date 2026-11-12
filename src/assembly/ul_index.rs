@@ -1446,35 +1446,27 @@ mod tests {
 
 /// `gen_ul_idx` (`inter.cpp` 21261): the `ul_idx_t` of the renewal pass —
 /// containment, coverage track and read containment over the polished graph.
+///
+/// `unitig_graph` is the `ma_ug_t` (`uu->ug`); its arc `ou` fields are updated
+/// in place by `gen_r_contain`, matching the reference. `sg` is the string
+/// graph the containment tables are built against.
 pub fn gen_ul_idx(
     options: &AssemblyOptions,
-    unitigs: &[MaUtg],
+    unitig_graph: &mut crate::assembly::unitig::UnitigGraph,
     sg: &Asg,
     sources: &[Vec<PafHit>],
     read_lengths: &[u64],
 ) -> UlIndex {
     let ctx = IndexContext::new(options, read_lengths, sources);
-    let contain = ul_contain_gen(unitigs, sg, &ctx, true, false);
-    let coverage = gen_cov_track(unitigs, &contain, &ctx);
-    let (read_contain, cc) = gen_r_contain(
-        // `gen_r_contain` takes the mutable graph only to refresh its arc
-        // occurrence bookkeeping; the caller's graph is already labelled.
-        &mut crate::assembly::unitig::UnitigGraph {
-            unitigs: unitigs.to_vec(),
-            graph: sg.clone(),
-        },
-        sg,
-        &ctx,
-        read_lengths.len(),
-        false,
-        false,
-    );
-    let read_unitig = gen_r_ug_idx_with_contain(unitigs, &contain, read_lengths.len(), false);
+    // The reference passes `is_el = 0, is_del = 1` on the renewal pass.
+    let contain = ul_contain_gen(&unitig_graph.unitigs, sg, &ctx, false, true);
+    let coverage = gen_cov_track(&unitig_graph.unitigs, &contain, &ctx);
+    let n_read = read_lengths.len();
+    let (read_contain, cc) = gen_r_contain(unitig_graph, sg, &ctx, n_read, false, true);
+    let read_unitig = gen_r_ug_idx_with_contain(&unitig_graph.unitigs, &contain, n_read, false);
+    let unitig = unitig_graph.clone();
     UlIndex {
-        unitig: crate::assembly::unitig::UnitigGraph {
-            unitigs: unitigs.to_vec(),
-            graph: sg.clone(),
-        },
+        unitig,
         contain,
         coverage,
         read_contain,

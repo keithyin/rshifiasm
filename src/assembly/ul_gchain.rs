@@ -1033,7 +1033,7 @@ fn get_r_offset(g: &Asg, x: &MgLchain) -> (i64, i64, i64, i64) {
 }
 
 /// `cal_qext_coor` (`inter.cpp` 4779).
-fn cal_qext_coor(pr: i64, ar: i64, pq: i64, aq: i64, r_off: i64) -> i64 {
+pub(crate) fn cal_qext_coor(pr: i64, ar: i64, pq: i64, aq: i64, r_off: i64) -> i64 {
     let q_off;
     if r_off >= pr && r_off <= ar && ar >= pr && aq >= pq {
         q_off = pq

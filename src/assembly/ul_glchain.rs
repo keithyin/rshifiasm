@@ -1739,6 +1739,15 @@ fn comput_sc_partial_cigar(
     wi: &mut i64,
     werr: &mut i64,
 ) -> i64 {
+    if z.window_cigar.windows.is_empty()
+        && ol != 0
+        && i64::from(z.x_position_end + 1 - z.x_position_start) > ol
+    {
+        eprintln!(
+            "[EZERO] ol={} x=[{},{}]",
+            ol, z.x_position_start, z.x_position_end
+        );
+    }
     let mut k = *wi;
     let wn = z.window_cigar.windows.len() as i64;
     let mut err = *werr;
@@ -2200,11 +2209,29 @@ pub fn gl_chain_flter(
     let idx = ll_lo;
     introsort_overlaps_by_xe(&mut olist[..*ol_len]);
     regen_ul_ov_t_lst(&context.unitig_graph.unitigs, &olist[..*ol_len], idx);
+    for (z, region) in olist[..*ol_len].iter().enumerate() {
+        eprintln!(
+            "[RGN] z={} y_id={} x=[{},{}] q=[{},{}] t=[{},{}]",
+            z,
+            region.y_identifier,
+            region.x_position_start,
+            region.x_position_end,
+            idx[z].qs,
+            idx[z].qe,
+            idx[z].ts,
+            idx[z].te
+        );
+    }
     if idx.is_empty() {
         return 0;
     }
-    ll_srt.reserve(idx.len());
-    sps.reserve(idx.len());
+    // `kv_resize(uint64_t, ll->srt.a, idx->n)` / `kv_resize(*sps, ...)` /
+    // `kv_resize(ll->tk, ...)`: the score/track arrays are indexed directly,
+    // so their lengths must cover the chain count; `ll->tk` only needs the
+    // capacity — the DP writes it from index 0 (`ex[n_v++]`) while `n` stays 0.
+    ll_srt.resize(idx.len(), 0);
+    sps.resize(idx.len(), 0);
+    ll_tk.clear();
     ll_tk.reserve(idx.len());
     let mut ex = std::mem::take(ll_tk);
     let mut idx_scratch = std::mem::take(ll_srt);
@@ -2413,15 +2440,239 @@ pub fn ff_chain(
 /// `fill_unaligned_alignments` (`inter.cpp` 4944): the middle links of a
 /// chain get `qs = qe = -1` before `update_uovlp_chain_qse`; here the
 /// reference only fills them when the chain is longer than two.
-fn fill_unaligned_alignments(a: &mut [MgLchain], offset: i64) {
-    if a.len() > 2 {
-        let n = a.len() - 1;
-        for entry in a.iter_mut().take(n).skip(1) {
-            entry.qs = -1;
-            entry.qe = -1;
+/// `get_u_offset` (`inter.cpp` 4513): the chain entry's unitig-space and
+/// query-space spans within the chain, as `(rs, re, qs, qe)`.
+fn get_u_offset(unitigs: &[MaUtg], x: &MgLchain) -> (i64, i64, i64, i64) {
+    let qs = i64::from(x.qs);
+    let qe = i64::from(x.qe);
+    let unitig_length = i64::from(unitigs[(x.v >> 1) as usize].length);
+    if x.v & 1 == 0 {
+        (
+            i64::from(x.rs) + i64::from(x.off),
+            i64::from(x.re) + i64::from(x.off),
+            qs,
+            qe,
+        )
+    } else {
+        (
+            i64::from(x.off) + unitig_length - i64::from(x.re),
+            i64::from(x.off) + unitig_length - i64::from(x.rs),
+            qs,
+            qe,
+        )
+    }
+}
+
+/// `adjust_utg_chain_qoffset` (`inter.cpp` 4749).
+fn adjust_utg_chain_qoffset(
+    r_srt: &[u64; 4],
+    r_pos: &[i64; 4],
+    q_pos: &[i64; 4],
+    r_off: i64,
+) -> i64 {
+    if r_off < (r_srt[0] >> 32) as i64 {
+        return q_pos[(r_srt[0] & 0xFFFF_FFFF) as usize];
+    }
+    if r_off >= (r_srt[3] >> 32) as i64 {
+        return q_pos[(r_srt[3] & 0xFFFF_FFFF) as usize];
+    }
+    let mut k = 3usize;
+    for probe in 0..3 {
+        if r_off >= (r_srt[probe] >> 32) as i64 && r_off < (r_srt[probe + 1] >> 32) as i64 {
+            k = probe;
+            break;
         }
     }
-    let _ = offset;
+    if k >= 3 {
+        for probe in 0..3 {
+            if r_off >= (r_srt[probe] >> 32) as i64 && r_off <= (r_srt[probe + 1] >> 32) as i64 {
+                k = probe;
+                break;
+            }
+        }
+    }
+    assert!(k < 3);
+
+    let lo = (r_srt[k] & 0xFFFF_FFFF) as usize;
+    let hi = (r_srt[k + 1] & 0xFFFF_FFFF) as usize;
+    let qdis = q_pos[hi] - q_pos[lo];
+    let rdis = r_pos[hi] - r_pos[lo];
+    if qdis < 0 {
+        return -1;
+    }
+    q_pos[lo]
+        + i64::from(crate::assembly::ul::get_offset_adjust(
+            (r_off - r_pos[lo]) as u32,
+            rdis as u32,
+            qdis as u32,
+        ))
+}
+
+/// `update_uovlp_chain_qse` (`inter.cpp` 4792): fill the query spans of the
+/// unaligned entries between the anchors `[sidx, eidx]`.
+fn update_uovlp_chain_qse(
+    unitigs: &[MaUtg],
+    sidx: i64,
+    eidx: i64,
+    a: &mut [MgLchain],
+) {
+    if eidx - sidx <= 1 {
+        return;
+    }
+    let a_n = a.len() as i64;
+    assert!(sidx >= 0 && eidx <= a_n);
+
+    let (mut r_pos, mut q_pos) = if sidx >= 0 {
+        let (r0, r1, q0, q1) = get_u_offset(unitigs, &a[sidx as usize]);
+        ([r0, r1, 0, 0], [q0, q1, 0, 0])
+    } else {
+        let (r0, r1, q0, q1) = get_u_offset(unitigs, &a[0]);
+        ([r0, r1, 0, 0], [q0, q1, 0, 0])
+    };
+    if eidx < a_n {
+        let (r2, r3, q2, q3) = get_u_offset(unitigs, &a[eidx as usize]);
+        r_pos[2] = r2;
+        r_pos[3] = r3;
+        q_pos[2] = q2;
+        q_pos[3] = q3;
+    } else {
+        let (r2, r3, q2, q3) = get_u_offset(unitigs, &a[(a_n - 1) as usize]);
+        r_pos[2] = r2;
+        r_pos[3] = r3;
+        q_pos[2] = q2;
+        q_pos[3] = q3;
+    }
+    let mut prs = r_pos[0];
+    let mut pre = r_pos[1];
+    let ars = r_pos[2];
+    let are = r_pos[3];
+    let mut pqs = q_pos[0];
+    let mut pqe = q_pos[1];
+    let aqs = q_pos[2];
+    let aqe = q_pos[3];
+    assert!(q_pos[0] >= 0 && q_pos[1] >= 0 && q_pos[2] >= 0 && q_pos[3] >= 0);
+    let mut r_srt = [
+        (r_pos[0] as u64) << 32,
+        ((r_pos[1] as u64) << 32) + 1,
+        ((r_pos[2] as u64) << 32) + 2,
+        ((r_pos[3] as u64) << 32) + 3,
+    ];
+    radix_sort_u64(&mut r_srt);
+
+    let mut i = sidx + 1;
+    while i < eidx {
+        let (rs, re, _, _) = get_u_offset(unitigs, &a[i as usize]);
+        assert!(rs <= re);
+        a[i as usize].qs = adjust_utg_chain_qoffset(&r_srt, &r_pos, &q_pos, rs) as i32;
+        a[i as usize].qe = adjust_utg_chain_qoffset(&r_srt, &r_pos, &q_pos, re) as i32;
+        let mut fail_s = 1i32;
+        let mut fail_e = 1i32;
+        if i64::from(a[i as usize].qs) >= 0
+            && i64::from(a[i as usize].qs) >= pqs
+            && i64::from(a[i as usize].qs) <= aqs
+        {
+            fail_s = 0;
+        }
+        if i64::from(a[i as usize].qe) >= 0
+            && i64::from(a[i as usize].qe) >= pqe
+            && i64::from(a[i as usize].qe) <= aqe
+        {
+            fail_e = 0;
+        }
+        if a[i as usize].qs > a[i as usize].qe {
+            fail_s = 1;
+            fail_e = 1;
+        }
+
+        if fail_s != 0 || fail_e != 0 {
+            a[i as usize].qe = crate::assembly::ul_gchain::cal_qext_coor(
+                pre,
+                if i64::from(a[i as usize].qe) <= aqs { re } else { ars },
+                pqe,
+                if i64::from(a[i as usize].qe) <= aqs {
+                    i64::from(a[i as usize].qe)
+                } else {
+                    aqs
+                },
+                re,
+            ) as i32;
+            a[i as usize].qs = crate::assembly::ul_gchain::cal_qext_coor(
+                prs,
+                if i64::from(a[i as usize].qe) <= aqs { re } else { ars },
+                pqs,
+                if i64::from(a[i as usize].qe) <= aqs {
+                    i64::from(a[i as usize].qe)
+                } else {
+                    aqs
+                },
+                rs,
+            ) as i32;
+        }
+        assert!(
+            i64::from(a[i as usize].qs) >= pqs
+                && i64::from(a[i as usize].qs) <= aqs
+                && i64::from(a[i as usize].qe) >= pqe
+                && i64::from(a[i as usize].qe) <= aqe
+                && a[i as usize].qs <= a[i as usize].qe
+        );
+
+        if i + 1 < eidx {
+            q_pos[0] = i64::from(a[i as usize].qs);
+            q_pos[1] = i64::from(a[i as usize].qe);
+            r_pos[0] = rs;
+            r_pos[1] = re;
+            r_srt = [
+                (r_pos[0] as u64) << 32,
+                ((r_pos[1] as u64) << 32) + 1,
+                ((r_pos[2] as u64) << 32) + 2,
+                ((r_pos[3] as u64) << 32) + 3,
+            ];
+            radix_sort_u64(&mut r_srt);
+        }
+        prs = rs;
+        pre = re;
+        pqs = i64::from(a[i as usize].qs);
+        pqe = i64::from(a[i as usize].qe);
+        i += 1;
+    }
+}
+
+/// `fill_unaligned_alignments` (`inter.cpp` 4944): rebuild the chain-relative
+/// unitig offsets, re-link the entries and fill the unaligned query spans.
+fn fill_unaligned_alignments(
+    unitigs: &[MaUtg],
+    a: &mut [MgLchain],
+    offset: i64,
+) {
+    let a_n = a.len() as i64;
+    if a_n == 0 {
+        return;
+    }
+    let mut l = i64::from(unitigs[(a[0].v >> 1) as usize].length);
+    for k in 0..a_n as usize {
+        l -= i64::from(unitigs[(a[k].v >> 1) as usize].length);
+        if a[k].off < 0 {
+            a[k].qs = -1;
+            a[k].qe = -1;
+        }
+        a[k].off = l as i32;
+        a[k].hash_pre = u32::MAX;
+        if k > 0 {
+            a[k].hash_pre = (offset + k as i64 - 1) as u32;
+        }
+        l += i64::from(unitigs[(a[k].v >> 1) as usize].length) + i64::from(a[k].dist_pre);
+    }
+
+    let mut previous = -1i64;
+    for k in 0..=a_n {
+        if k == a_n || a[k as usize].qs >= 0 {
+            // a[k] and a[previous] are anchors
+            if k - previous > 1 {
+                update_uovlp_chain_qse(unitigs, previous, k, a);
+            }
+            previous = k;
+        }
+    }
 }
 
 /// `update_ul_vec_t_ug` (`inter.cpp` 4974): rewrites the read's block list
@@ -2437,7 +2688,7 @@ pub fn update_ul_vec_t_ug(
     let mut k = 0usize;
     while k < ucn {
         let cnt = uc[k].cnt as usize;
-        fill_unaligned_alignments(&mut uc[k + 1..k + 1 + cnt], (k + 1) as i64);
+        fill_unaligned_alignments(unitigs, &mut uc[k + 1..k + 1 + cnt], (k + 1) as i64);
         uc[k].hash_pre = u32::MAX;
         uc[k].off = -1;
         a_n += cnt;
@@ -2816,7 +3067,7 @@ pub fn ul_lalign(
     mm: &crate::assembly::ul_phase::EmaskTable,
     mk: &mut crate::assembly::ul_phase::MaskUlOv,
     slots: &mut crate::assembly::ul_phase::SecondaryWindows,
-) {
+) -> usize {
     if let Some(aln) = aln {
         if regions.len() <= 1 {
             if regions.len() == 1 {
@@ -2838,7 +3089,7 @@ pub fn ul_lalign(
                 z.overlap_length = z.alignment_length;
                 z.non_homopolymer_errors = 0;
             }
-            return;
+            return regions.len();
         }
         let ql = query.len() as i64;
         let mut iidx = std::mem::take(snp_srt);
@@ -2882,6 +3133,7 @@ pub fn ul_lalign(
         *snp_srt = iidx;
         *v_idx = buf;
         *stb = buf1;
+        regions.len()
     } else {
         let kept = crate::assembly::ul_rescall::ul_lalign_base(
             regions,
@@ -2894,6 +3146,6 @@ pub fn ul_lalign(
             wl,
             query.len() as i64,
         );
-        let _ = kept;
+        kept
     }
 }
