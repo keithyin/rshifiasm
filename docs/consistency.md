@@ -3255,6 +3255,32 @@ renew_ng/gen_raw_ug_seq 九大块已移植并提交（ee59902..a5edf0f 十一个
 6. `ul_realignment_gfa` 组装 + `realloc_rdb_adv` + 接线 pipeline.rs。
 7. U7 解锁 + e2e。
 
+## U6 续十一（2026-11-12 第十二轮，u2g_threading 落地）
+
+- `99f3772` usg_arc_cut_srt_length + usg_naive_topocut_aux_sec。
+- `b1a8452` merge_unitig_content + merge_hybrid_utg_content。
+- `7b9095b` renew_u2g_bg（bridge 图 + worker 占用 + ou 正确性标注；
+  `UlCov`/`UlBg` 结构）。
+- `53c915b` clc_contain + renew_u2g_cov（UlCov 表 + iug_a/iug_idx/iug_b
+  CSR 构建——`gen_raw_ug_seq` 消费者）。
+- `bdd1bfb` u2g_threading + renew_ul2_utg（h_usg 构建：raw usg 副本、
+  worker_update_ul_arc_drop 等价物、tm=min(tt-tl,tl) 覆盖 ou、
+  is_bridg 补桥弧、usg_cleanup）。`Ul2ulIdx` 增加 `cov: UlCov` 字段。
+- `06e99eb` ma_ug_hybrid_gen + merge_unitig_content/hybrid。
+
+**U6-3 剩余（精确）**：
+1. `u2g_clean` 主体（16281 ✅已读）：需要 ulg 版清理函数——
+   get_ul_path_info/get_remove_hifi_occ/get_ul_arc_supports/
+   check_ul_contain_arc_supports/check_ulg_to_del/ulg_arc_cut_supports/
+   ulg_arc_cut_tips/ulg_pop_bubble/ulg_bub_pop1 簇/ulg_arc_cut_z/
+   ul_occ_check/ul_homo_path_check/idx_check_rate/is_het_bridge/
+   gen_ug_integer_seq_on_fly/get_integer_seq_ovlps（**全部 C 已读 ✅**，
+   上一轮草稿已删需忠实移植）。
+2. `u2g_hybrid_clean`(15967 ✅) + `u2g_hybrid_detan_iter`(15332 ✅)
+   → 依赖 `ug_ext_strict`(14410)/`ug_ext_free`(14368)（**未读**）。
+3. `ul_realignment_gfa`(17598 ✅) 组装 + `realloc_rdb_adv`(✅)。
+4. pipeline.rs 接线 + U7 解锁 + e2e 门禁。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
