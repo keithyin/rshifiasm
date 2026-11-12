@@ -1343,6 +1343,35 @@ pub struct UlCov {
     /// removed word).
     pub iug_idx: Vec<u64>,
     pub iug_b: Vec<u64>,
+    /// `raw->g->seq[id].len` per raw unitig (the deletion measure reads it).
+    pub raw_lens: Vec<u64>,
+}
+
+impl UlCov {
+    /// The raw unitig length (`raw->g->seq[id].len`).
+    pub fn raw_len(&self, id: usize) -> u64 {
+        self.raw_lens.get(id).copied().unwrap_or(0)
+    }
+    /// `get_bg_flag` (`gfa_ut.cpp` 8621).
+    pub fn get_bg_flag_pub(&self, bg: &crate::assembly::asg::Asg, v: u32, w: u32) -> u32 {
+        if bg.sequences[(v >> 1) as usize].deleted || bg.sequences[(w >> 1) as usize].deleted {
+            return crate::assembly::ulg_clean::BG_UNAVAILABLE;
+        }
+        for arc in bg.arcs_of(v) {
+            if arc.v == w {
+                return match arc.occurrence {
+                    3 => crate::assembly::ulg_clean::BG_CORRECT,
+                    2 => crate::assembly::ulg_clean::BG_WRONG,
+                    _ => crate::assembly::ulg_clean::BG_AMBIGUOUS,
+                };
+            }
+        }
+        crate::assembly::ulg_clean::BG_UNAVAILABLE
+    }
+    /// `get_ul_occ` (`gfa_ut.cpp` 8036).
+    pub fn get_ul_occ(&self, id: usize) -> u64 {
+        u64::from(self.uc[id])
+    }
 }
 
 /// The `ul_bg_t` bridge table (`gfa_ut.cpp` 16653): the raw-read-level

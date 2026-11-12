@@ -2,7 +2,37 @@
 //! 10519-11150 + 15332 + 15616-16050): tip cuts, bubble identification and
 //! the bridge marking over the hybrid UL/unitig graph (`usg_t`).
 
+use crate::assembly::asg::Asg;
+use crate::assembly::bubble_chain::BubbleType;
 use crate::assembly::ul2ul::{Usg, UsgArc};
+use crate::container::ksort::radix_sort_u64;
+
+/// `bg_*` flags (`gfa_ut.cpp` 8617-8620).
+pub const BG_UNAVAILABLE: u32 = u32::MAX;
+pub const BG_CORRECT: u32 = 1;
+pub const BG_WRONG: u32 = 2;
+pub const BG_AMBIGUOUS: u32 = 3;
+
+/// `get_arcs` (`gfa_ut.cpp` 463): the live out-degree, optionally recording
+/// the arc indices.
+pub fn get_arcs(g: &Asg, v: u32, idx: Option<&mut Vec<usize>>, idx_n: usize) -> usize {
+    let arcs = g.arcs_of(v);
+    let mut kv = 0usize;
+    if let Some(list) = idx {
+        for (i, arc) in arcs.iter().enumerate() {
+            if arc.deleted {
+                continue;
+            }
+            if kv < idx_n {
+                list.push(i);
+            }
+            kv += 1;
+        }
+    } else {
+        kv = arcs.iter().filter(|a| !a.deleted).count();
+    }
+    kv
+}
 
 /// `usg_end` (`gfa_ut.cpp` 10698).
 fn usg_end(g: &Usg, v: u32, lw: Option<&mut u64>) -> i32 {
@@ -1025,4 +1055,305 @@ pub fn usg_naive_topocut_aux_sec(g: &Usg, v0: u32, max_ext: i32) -> i32 {
         return n_ext;
     }
     max_ext
+}
+
+/// `get_ul_path_info` (`gfa_ut.cpp` 9004): walks the linear path from `s`,
+/// returning the terminal kind; records the visited vertices and the
+/// UL/bridge occupancies.
+#[allow(clippy::too_many_arguments)]
+pub fn get_ul_path_info(
+    g: &Asg,
+    cov: &crate::assembly::ul2ul::UlCov,
+    bg: Option<&crate::assembly::ul2ul::UlBg>,
+    s: u32,
+    mut e: Option<&mut u32>,
+    mut occ: Option<&mut u32>,
+    mut ul_cnt: Option<&mut u32>,
+    mut bridge_w: Option<&mut u32>,
+    mut bridge_am: Option<&mut u32>,
+    b: &mut Vec<u64>,
+) -> u32 {
+    let mut v = s;
+    let mut uv = u32::MAX;
+    if let Some(out) = occ.as_deref_mut() {
+        *out = 0;
+    }
+    if let Some(out) = ul_cnt.as_deref_mut() {
+        *out = 0;
+    }
+    if let Some(out) = bridge_w.as_deref_mut() {
+        *out = 0;
+    }
+    if let Some(out) = bridge_am.as_deref_mut() {
+        *out = 0;
+    }
+    loop {
+        if let Some(out) = occ.as_deref_mut() {
+            *out += 1;
+        }
+        let mut arc_idx: Vec<usize> = Vec::new();
+        let kv = get_arcs(g, v, Some(&mut arc_idx), 1);
+        if let Some(out) = e.as_deref_mut() {
+            *out = v;
+        }
+        b.push(u64::from(v));
+        if let Some(out) = ul_cnt.as_deref_mut() {
+            *out += cov.uc[(v >> 1) as usize];
+        }
+        if bridge_w.as_deref_mut().is_some() || bridge_am.as_deref_mut().is_some() {
+            let uw = v;
+            if let Some(out) = bridge_w.as_deref_mut() {
+                *out += bg.map_or(0, |t| t.w_n.get((v >> 1) as usize).copied().unwrap_or(0));
+            }
+            if let Some(out) = bridge_am.as_deref_mut() {
+                *out += bg.map_or(0, |t| t.a_n.get((v >> 1) as usize).copied().unwrap_or(0));
+            }
+            if uv != u32::MAX {
+                if let Some(t) = bg {
+                    // The reference compares the two boundary raw vertices of
+                    // the previous and current integer unitigs through
+                    // `cc.iug_a`; the bridge table stores the flag on the
+                    // same pair.
+                    let l = cov.get_bg_flag_pub(&t.bg, uv, uw);
+                    if l == BG_WRONG {
+                        if let Some(out) = bridge_w.as_deref_mut() {
+                            *out += 1;
+                        }
+                    }
+                    if l == BG_AMBIGUOUS {
+                        if let Some(out) = bridge_am.as_deref_mut() {
+                            *out += 1;
+                        }
+                    }
+                }
+            }
+            uv = uw;
+        }
+        if kv == 0 {
+            return u32::from(crate::assembly::gfa_clean::END_TIPS);
+        }
+        if kv == 2 {
+            return 2; // TWO_OUTPUT
+        }
+        if kv > 2 {
+            return 4; // MUL_OUTPUT
+        }
+        let w = g.arcs_of(v)[arc_idx[0]].v;
+        let kw = get_arcs(g, w ^ 1, None, 1);
+        v = w;
+        if kw == 2 {
+            return 1; // TWO_INPUT
+        }
+        if kw > 2 {
+            return 3; // MUL_INPUT
+        }
+        if v == s {
+            return u32::from(crate::assembly::gfa_clean::LOOP);
+        }
+    }
+}
+
+/// `is_het_bridge` (`gfa_ut.cpp` 9554): whether the boundary node at
+/// `match_bound` sits inside a het region.
+pub fn is_het_bridge(bub: &BubbleType, p_a: &[u64], match_bound: i64) -> bool {
+    let mut z = match_bound;
+    while z >= 0 && crate::assembly::ul_renew_gfa::if_hom((p_a[z as usize] >> 1) as u32, bub) {
+        z -= 1;
+    }
+    if z < 0 {
+        return false;
+    }
+    let mut z = match_bound + 1;
+    while (z as usize) < p_a.len()
+        && crate::assembly::ul_renew_gfa::if_hom((p_a[z as usize] >> 1) as u32, bub)
+    {
+        z += 1;
+    }
+    (z as usize) < p_a.len()
+}
+
+/// `idx_check_rate` (`gfa_ut.cpp` 10228): the sliding-window match-rate
+/// check of the ordered positions.
+pub fn idx_check_rate(a: &[u64], tot: u64, winlen: u64, match_rate: f32) -> bool {
+    if a.is_empty() {
+        return false;
+    }
+    let mut winlen = winlen;
+    if tot < winlen {
+        winlen = tot;
+    }
+    let mut s = 0u32;
+    let mut e = winlen as u32;
+    let mut k = 0usize;
+    while k < a.len() {
+        debug_assert_ne!(a[k], u64::MAX);
+        if (a[k] as u32) >= s && (a[k] as u32) < e {
+            k += 1;
+            continue;
+        }
+        break;
+    }
+    let mut p = k as i64;
+    if p > 0 && p >= (winlen as f32 * match_rate) as i64 {
+        return true;
+    }
+    let mut ks = 0usize;
+    while k < a.len() {
+        debug_assert_ne!(a[k], u64::MAX);
+        e = (a[k] as u32) + 1;
+        p += 1;
+        while ks < k {
+            if i64::from(e) - i64::from(a[ks] as u32) <= i64::from(winlen as u32) {
+                break;
+            }
+            p -= 1;
+            ks += 1;
+        }
+        debug_assert!(p >= 0);
+        if p > 0 && p >= (winlen as f32 * match_rate) as i64 {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+/// `get_remove_hifi_occ` (`gfa_ut.cpp` 8499): masks the raw-read words of
+/// the candidate vertices in the CSR and reports whether the deleted span
+/// exceeds `thres`; `del_occ` carries the deleted base count.
+pub fn get_remove_hifi_occ(
+    cov: &mut crate::assembly::ul2ul::UlCov,
+    thres: u64,
+    v_a: &[u64],
+    ub: &mut Vec<u64>,
+    del_occ: Option<&mut u32>,
+) -> bool {
+    let mut del_n: u64 = 0;
+    let mut buf: Vec<u64> = Vec::new();
+    let mut fn_count = 0usize;
+    let mut dup_raw = false;
+    for &vk in v_a {
+        let iu = cov.iug_a[(vk >> 1) as usize].clone();
+        for (z, item) in iu.iter().enumerate() {
+            let raw_id = (item.v >> 1) as usize;
+            let start = cov.iug_idx[raw_id] as usize;
+            let end = cov.iug_idx[raw_id + 1] as usize;
+            let mut keep_ns = [0u32; 2];
+            let pn = buf.len();
+            let mut n_mask = 0usize;
+            for m in start..end {
+                let word = cov.iug_b[m];
+                let iug_id = ((word << 1) >> 33) as usize;
+                let iug_off = (word & 0x7fff_ffff) as usize;
+                if (word >> 63) != 0 {
+                    n_mask += 1;
+                    continue;
+                }
+                if iug_id == (vk >> 1) as usize && iug_off == z {
+                    cov.iug_b[m] |= 0x8000_0000_0000_0000;
+                    buf.push((u64::MAX << 32) | m as u64);
+                } else {
+                    let entry = &cov.iug_a[iug_id][iug_off];
+                    if entry.v & 1 == 0 {
+                        keep_ns[0] = keep_ns[0].max(entry.n);
+                    } else {
+                        keep_ns[1] = keep_ns[1].max(entry.n);
+                    }
+                }
+            }
+            debug_assert_eq!(buf.len(), pn + 1);
+            let raw_len = cov.raw_len(raw_id);
+            if keep_ns[0] as u64 + keep_ns[1] as u64 >= raw_len {
+                keep_ns[0] = raw_len as u32;
+                keep_ns[1] = raw_len as u32;
+            }
+            let is = keep_ns[0] as u64;
+            let ie = raw_len - keep_ns[1] as u64;
+            if ie > is {
+                let (ms, me) = if item.v & 1 == 0 {
+                    (0u64, iu.len() as u64)
+                } else {
+                    (raw_len - iu.len() as u64, raw_len)
+                };
+                if is.max(ms) < ie.min(me) {
+                    del_n += (ie.min(me) - is.max(ms)) as u64;
+                    buf[pn] = ((buf[pn] << 32) >> 32) | (raw_id as u64) << 32;
+                    fn_count += 1;
+                    if n_mask > 0 {
+                        dup_raw = true;
+                    }
+                }
+            }
+        }
+    }
+    if del_n > thres && dup_raw {
+        radix_sort_u64(&mut buf);
+        del_n = 0;
+        let mut l = 0usize;
+        let mut k = 1usize;
+        while k <= fn_count {
+            if k == fn_count || (buf[k] >> 32) != (buf[l] >> 32) {
+                let raw_id = (buf[l] >> 32) as usize;
+                let start = cov.iug_idx[raw_id] as usize;
+                let end = cov.iug_idx[raw_id + 1] as usize;
+                let mut del_ns = [0u32; 2];
+                let mut keep_ns = [0u32; 2];
+                for m in start..end {
+                    let word = cov.iug_b[m];
+                    let iug_id = ((word << 1) >> 33) as usize;
+                    let iug_off = (word & 0x7fff_ffff) as usize;
+                    let entry = &cov.iug_a[iug_id][iug_off];
+                    if (word >> 63) != 0 {
+                        if entry.v & 1 == 0 {
+                            del_ns[0] = del_ns[0].max(entry.n);
+                        } else {
+                            del_ns[1] = del_ns[1].max(entry.n);
+                        }
+                    } else if entry.v & 1 == 0 {
+                        keep_ns[0] = keep_ns[0].max(entry.n);
+                    } else {
+                        keep_ns[1] = keep_ns[1].max(entry.n);
+                    }
+                }
+                debug_assert!(del_ns[0] + del_ns[1] > 0);
+                let raw_len = cov.raw_len(raw_id);
+                if keep_ns[0] as u64 + keep_ns[1] as u64 >= raw_len {
+                    keep_ns[0] = raw_len as u32;
+                    keep_ns[1] = raw_len as u32;
+                }
+                let is = keep_ns[0] as u64;
+                let ie = raw_len - keep_ns[1] as u64;
+                if ie > is {
+                    if del_ns[0] as u64 + del_ns[1] as u64 >= raw_len {
+                        del_n += ie - is;
+                    } else {
+                        let mut ms = 0u64;
+                        let me = del_ns[0] as u64;
+                        if ms < me && is.max(ms) < ie.min(me) {
+                            del_n += (ie.min(me) - is.max(ms)) as u64;
+                        }
+                        ms = raw_len - del_ns[1] as u64;
+                        let me = raw_len;
+                        if ms < me && is.max(ms) < ie.min(me) {
+                            del_n += (ie.min(me) - is.max(ms)) as u64;
+                        }
+                    }
+                }
+                if del_n > thres {
+                    break;
+                }
+                l = k;
+            }
+            k += 1;
+        }
+    }
+    for &word in &buf {
+        cov.iug_b[(word & 0xffff_ffff) as usize] <<= 1;
+        cov.iug_b[(word & 0xffff_ffff) as usize] >>= 1;
+    }
+    if let Some(out) = del_occ {
+        *out = del_n as u32;
+    }
+    ub.clear();
+    del_n > thres
 }
