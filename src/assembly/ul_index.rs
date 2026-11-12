@@ -88,6 +88,10 @@ pub struct UlIndex {
     pub coverage: UCov,
     pub read_contain: UCov,
     pub read_unitig: UtgRid,
+    /// The `ma_hit_t::cc` counters `gen_r_contain` left on the sources,
+    /// parallel to them; the rescall chaining reads them through
+    /// `get_ecov_adv`/`get_ug_edge_src`.
+    pub cc: Vec<Vec<u32>>,
 }
 
 /// The reference threads these values through every helper as `ug_opt_t` plus
@@ -335,7 +339,7 @@ fn gen_r_contain(
     n_read: usize,
     is_el: bool,
     is_del: bool,
-) -> UCov {
+) -> (UCov, Vec<Vec<u32>>) {
     let mut coverage = UCov {
         idx: vec![0u32; n_read + 1],
         interval: Vec::new(),
@@ -394,7 +398,7 @@ fn gen_r_contain(
     }
 
     update_ug_uo_t(&mut unitig.graph, &unitig.unitigs, rg, ctx, &cc);
-    coverage
+    (coverage, cc)
 }
 
 /// `update_gen_r_contain` with `is_src_cc == 1` (`inter.cpp` 21049).
@@ -938,7 +942,7 @@ pub fn dedup_hi_fis(
 
     let contain = ul_contain_gen(&unitig.unitigs, &rg, &ctx, is_el, is_del);
     let coverage = gen_cov_track(&unitig.unitigs, &contain, &ctx);
-    let read_contain = gen_r_contain(&mut unitig, &rg, &ctx, n_read, is_el, is_del);
+    let (read_contain, cc) = gen_r_contain(&mut unitig, &rg, &ctx, n_read, is_el, is_del);
     let read_unitig = gen_r_ug_idx_with_contain(&unitig.unitigs, &contain, n_read, false);
 
     eprintln!(
@@ -954,6 +958,7 @@ pub fn dedup_hi_fis(
         coverage,
         read_contain,
         read_unitig,
+        cc,
     }
 }
 
@@ -1141,7 +1146,7 @@ pub fn gen_ul_index_t(
     let ctx = IndexContext::new(options, &reads.read_lengths, sources);
     let contain = ul_contain_gen(&unitig.unitigs, sg, &ctx, is_el, is_del);
     let coverage = gen_cov_track(&unitig.unitigs, &contain, &ctx);
-    let read_contain = gen_r_contain(
+    let (read_contain, _cc_unused) = gen_r_contain(
         &mut unitig,
         sg,
         &ctx,
@@ -1157,6 +1162,7 @@ pub fn gen_ul_index_t(
         coverage,
         read_contain,
         read_unitig,
+        cc: Vec::new(),
     }
 }
 

@@ -845,7 +845,7 @@ fn gl_chain_graph(
 /// `select_max_gchain` (`inter.cpp` 6310): filters overlapping chains and
 /// materialises the survivors via `gen_gchain_track`.
 #[allow(clippy::too_many_arguments)]
-fn select_max_gchain(
+pub(crate) fn select_max_gchain(
     g: &Asg,
     idx: &[u64],
     e: &[MgLchain],

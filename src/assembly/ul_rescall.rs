@@ -42,6 +42,8 @@ pub const N_GCHAIN_RATE: f64 = 0.04;
 pub struct UlRescallContext<'a> {
     pub unitig_graph: &'a UnitigGraph,
     pub sources: &'a [Vec<PafHit>],
+    /// The `ma_hit_t::cc` counters parallel to `sources`.
+    pub cc: &'a [Vec<u32>],
     pub reads: &'a ReadStore,
     pub maximum_hang: i32,
     pub maximum_hang_rate: f32,

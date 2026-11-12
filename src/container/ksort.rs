@@ -178,6 +178,100 @@ pub fn radix_sort_u64(values: &mut [u64]) {
     radix_sort_by_key(values, &|value: &u64| *value);
 }
 
+/// `KRADIX_SORT_INIT(.., int64_t, generic_key, 8)`: the key shifts are
+/// arithmetic, so negative keys land in the high buckets.
+pub fn radix_sort_i64(values: &mut [i64]) {
+    radix_sort_by_key_i64(values, &|value: &i64| *value);
+}
+
+/// MSD radix sort over an arbitrary type, keyed by a signed 64-bit `key`.
+pub fn radix_sort_by_key_i64<T, F>(values: &mut [T], key: &F)
+where
+    T: Copy,
+    F: Fn(&T) -> i64,
+{
+    if values.len() <= RADIX_INSERTION_THRESHOLD {
+        radix_insertion_sort_i64(values, key);
+        return;
+    }
+    radix_sort_recursive_i64(values, key, 8, 56);
+}
+
+fn radix_insertion_sort_i64<T, F>(values: &mut [T], key: &F)
+where
+    T: Copy,
+    F: Fn(&T) -> i64,
+{
+    for index in 1..values.len() {
+        let current = values[index];
+        if key(&current) < key(&values[index - 1]) {
+            let mut position = index;
+            while position > 0 && key(&current) < key(&values[position - 1]) {
+                values[position] = values[position - 1];
+                position -= 1;
+            }
+            values[position] = current;
+        }
+    }
+}
+
+fn radix_sort_recursive_i64<T, F>(values: &mut [T], key: &F, bits_per_pass: u32, shift: u32)
+where
+    T: Copy,
+    F: Fn(&T) -> i64,
+{
+    let bucket_total = 1usize << bits_per_pass;
+    let mask = (bucket_total - 1) as i64;
+
+    let mut bucket_starts = vec![0usize; bucket_total];
+    let mut bucket_ends = vec![0usize; bucket_total];
+
+    for value in values.iter() {
+        let bucket = (((key(value) >> shift) & mask) as i64) as usize;
+        bucket_ends[bucket] += 1;
+    }
+    let mut running = 0usize;
+    for bucket in 0..bucket_total {
+        bucket_starts[bucket] = running;
+        running += bucket_ends[bucket];
+        bucket_ends[bucket] = running;
+    }
+
+    let mut cursor = bucket_starts.clone();
+    for bucket in 0..bucket_total {
+        while cursor[bucket] != bucket_ends[bucket] {
+            let position = cursor[bucket];
+            let mut carried = values[position];
+            let mut target_bucket = (((key(&carried) >> shift) & mask) as i64) as usize;
+            while target_bucket != bucket {
+                let target_position = cursor[target_bucket];
+                let displaced = values[target_position];
+                values[target_position] = carried;
+                cursor[target_bucket] += 1;
+                carried = displaced;
+                target_bucket = (((key(&carried) >> shift) & mask) as i64) as usize;
+            }
+            values[position] = carried;
+            cursor[bucket] += 1;
+        }
+    }
+
+    if shift == 0 {
+        return;
+    }
+
+    let next_shift = shift.saturating_sub(bits_per_pass);
+    for bucket in 0..bucket_total {
+        let start = bucket_starts[bucket];
+        let end = bucket_ends[bucket];
+        if end - start > RADIX_INSERTION_THRESHOLD {
+            radix_sort_recursive_i64(&mut values[start..end], key, bits_per_pass, next_shift);
+        } else if end - start > 1 {
+            radix_insertion_sort_i64(&mut values[start..end], key);
+        }
+    }
+}
+
 /// MSD radix sort over an arbitrary type, keyed by a 64-bit `key`.
 pub fn radix_sort_by_key<T, F>(values: &mut [T], key: &F)
 where

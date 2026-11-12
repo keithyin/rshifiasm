@@ -18,11 +18,11 @@ const G_CHAIN_BW: i64 = 16;
 /// `N_GCHAIN_RATE` (`inter.cpp`).
 const N_GCHAIN_RATE: f64 = 0.04;
 /// `UG_SKIP_N` / `UG_ITER_N` / `UG_DIS_N` (`inter.cpp` 18830).
-const UG_SKIP_N: i64 = 100;
-const UG_ITER_N: i64 = 5000;
-const UG_DIS_N: i64 = 50000;
+pub const UG_SKIP_N: i64 = 100;
+pub const UG_ITER_N: i64 = 5000;
+pub const UG_DIS_N: i64 = 50000;
 /// `UG_SKIP_GRAPH_N` (`inter.cpp`).
-const UG_SKIP_GRAPH_N: i64 = 72;
+pub const UG_SKIP_GRAPH_N: i64 = 72;
 
 /// `ul_ov_t` (`Overlaps.h` 58): one unitig alignment of a query read/contig.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

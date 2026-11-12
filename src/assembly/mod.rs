@@ -43,6 +43,7 @@ pub mod ul_renew;
 pub mod ul_load;
 pub mod ul_store;
 pub mod ul_src;
+pub mod ul_glchain;
 pub mod ul_graph;
 pub mod ul_rescall;
 pub mod dual_scaf;

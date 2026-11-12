@@ -13,7 +13,7 @@ use std::path::Path;
 
 use crate::assembly::asg::AsgArc;
 use crate::assembly::hit::ma_hit_to_arc;
-use crate::assembly::ul::{UcBlock, UlOv};
+pub use crate::assembly::ul::{UcBlock, UlOv};
 use crate::overlap::paf::PafHit;
 use crate::correction::rphase::SEC_MODE;
 
