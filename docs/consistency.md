@@ -3212,6 +3212,49 @@ U1-U5 已有门禁；U6 的 phase/gl_chain/mask/binning/rescall/ul2ul/
 renew_ng/gen_raw_ug_seq 九大块已移植并提交（ee59902..a5edf0f 十一个
 提交）；每块的 C 行号与语义陷阱均在上述各「续N」节。
 
+## U6 续十（2026-11-12 第十一轮，ulg/usg 清理簇落地）
+
+- `4d1c0e0` **`ulg_clean.rs`**：usg 清理簇——`usg_end`、`usg_arc_occ`、
+  `get_usg_arc`、`usg_seq_del`、`usg_tip_del`、`usg_tip_detect`、
+  `usg_naive_topocut_aux`、`usg_arc_cut_tips`（ul 占用累计 + telo 检查 +
+  `usg_real_tip` 0.75 占比）、`usg_bub_clean0`（extracr_clean_arc 的
+  ou 双桶判定 + km_ol/len_rat 门 + topo 三分支）、`usg_bub_clean`
+  （`usg_bub_dis` + `usg_bub_identify` 的单 sink 气泡走 + is_first 时
+  l=0 的参考怪癖 + bs 标记）、`usg_cleanup`（arc 压缩排序）、
+  `usg_arc_cut_srt_length`（长度序弱弧剪切 + 双端 topocut 复核）、
+  `usg_naive_topocut_aux_sec`（双向遍历 + tip[2] 判定）。
+- `06e99eb` **`ul_hybrid_ug.rs`**：`ma_ug_hybrid_gen`（双向 arc 走 +
+  circ 分支 + mark 数组 + 弧重建 `u = mark[(arc.ul>>32)^1]^1`、
+  `l = len-ol` 截 1）。
+
+**下一批（U6-3 剩余）**：
+1. `renew_u2g_cov` Rust 版（gen_raw_ug_seq 已有；worker + CSR 构建
+   iug_a/iug_idx/iug_b——C 已全读 ✅）+ `clc_contain`。
+2. `renew_u2g_bg`（C 已全读 ✅：per-raw-read bridge 弧 + ou 标注）。
+3. `u2g_threading`（C 已全读 ✅：raw usg 副本 + 每个 iug unitig 走
+   worker_update_ul_arc_drop 找不可靠弧 + ou 覆盖计数 + is_bridg 补桥）。
+   依赖 `renew_ul2_utg`（= renew_utg + renew_u2g_cov + renew_u2g_bg）。
+4. `u2g_clean` 主体（C 已全读 ✅：三轮 supports+tips → pop_bubble →
+   cut_z → 第二遍 ss → u2g_threading）；**ulg 版清理函数**
+   （ulg_arc_cut_supports 9757 ✅已读、ulg_arc_cut_tips 8673 ✅、
+   ulg_pop_bubble 10084 ✅、ulg_arc_cut_z 10337 ✅、get_ul_arc_supports
+   9577 ✅、get_ul_path_info 9004 ✅、get_remove_hifi_occ 8499 ✅、
+   gen_ug_integer_seq_on_fly 9203 ✅、get_integer_seq_ovlps 9301 ✅、
+   is_het_bridge 9554 ✅、ul_occ_check 10211 ✅、ul_homo_path_check
+   10247 ✅、idx_check_rate 10228 ✅、check_ulg_to_del 9735 ✅、
+   get_bridges 8636 ✅、ulg_seq_del 8656 ✅、get_bg_flag 8621 ✅）。
+   **注意**：上一轮曾写出带占位实现的 ulg_clean.rs 草稿并已删除——
+   ulg 版函数需全新忠实移植（worker_update_ul_arc_supports/get_bridges
+   的 bg 桥表、get_remove_hifi_occ 的双轮 CSR 掩码）。
+5. `u2g_hybrid_clean`（15967 ✅已读：usg_arc_cut_tips + 2 轮
+   [bub_clean + srt_length + tips] × clean_round + detan_iter）+
+   `u2g_hybrid_detan_iter`(15332 ✅) → 依赖 `ug_ext_strict`(14410)/
+   `ug_ext_free`(14368)（**未读**）+ `renew_usg_t_bub`(13928 ✅已读，
+   需 ma_ug_hybrid_gen ✅ + merge_hybrid_utg_content ✅已读 +
+   identify_bubbles_recal(recal_poy) 已有)。
+6. `ul_realignment_gfa` 组装 + `realloc_rdb_adv` + 接线 pipeline.rs。
+7. U7 解锁 + e2e。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
