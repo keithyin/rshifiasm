@@ -116,6 +116,11 @@ fn encode_base(dest: &mut [u8], src: &[u8], n_site: &mut Vec<u32>, offset: u32) 
     }
 }
 
+/// `ha_encode_base` with `offset = 0`, the `write_compress_base_disk` form.
+pub fn encode_base_public(dest: &mut [u8], src: &[u8], n_site: &mut Vec<u32>) {
+    encode_base(dest, src, n_site, 0);
+}
+
 /// The parameters [`append_ul_t`] reads from `ug_opt_t` and `All_reads`.
 pub struct AppendParameters<'a> {
     /// `uopt->sources`.

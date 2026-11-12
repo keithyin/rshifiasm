@@ -87,6 +87,19 @@ pub fn ul_map_lchain(
     parameters: &UlAlignParameters,
     filter_table: Option<&crate::counting::filter_table::KmerFilterTable>,
 ) -> UlMapResult {
+    ul_map_lchain_khit(query, index, targets, parameters, filter_table, 3)
+}
+
+/// `ul_map_lchain` with an explicit `mcopy_khit_cut` (the scall worker passes
+/// 3, the rescall worker 1).
+pub fn ul_map_lchain_khit(
+    query: &[u8],
+    index: &PositionIndex,
+    targets: &TargetSource<'_>,
+    parameters: &UlAlignParameters,
+    filter_table: Option<&crate::counting::filter_table::KmerFilterTable>,
+    copy_kmer_cutoff: u32,
+) -> UlMapResult {
     let minimizers = sketch(
         query,
         parameters.minimizer_window as i32,
@@ -139,7 +152,7 @@ pub fn ul_map_lchain(
         copy_number: 1,
         copy_rate: 0.2,
         chain_cutoff: 2,
-        copy_kmer_cutoff: 3,
+        copy_kmer_cutoff,
         // the non-fast `lchain_qgen_mcopy` has no coverage-window pass
         coverage_window: 0,
     };

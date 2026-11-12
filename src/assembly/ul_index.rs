@@ -195,7 +195,7 @@ fn push_coverage_track(
 
 /// `ul_contain_gen` (`inter.cpp` 20717): the containment table of every
 /// unitig, one entry per contained read plus a 5%-tolerant dedup pass.
-fn ul_contain_gen(
+pub(crate) fn ul_contain_gen(
     unitigs: &[MaUtg],
     rg: &Asg,
     ctx: &IndexContext,
@@ -313,7 +313,7 @@ fn ul_contain_gen(
 }
 
 /// `gen_cov_track` (`inter.cpp` 21173).
-fn gen_cov_track(unitigs: &[MaUtg], contain: &UlContain, ctx: &IndexContext) -> UCov {
+pub(crate) fn gen_cov_track(unitigs: &[MaUtg], contain: &UlContain, ctx: &IndexContext) -> UCov {
     let mut coverage = UCov {
         idx: vec![0u32; unitigs.len() + 1],
         interval: Vec::new(),
@@ -332,7 +332,7 @@ fn gen_cov_track(unitigs: &[MaUtg], contain: &UlContain, ctx: &IndexContext) -> 
 /// Returns the index and the `cc` counter array threaded through in place of
 /// `ma_hit_t::cc`.
 #[allow(clippy::too_many_arguments)]
-fn gen_r_contain(
+pub(crate) fn gen_r_contain(
     unitig: &mut UnitigGraph,
     rg: &Asg,
     ctx: &IndexContext,
@@ -1441,5 +1441,44 @@ mod tests {
         assert_eq!((entries[1].u, entries[1].pos), (0, 800));
         assert_eq!((entries[2].u, entries[2].pos), (2, 0));
         assert_eq!((entries[3].u, entries[3].pos), (4, 0));
+    }
+}
+
+/// `gen_ul_idx` (`inter.cpp` 21261): the `ul_idx_t` of the renewal pass —
+/// containment, coverage track and read containment over the polished graph.
+pub fn gen_ul_idx(
+    options: &AssemblyOptions,
+    unitigs: &[MaUtg],
+    sg: &Asg,
+    sources: &[Vec<PafHit>],
+    read_lengths: &[u64],
+) -> UlIndex {
+    let ctx = IndexContext::new(options, read_lengths, sources);
+    let contain = ul_contain_gen(unitigs, sg, &ctx, true, false);
+    let coverage = gen_cov_track(unitigs, &contain, &ctx);
+    let (read_contain, cc) = gen_r_contain(
+        // `gen_r_contain` takes the mutable graph only to refresh its arc
+        // occurrence bookkeeping; the caller's graph is already labelled.
+        &mut crate::assembly::unitig::UnitigGraph {
+            unitigs: unitigs.to_vec(),
+            graph: sg.clone(),
+        },
+        sg,
+        &ctx,
+        read_lengths.len(),
+        false,
+        false,
+    );
+    let read_unitig = gen_r_ug_idx_with_contain(unitigs, &contain, read_lengths.len(), false);
+    UlIndex {
+        unitig: crate::assembly::unitig::UnitigGraph {
+            unitigs: unitigs.to_vec(),
+            graph: sg.clone(),
+        },
+        contain,
+        coverage,
+        read_contain,
+        read_unitig,
+        cc,
     }
 }

@@ -720,3 +720,37 @@ pub fn split_ug_lalign(
 fn block_length(error_rate: f64) -> i64 {
     ((THRESHOLD_MAXIMUM as f64 / error_rate).min(WINDOW_LENGTH as f64)) as i64
 }
+
+/// The `ug_lalign` entry for the graph-binning worker (`inter.cpp` 12493):
+/// `None` auxiliary aligns the chain windows directly, `Some` re-aligns from
+/// the chain-level alignment.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ug_lalign_public(
+    overlaps: &mut RegionList,
+    candidates: &mut CandidatesList,
+    targets: &TargetSource,
+    query: &[u8],
+    query_total_length: i64,
+    extz: &mut BitExtz,
+    auxiliary: Option<&mut OverlapRegion>,
+    error_rate: f64,
+    window_length: i64,
+    h_kmer_hit: i64,
+    chain_cut: u64,
+) {
+    let length = overlaps.len();
+    ug_lalign(
+        overlaps,
+        length,
+        candidates,
+        targets,
+        query,
+        query_total_length,
+        extz,
+        auxiliary,
+        error_rate,
+        window_length,
+        h_kmer_hit,
+        chain_cut,
+    );
+}

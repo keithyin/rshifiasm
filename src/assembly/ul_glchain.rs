@@ -2109,7 +2109,8 @@ fn ck_w_err(z: &mut OverlapRegion, w_idx: &[u64], wl: i64, ql: i64) -> u32 {
 /// `filter_sec` (`inter.cpp` 6983): keeps only the overlaps that belong to
 /// the best chains or beat their block's minimum error; compacts `ol`.
 fn filter_sec(
-    ol: &mut Vec<OverlapRegion>,
+    ol: &mut [OverlapRegion],
+    ol_len: &mut usize,
     idx: &[UlOv],
     a: &[UlOv],
     w_idx: &mut [u64],
@@ -2120,7 +2121,7 @@ fn filter_sec(
     if idx.is_empty() {
         return true;
     }
-    let on = ol.len();
+    let on = *ol_len;
     for entry in w_idx.iter_mut().take(nw) {
         *entry = u64::MAX;
     }
@@ -2172,7 +2173,7 @@ fn filter_sec(
         }
         z = 1;
     }
-    ol.truncate(z);
+    *ol_len = z;
     z == 1
 }
 
@@ -2181,7 +2182,8 @@ fn filter_sec(
 #[allow(clippy::too_many_arguments)]
 pub fn gl_chain_flter(
     context: &UlRescallContext<'_>,
-    olist: &mut Vec<OverlapRegion>,
+    olist: &mut [OverlapRegion],
+    ol_len: &mut usize,
     dumy_srt: &mut Vec<u64>,
     ll_srt: &mut Vec<u64>,
     sps: &mut Vec<u64>,
@@ -2196,8 +2198,8 @@ pub fn gl_chain_flter(
     ll_tk.clear();
     ll_lo.clear();
     let idx = ll_lo;
-    introsort_overlaps_by_xe(olist);
-    regen_ul_ov_t_lst(&context.unitig_graph.unitigs, olist, idx);
+    introsort_overlaps_by_xe(&mut olist[..*ol_len]);
+    regen_ul_ov_t_lst(&context.unitig_graph.unitigs, &olist[..*ol_len], idx);
     if idx.is_empty() {
         return 0;
     }
@@ -2208,7 +2210,7 @@ pub fn gl_chain_flter(
     let mut idx_scratch = std::mem::take(ll_srt);
     let mut track = std::mem::take(sps);
     let occ = ed_dp_c(
-        olist,
+        &olist[..*ol_len],
         idx,
         &mut ex,
         context,
@@ -2242,6 +2244,7 @@ pub fn gl_chain_flter(
     }
     let mut i = idx_n as i64 - 1;
     let mut occ2 = i64::from(p_last.te - p_last.ts);
+    let _ = ol_len;
     if ((p_last.qe - p_last.qs) as i64) < ql && idx_n > 1 {
         occ2 = 0;
         while i >= 0 {
@@ -2273,21 +2276,25 @@ pub fn gl_chain_flter(
         }
         i += 1;
     }
-    if occ2 == olist.len() as i64 {
+    if occ2 == *ol_len as i64 {
         return 1;
     }
     let nw = get_num_wins(0, ql, wl) as usize;
     ll_srt.clear();
     ll_srt.resize(nw, u64::MAX);
-    if filter_sec(
+    // `filter_sec` compacts within `[0, ol_len)`; the dropped entries stay
+    // in the tail like the reference's swaps.
+    let ok = filter_sec(
         olist,
+        ol_len,
         &idx[i as usize..],
         ll_tk,
         ll_srt,
         nw,
         wl as u64,
         ql as u64,
-    ) {
+    );
+    if ok {
         *need_phase = 0;
     }
     1
@@ -2537,7 +2544,8 @@ pub fn update_ul_vec_t_ug(
 /// chains, ranked by the per-block minimum error.
 #[allow(clippy::too_many_arguments)]
 pub fn filter_topN(
-    ol: &mut Vec<OverlapRegion>,
+    ol: &mut [OverlapRegion],
+    ol_len: &mut usize,
     aln: &mut Vec<UlOv>,
     ql: u64,
     wl: u64,
@@ -2554,12 +2562,12 @@ pub fn filter_topN(
     }
     let nw = get_num_wins(0, ql as i64, wl as i64) as usize;
     ll_srt.clear();
-    ll_srt.resize(nw + ol.len(), u64::MAX);
+    ll_srt.resize(nw + *ol_len, u64::MAX);
     let (w_idx, srt) = ll_srt.split_at_mut(nw);
     for entry in w_idx.iter_mut() {
         *entry = u64::MAX;
     }
-    for region in ol.iter_mut() {
+    for region in ol[..*ol_len].iter_mut() {
         region.is_match = 0;
         region.alignment_length = 0;
         crate::correction::recalculate::append_unmatched_windows(
@@ -2585,7 +2593,7 @@ pub fn filter_topN(
     let mut m = 0usize;
     let mut h0 = 0usize;
     let mut h1 = 0usize;
-    for (i, region) in ol.iter().enumerate() {
+    for (i, region) in ol[..*ol_len].iter().enumerate() {
         let sc = cal_sec_e_min(region, w_idx, wl as i64, ql as i64, None);
         if sc >= 0 {
             srt[m] = (sc as u64) << 32 | i as u64 | 0x8000_0000_0000_0000;
@@ -2596,14 +2604,14 @@ pub fn filter_topN(
         }
         m += 1;
     }
-    radix_sort_u64(&mut srt[..ol.len()]);
+    radix_sort_u64(&mut srt[..*ol_len]);
     if h1 > 0 {
         let zn = h1 >> 1;
         for i in 0..zn {
             srt.swap(i, h1 - i - 1);
         }
     }
-    let mut m = ol.len() as i64 - 1;
+    let mut m = *ol_len as i64 - 1;
     let mut cc = 0u64;
     while m >= 0 && cc <= cc_max {
         cc += u64::from(ol[(srt[m as usize] as u32) as usize].alignment_length);
@@ -2611,7 +2619,7 @@ pub fn filter_topN(
         m -= 1;
     }
     let mut m = 0usize;
-    for k in 0..ol.len() {
+    for k in 0..*ol_len {
         ol[k].alignment_length = u32::MAX;
         if ol[k].is_match == 0 {
             continue;
@@ -2631,7 +2639,7 @@ pub fn filter_topN(
     aln.truncate(m);
     let mut m = 0usize;
     let mut sec_err = 0i64;
-    for k in 0..ol.len() {
+    for k in 0..*ol_len {
         if ol[k].is_match == 0 {
             let _ = cal_sec_e_min(&ol[k], w_idx, wl as i64, ql as i64, Some(&mut sec_err));
             ol[k].non_homopolymer_errors = sec_err as u32;
@@ -2642,7 +2650,7 @@ pub fn filter_topN(
         }
         m += 1;
     }
-    ol.truncate(m);
+    *ol_len = m;
 }
 
 /// `gdpchain_t` (`Correct.h`): the graph-chain scratch buffers of one worker.
@@ -2668,7 +2676,7 @@ pub struct GdpChain {
 pub fn gl_chain(
     context: &UlRescallContext<'_>,
     rch: &mut crate::assembly::ul_store::UlReadVec,
-    olist: &mut Vec<OverlapRegion>,
+    olist: &mut [OverlapRegion],
     dp: &mut ChainData,
     hap: &mut HaplotypeEvidenceAlloc,
     sps: &mut Vec<u64>,
@@ -2805,7 +2813,7 @@ pub fn ul_lalign(
     khit: i64,
     snp_srt: &mut Vec<u64>,
     stb: &mut Vec<u64>,
-    mm: &mut crate::assembly::ul_phase::EmaskTable,
+    mm: &crate::assembly::ul_phase::EmaskTable,
     mk: &mut crate::assembly::ul_phase::MaskUlOv,
     slots: &mut crate::assembly::ul_phase::SecondaryWindows,
 ) {

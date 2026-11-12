@@ -31,7 +31,7 @@ const CHUNK_SIZE: u64 = 1_000_000_000;
 pub const UL_COV_THRES: u32 = 2;
 
 /// `P_CHAIN_COV` (`inter.h` 14).
-const P_CHAIN_RATE: f32 = 0.985;
+pub const P_CHAIN_RATE: f32 = 0.985;
 
 /// `print_ovlp_src_bl_stat` (`inter.cpp` 19527): the two statistics lines the
 /// reference prints after the source labelling.

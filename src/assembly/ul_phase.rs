@@ -187,7 +187,7 @@ pub fn infer_se(
 }
 
 /// `cal_s_interval` (`inter.cpp` 11162).
-fn cal_s_interval(graph: &Asg, arc: &AsgArc, res: &mut UlOv) {
+pub(crate) fn cal_s_interval(graph: &Asg, arc: &AsgArc, res: &mut UlOv) {
     *res = UlOv::default();
     res.rev = (((arc.ul >> 32) as u32 ^ arc.v) & 1) != 0;
     res.qn = (arc.ul >> 33) as u32;
@@ -212,7 +212,7 @@ fn cal_s_interval(graph: &Asg, arc: &AsgArc, res: &mut UlOv) {
 }
 
 /// `cal_x_interval` (`inter.cpp` 11202).
-fn cal_x_interval(graph: &Asg, v: &UlOv, w: &UlOv, res: &mut UlOv) -> bool {
+pub(crate) fn cal_x_interval(graph: &Asg, v: &UlOv, w: &UlOv, res: &mut UlOv) -> bool {
     *res = UlOv::default();
     if v.tn == w.qn {
         let os = v.ts.max(w.qs);
@@ -2043,7 +2043,7 @@ fn mask_ovlps(
     ov_db: &mut Vec<UlOv>,
     coor_srt: &mut Vec<u64>,
     buf1: &mut Vec<u64>,
-    mm: &mut EmaskTable,
+    mm: &EmaskTable,
     len_diff: f64,
     rlen: u64,
     bd: i64,
@@ -2521,7 +2521,7 @@ pub fn rphase_hl(
     slots: &mut SecondaryWindows,
     aln: &mut Vec<UlOv>,
     mk: &mut MaskUlOv,
-    mm: &mut EmaskTable,
+    mm: &EmaskTable,
     len_diff: f64,
     bd: i64,
     rlen: i64,
