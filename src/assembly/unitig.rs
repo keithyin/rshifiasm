@@ -2155,7 +2155,7 @@ pub fn ma_ug_print_bed(
 }
 
 /// `gen_spec_edge`: the stored overlap that becomes exactly `v -> w`.
-fn gen_spec_edge(
+pub(crate) fn gen_spec_edge(
     read_graph: &Asg,
     sources: &[PafList],
     maximum_hang: i32,

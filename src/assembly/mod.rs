@@ -41,6 +41,7 @@ pub mod ul_gchain;
 pub mod ul_phase;
 pub mod ul_recall;
 pub mod ul_renew;
+pub mod ul_renew_gfa;
 pub mod ul_binning;
 pub mod ul_load;
 pub mod ul_mask;
