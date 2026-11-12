@@ -3142,6 +3142,45 @@ integer_align_extention、gap_chain_check。
 5. gradually_renew_g/renew_g 接线 pipeline.rs。
 6. U7：解锁 --ul + e2e 门禁（见「U6 续三」门禁顺序）。
 
+## U6 续八（2026-11-12 第九轮，usg 子树读单）
+
+**h_usg 的生产链**（gen_ul2ul 尾 → u2g_clean → u2g_threading）：
+1. `renew_ul2_utg`(16813)：`renew_utg(&i_ug, i_g, NULL)` + seq_vis 重置 +
+   `renew_u2g_cov` + `renew_u2g_bg`。`renew_utg`（grep 定义）按 i_g 的
+   弧重建 i_ug 的 unitig 读段列表。
+2. `renew_u2g_cov`(16560) ✅ 已读（worker_renew_u2g_cov：clc_contain
+   两半 + 去重计数；`ul_cov_t.uc/hc/raw_uc`）。
+3. `renew_u2g_bg`(16653) ✅ 已读（per-raw-read bridge 弧 + `ou`
+   正确/歧义标注 ss=0.500001；`worker_renew_integer_bridge`）。
+4. `u2g_threading`(16146) ✅ 已读主体（ng 的 raw-graph 副本 + 每个
+   iug unitig 的 seq 走 `worker_update_ul_arc_drop` 找不可靠弧 →
+   res_dump → ou 标注 + tm=min(tt-tl,tl)*2+1 覆盖计数 + is_bridg
+   补桥弧 + `usg_cleanup` + `u2g_hybrid_clean`）→ `idx->h_usg`。
+   依赖：`renew_ul2_utg`、`gen_raw_ug_seq`(16586，iug_a 的填充)、
+   `get_ul_spec_ovlp`/`get_ulg_spec_ovlp`、`iug_b/iug_idx`（raw read →
+   iug unitig 的 CSR，gen_cul_g_t 区间构建，见 8330-8440 的消费方式）。
+5. `u2g_clean`(16281) ✅ 已读主体（三轮 arc_cut_supports+tips 循环
+   （topo_level 2/1/1、mm_tip 递减）→ ulg_pop_bubble → ulg_arc_cut_z
+   循环 → max_tip_hifi<<1 后第二遍 ss → u2g_threading）。
+6. **ulg 弧清理子树（~2000 行，未读）**：`ulg_arc_cut_tips`(8673)、
+   `ulg_arc_cut_supports`(9757)、`ulg_pop_bubble`(10084)、
+   `ulg_arc_cut_z`(10337)，及其内部的 usg_bub_clean(15800 区)/
+   usg_bub_clean0/usg_naive_topocut_aux/usg_tip_del/usg_bub_dis/
+   usg_bub_identify/extracr_clean_arc/usg_seq_del。
+7. `u2g_hybrid_clean`（未读）。
+
+**剩余组装**：`ul_realignment_gfa`(17598) 全清单（见续三 12）；
+`realloc_rdb_adv` 已读 ✅（Rust 需读段存储 append API）；接线
+pipeline.rs；U7 e2e。
+
+当前已提交的 UL 模块清单（全部编译绿，312 lib tests）：
+ul_store/ul_index/ul_scall/ul_raw_chain/ul_src/ul_load/ul_consensus/
+ul_gchain/ul_flex/ul_renew/ul_phase/ul_glchain/ul_mask/ul_binning/
+ul_recall/ul_renew_gfa/ul_integer/ul2ul/ul_renew_ng (+ ul_graph/
+ul_rescall/ul.rs 基础件)。测试：ul_scall_golden、ul_raw_chain_golden、
+ul_load_golden(ul_load_golden+ul_clean_gfa_smoke, ignored)、
+ul_store_golden、ul_reference_probe。
+
 ## 迁移状态总览（2026-11-12 更新）
 
 ### 已完成并门禁通过（默认路径）
