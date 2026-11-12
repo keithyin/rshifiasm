@@ -1357,3 +1357,288 @@ pub fn get_remove_hifi_occ(
     ub.clear();
     del_n > thres
 }
+
+/// `gen_ug_integer_seq_on_fly` (`gfa_ut.cpp` 9203): the raw-read sequence of
+/// an integer-unitig path, appending to `res`.
+pub fn gen_ug_integer_seq_on_fly(
+    cov: &crate::assembly::ul2ul::UlCov,
+    z_items: &crate::assembly::ul2ul::Ul2ulIdx,
+    raw: &crate::assembly::unitig::UnitigGraph,
+    u_a: &[u64],
+    res: &mut Vec<u64>,
+) {
+    let uln = z_items.uln as usize;
+    for k in 0..u_a.len() {
+        let seq = &cov.iug_a[(u_a[k] >> 1) as usize];
+        let u_rev = u_a[k] & 1 != 0;
+        if k > 0 {
+            let uv = u_a[k - 1];
+            let uw = u_a[k];
+            let mut bv = endpoint_of(z_items, iug_end(&cov.iug_a, uv));
+            if uv & 1 != 0 {
+                bv ^= 1;
+            }
+            let mut bw = endpoint_of(z_items, iug_end(&cov.iug_a, uw));
+            if uw & 1 != 0 {
+                bw ^= 1;
+            }
+            let is_bw_ul = ulg_type_of(z_items, bw);
+            if is_bw_ul {
+                let m = crate::assembly::ul2ul::get_ul_spec_ovlp(
+                    z_items,
+                    (bv >> 1) as usize,
+                    (bw >> 1) as usize,
+                )
+                .expect("the string link must exist");
+                assert!(!m.is_del);
+                let nn = (m.te_k - m.ts_k) as usize;
+                let zn = seq.len();
+                if !u_rev {
+                    for z in 0..nn {
+                        debug_assert_eq!(res[res.len() - nn + z], u64::from(seq[z].v));
+                    }
+                    for z in nn..zn {
+                        res.push(u64::from(seq[z].v));
+                    }
+                } else {
+                    for z in (zn - nn..zn).rev() {
+                        debug_assert_eq!(res[res.len() - nn + (zn - 1 - z)], u64::from(seq[z].v ^ 1));
+                    }
+                    for z in (0..zn - nn).rev() {
+                        res.push(u64::from(seq[z].v ^ 1));
+                    }
+                }
+            } else {
+                let mut x = bw >> 1;
+                x <<= 1;
+                x += bw & 1;
+                let is_bv_ul = ulg_type_of(z_items, bv);
+                if !is_bv_ul {
+                    assert!(
+                        raw.graph
+                            .arcs_of(res[res.len() - 1] as u32)
+                            .iter()
+                            .any(|a| !a.deleted && a.v == x)
+                    );
+                } else if res[res.len() - 1] == u64::from(x) {
+                    res.pop();
+                } else {
+                    assert!(
+                        raw.graph
+                            .arcs_of(res[res.len() - 1] as u32)
+                            .iter()
+                            .any(|a| !a.deleted && a.v == x)
+                    );
+                }
+                if !u_rev {
+                    for entry in seq {
+                        res.push(u64::from(entry.v));
+                    }
+                } else {
+                    for entry in seq.iter().rev() {
+                        res.push(u64::from(entry.v ^ 1));
+                    }
+                }
+            }
+        } else if !u_rev {
+            for entry in seq {
+                res.push(u64::from(entry.v));
+            }
+        } else {
+            for entry in seq.iter().rev() {
+                res.push(u64::from(entry.v ^ 1));
+            }
+        }
+    }
+}
+
+/// The raw unitig id of an integer-unitig path's boundary vertex.
+fn iug_end(iug_a: &[Vec<crate::assembly::ul2ul::UinfoSrt>], v: u64) -> u32 {
+    let walk = &iug_a[(v >> 1) as usize];
+    if v & 1 != 0 {
+        walk[0].v
+    } else {
+        walk[walk.len() - 1].v
+    }
+}
+
+fn endpoint_of(z_items: &crate::assembly::ul2ul::Ul2ulIdx, raw_vertex: u32) -> u32 {
+    let _ = z_items;
+    raw_vertex
+}
+
+fn ulg_type_of(z_items: &crate::assembly::ul2ul::Ul2ulIdx, raw_vertex: u32) -> bool {
+    let raw_id = (raw_vertex >> 1) as usize;
+    raw_id < z_items.uln as usize
+}
+
+/// `get_integer_seq_ovlps` (`gfa_ut.cpp` 9301): the string-supported
+/// overhangs around `match_bound`; returns the support count.
+#[allow(clippy::too_many_arguments)]
+pub fn get_integer_seq_ovlps(
+    str_idx: &crate::assembly::ul_integer::UlStrIdx,
+    store: &[crate::assembly::ul_store::UlReadVec],
+    raw_unitigs: &[crate::assembly::asg::MaUtg],
+    read_lengths: &[u64],
+    unitig_reads: &[Vec<u64>],
+    bub: &BubbleType,
+    p_a: &[u64],
+    match_bound: i64,
+    skip_hom: bool,
+    mut res: Option<&mut Vec<u64>>,
+    r_w: &mut u64,
+) -> u32 {
+    let v = p_a[match_bound as usize] as u32;
+    let vertex = (v >> 1) as usize;
+    let start = str_idx.idx[vertex] as usize;
+    let end = str_idx.idx[vertex + 1] as usize;
+    let mut ww = [0u64; 2];
+    let mut occ = 0u32;
+    *r_w = 0;
+    for z in start..end {
+        let word = str_idx.occ[z];
+        let read_id = (word >> 32) as usize;
+        let pos = (word & 0xffff_ffff) as usize;
+        let str_ = &str_idx.str[read_id];
+        let s_n = str_.cn as usize;
+        if s_n < 2 {
+            continue;
+        }
+        let vz = str_.a[pos] as u32;
+        debug_assert_eq!(v >> 1, vz >> 1);
+        let mut sw = [0u64; 2];
+        let mut ps = u64::MAX;
+        let mut pe = u64::MAX;
+        if v == vz {
+            let mut s = pos as i64 + 1;
+            let mut p = match_bound + 1;
+            while s < s_n as i64
+                && (p as usize) < p_a.len()
+                && str_.a[s as usize] as u32 == p_a[p as usize] as u32
+            {
+                let xi = &store[read_id].bb[str_.a[s as usize] as usize >> 32];
+                debug_assert_eq!(
+                    (xi.hid << 1) + u32::from(xi.rev),
+                    str_.a[s as usize] as u32
+                );
+                if !(skip_hom && crate::assembly::ul_renew_gfa::if_hom(xi.hid, bub)) {
+                    sw[1] += crate::assembly::ul_integer::ug_occ_w(
+                        u64::from(xi.ts),
+                        u64::from(xi.te),
+                        read_lengths,
+                        &unitig_reads[xi.hid as usize],
+                    );
+                }
+                s += 1;
+                p += 1;
+            }
+            if s < s_n as i64 && (p as usize) < p_a.len() {
+                continue;
+            }
+            if p <= match_bound + 1 {
+                continue;
+            }
+            if sw[1] == 0 {
+                continue;
+            }
+            pe = p as u64;
+            let mut s = pos as i64;
+            let mut p = match_bound;
+            while s >= 0 && p >= 0 && str_.a[s as usize] as u32 == p_a[p as usize] as u32 {
+                let xi = &store[read_id].bb[str_.a[s as usize] as usize >> 32];
+                debug_assert_eq!(
+                    (xi.hid << 1) + u32::from(xi.rev),
+                    str_.a[s as usize] as u32
+                );
+                if !(skip_hom && crate::assembly::ul_renew_gfa::if_hom(xi.hid, bub)) {
+                    sw[0] += crate::assembly::ul_integer::ug_occ_w(
+                        u64::from(xi.ts),
+                        u64::from(xi.te),
+                        read_lengths,
+                        &unitig_reads[xi.hid as usize],
+                    );
+                }
+                s -= 1;
+                p -= 1;
+            }
+            debug_assert!(p < match_bound);
+            if s >= 0 && p >= 0 {
+                continue;
+            }
+            if sw[0] == 0 {
+                continue;
+            }
+            ps = (p + 1) as u64;
+        } else {
+            let mut s = pos as i64 - 1;
+            let mut p = match_bound + 1;
+            while s >= 0
+                && (p as usize) < p_a.len()
+                && str_.a[s as usize] as u32 == (p_a[p as usize] as u32 ^ 1)
+            {
+                let xi = &store[read_id].bb[str_.a[s as usize] as usize >> 32];
+                debug_assert_eq!(
+                    (xi.hid << 1) + u32::from(xi.rev),
+                    str_.a[s as usize] as u32
+                );
+                if !(skip_hom && crate::assembly::ul_renew_gfa::if_hom(xi.hid, bub)) {
+                    sw[1] += crate::assembly::ul_integer::ug_occ_w(
+                        u64::from(xi.ts),
+                        u64::from(xi.te),
+                        read_lengths,
+                        &unitig_reads[xi.hid as usize],
+                    );
+                }
+                s -= 1;
+                p += 1;
+            }
+            if s >= 0 && (p as usize) < p_a.len() {
+                continue;
+            }
+            if p <= match_bound + 1 {
+                continue;
+            }
+            if sw[1] == 0 {
+                continue;
+            }
+            pe = p as u64;
+            let mut s = pos as i64;
+            let mut p = match_bound;
+            while s < s_n as i64 && p >= 0 && str_.a[s as usize] as u32 == (p_a[p as usize] as u32 ^ 1)
+            {
+                let xi = &store[read_id].bb[str_.a[s as usize] as usize >> 32];
+                debug_assert_eq!(
+                    (xi.hid << 1) + u32::from(xi.rev),
+                    str_.a[s as usize] as u32
+                );
+                if !(skip_hom && crate::assembly::ul_renew_gfa::if_hom(xi.hid, bub)) {
+                    sw[0] += crate::assembly::ul_integer::ug_occ_w(
+                        u64::from(xi.ts),
+                        u64::from(xi.te),
+                        read_lengths,
+                        &unitig_reads[xi.hid as usize],
+                    );
+                }
+                s += 1;
+                p -= 1;
+            }
+            debug_assert!(p < match_bound);
+            if s < s_n as i64 && p >= 0 {
+                continue;
+            }
+            if sw[0] == 0 {
+                continue;
+            }
+            ps = (p + 1) as u64;
+        }
+        if let Some(out) = res.as_deref_mut() {
+            out.push((ps << 32) | pe);
+        }
+        occ += 1;
+        ww[0] += sw[0];
+        ww[1] += sw[1];
+        let _ = raw_unitigs;
+    }
+    *r_w = ww[0].min(ww[1]);
+    occ
+}
