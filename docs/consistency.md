@@ -3534,3 +3534,79 @@ Rust 侧：`target/release/rshifiasm -t1 --ul /tmp/ul.fq -o /tmp/ulrsm
 /home/keith/Downloads/chr11-2M.fa.gz`，比对 8 个 GFA/BED
 （/tmp/ulref.bp*.gfa/.bed 等）+ `.re.*` 缓存字段。预期首次跑通需要
 调试（整链第一次执行）；错误多半在 renew_ng/gen_ul2ul 的断言。
+
+## 续十五（2026-11-13，U7 首轮 e2e 调试：rescall 全链贯通）
+
+U7 门禁首次端到端执行（`-t1 --ul /tmp/ul.fq` vs `/tmp/ulref`）暴露并修复了
+一批移植偏差。当前状态：**rescall 739/739 全部跑通，renewal 链推进到
+`gen_ul2ul` 内部**（此前在 rescall 前段即 panic）。
+
+### 已修复（c2215e4、543b528）
+
+基础接线：
+1. `gen_ul_idx`：第 2 参数应是字符串图 `sg`（原误传 unitig 图，导致
+   `ul_contain_gen` 用 read id 索引 60 个 unitig）；`is_el/is_del` 按
+   `inter.cpp:21261` 传 `(0,1)`；`gen_r_contain` 的 `update_ug_uo_t`
+   须原地修改真实 unitig 弧的 `ou`。
+2. `ul_realignment`：操作管线全局 UL store（`clear_all_ul_t` 只清内容、
+   保留 739 个条目）；把 store 传给 `gen_ul_reovlps`。
+3. `rescall_ul_pipeline`：全局读计数器 `p->total_pair`（替代尾插公式）；
+   step0 不注册名字（参考该处 append 被注释）；`gen_ul_vec_rid_t` 每次
+   chunk 后不重建（C++ 中该调用被注释）。
+4. `ul_lalign_base`：补 `clear_Correct_dumy` 语义（按 overlap 数扩容）与
+   `ol->length = k` 压缩（survivors 截断）。
+5. `gl_chain_flter`：`kv_resize` 语义——`srt/track` 需按链数定长（DP 直接
+   下标访问），`ll_tk` 只保留容量（DP 从 0 写）。
+6. `push_adp_k_hits`：`kv_pushp_cl` 写在逻辑长度处（不是物理尾）——
+   由此修复了 rescall 链多余块（PRE 1266 块现与参考一致）。
+7. `gen_cns_chain` 的 `gen_weight_khits` 切片按 `hit_count` 界定。
+8. 移植 `deep_graph_clean` + `hic_clean_adv` 全簇（`ug_clean.rs`），接线到
+   `ul_realignment_gfa`、`gradually_renew_g` 与非 ar 尾部；`sg` 的
+   SGCHK 与参考一致（3078 弧、哈希相同）、`gen_polished_ug` 的 POLUG 流
+   一致（49 个 unitig）。
+9. `fill_unaligned_alignments` 完整重写（`get_u_offset`/
+   `adjust_utg_chain_qoffset`/`update_uovlp_chain_qse`/`cal_qext_coor`）。
+10. `push_rphase` 补 `pe <= ze` 且非 primary 的 `p->x_end = ze` 分支。
+11. `rphase_hl`：入口清空 `slots`（C++ 以 `align_length=0` 丢弃上次次级
+    窗口；否则非 active 区域的陈旧 slot 会被写回）。
+12. `gen_region_phase_robust_rr`：选择循环用 `(uint32_t)buf->a[k]` 截断。
+13. `gen_commen_sketch`：`buf` 低 32 位是 aln 数组下标，直接 `aln[buf[i]]`
+    （原双重 `aln[id_a[buf[i]]]` 取错 overlap，破坏共享区间跟踪）。
+14. `extract_xcoordates`：后向扫描在 `a_i == a_n` 时越界（参考读越界槽位
+    后立即停止），加长度钳制（4 处）。
+15. `init_ul_str_idx`：occ 写入须相对顶点槽位起点（`occ[start+m]`）且先
+    存 packed 再推进计数器（C++ `a[a[a_n-1]++]` 惯用法）。
+16. `shrink_ul0`：原地组的块须从稳定源拷贝（原实现先 `mem::take` 了读的
+    bb，再从空 vec 读）。
+
+### U7 门禁剩余分歧（下一步从这里继续）
+
+rescall 完成后 `shrink_uls`/`init_ul_str_idx` 与 `gen_ul2ul` 的 str 索引
+重建已与参考对齐到条目级（参考 `cn0=0, tot=1061`；Rust 现 `tot=959`，
+差异来自下一条），随后 `dis_check_integer_aln_t` 出现 uszie 下溢 panic。
+
+1. **第二遍 `ul_lalign` 的 base 对齐回退路径**：对 rid=5/y_id=26，
+   - 主路径 239 次 `cal_exz_infi_adv` 的输入序列（ts/qs/target+query 哈希）
+     与输出（err/thre/ps/pe/ts/te）与参考**逐次一致**；
+   - 但 Rust 在末尾多出 5 次小对齐，且合并窗口在参考为
+     `x=[0,14328) y=[45945,60300)`，Rust 为 `x=[0,14549) y=[45945,60525)`
+     （err 727 vs 738、clen 1368 vs 1383）。
+   - 说明分歧在 `ovlp_base_aln_all` 回退/`rechain_alignment_ul` 的触发或
+     `hc_aln_exz_adv` 的 `MAX_SIN_*` 分支，而非 DP 内核。已确认 595 个
+     链命中的 offset/self_offset/cnt 完全一致，仅 41 个条目的 `readID`
+     标签不同（2 vs 3，`is_pri_aln` 分类无翻转）。
+2. **`dis_check_integer_aln_t` 负数索引**：当目标读的 `str.cn==0` 时参考
+   `i_tk = t->cn - lk->tk - 1` 为 `(uint32)-1`（越界读，glibc 下表现为
+   读到 0，即 a[0]）；Rust 为 usize 下溢 panic。参考实测 `cn0=0`（无空
+   str 的读），Rust 出现 cn==0 说明上游仍有一处分歧（`filter_ul_ug` 的
+   `pchain` 计数：参考 1061、Rust 959）。
+3. 由此导致 `renew_ul_vec_t` 后 str 条目数不同（959 vs 1061），进而改变
+   `gen_ul2ul`/`renew_ng` 的输入。
+
+### 方法提示
+
+- C++ 探针：`/tmp/{OverlapsP,InterP,CorrectP,GfaP}.cpp`（分别替换
+  Overlaps/inter/Correct/gfa_ut 的目标文件后重链 `/tmp/polished_probe`）。
+- 对比时务必**串行**运行两侧（并发会互相加载 `.ul.ovlp.bin` 缓存导致
+  rescall 被跳过）。
+- 当前 `cargo test --release` 345 passed。
