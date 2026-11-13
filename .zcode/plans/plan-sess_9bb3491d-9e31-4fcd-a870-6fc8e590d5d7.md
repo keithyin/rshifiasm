@@ -1,5 +1,12 @@
 # hifiasm 迁移收尾：U7 e2e 门禁 + Hi-C 完整迁移
 
+> **执行状态（2026-11-13）**：Part A 的 U7 已推进到 e2e 门禁收尾——
+> 解锁提交 `1085527`，两批移植修复 `c2215e4`（15 处接线/语义）与
+> `543b528`（第二遍链构造/shrink 记账）；rescall 739/739 全通、renewal
+> 推进到 `gen_ul2ul`。剩余 2 处分歧与 TODO 索引见
+> `docs/consistency.md`「续十五」+「U7 门禁剩余待办」+「待办索引」。
+> Part B（Hi-C H0–H7）尚未开始。
+
 ## Context
 
 rshifiasm 是 hifiasm 0.25.0-r726 的逐字节一致 Rust 移植（C++ 只读参考在 `/home/keith/projects/hifiasm`）。主线（P0–P8 默认 HiFi、trio 全分支、ONT、`--sec-in`）已完成并门禁通过；`--ul` 的 U1–U6 机制层全部移植并接线（checkpoint 续十四，HEAD `2f0b613`），解析解锁已提交（`1085527`）。

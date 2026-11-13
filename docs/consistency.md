@@ -3,10 +3,11 @@
 本文件记录与 C++ 版 hifiasm 的逐字节比对基线、各阶段门禁状态与已知差异。
 每次阶段推进都需要更新本文件。
 
-> **最新状态（2026-11-12）**：默认 HiFi、trio 全分支、ONT、`--sec-in` 已完成
-> 并门禁通过；`--ul` 已完成 U1–U5 与 U6 基础件（`ul_load`/共识簇/gchain 簇/
-> `ul_clean_gfa` is_ou 均已接线并有探针门禁），U6 renewal 链主体与 U7 解锁、
-> Hi-C（`--h1`/`--h2`）尚未完成。详见文末「迁移状态总览」。
+> **最新状态（2026-11-13）**：默认 HiFi、trio 全分支、ONT、`--sec-in` 已完成
+> 并门禁通过；`--ul` 的 U1–U6 已全部移植并接线，U7 已解锁（parse 期拒绝已
+> 移除），U7 端到端门禁正在收尾（rescall 739/739 全通、renewal 链推进到
+> `gen_ul2ul`，剩余 2 处分歧见「续十五」）；Hi-C（`--h1`/`--h2`）尚未开始。
+> 详见文末「迁移状态总览」。
 > 本文件其余章节为按时间顺序的迁移记录，其中的「尚未实现 / 待移植」表述
 > 反映**当时**的状态，可能已被后续提交实现。
 
@@ -103,7 +104,7 @@
 | P5 组装图 | `p_utg.gfa`、`p_ctg.gfa` 逐字节一致 | ✅ 完成（r_utg/p_utg 全链路一致；p_ctg 探针级 + e2e 一致，见下文实测） |
 | P6 单倍型 | `hap1/hap2.p_ctg.gfa`、`a_ctg.gfa` 一致 | ✅ 完成（`hap1/hap2.p_ctg.*` 探针级 + e2e 逐字节一致，见下文实测；`--dual-scaf` 的完整路径见下文 `trans_base_infer` 一节） |
 | P7 Hi-C/trio | trio 全部分支逐字节；Hi-C 需额外测试数据 | ✅ trio（名单模式/`--trio-dual`/`-5`/`--dual-scaf`）；⏳ Hi-C |
-| P8 ONT/UL | 需额外测试数据 | ✅ ONT（全部 GFA/BED/ovlp 逐字节一致；`--fast` 亦一致）；⏳ UL |
+| P8 ONT/UL | 需额外测试数据 | ✅ ONT（全部 GFA/BED/ovlp 逐字节一致；`--fast` 亦一致）；🔨 UL（U1–U6 完成、U7 解锁，e2e 门禁剩 2 处分歧，见「续十五」与「待办索引」T1–T4） |
 
 ## 已验证的翻译细节
 
@@ -3281,7 +3282,7 @@ renew_ng/gen_raw_ug_seq 九大块已移植并提交（ee59902..a5edf0f 十一个
 3. `ul_realignment_gfa`(17598 ✅) 组装 + `realloc_rdb_adv`(✅)。
 4. pipeline.rs 接线 + U7 解锁 + e2e 门禁。
 
-## 迁移状态总览（2026-11-12 更新）
+## 迁移状态总览（2026-11-13 更新）
 
 ### 已完成并门禁通过（默认路径）
 
@@ -3291,7 +3292,7 @@ renew_ng/gen_raw_ug_seq 九大块已移植并提交（ee59902..a5edf0f 十一个
 `--primary`/`--dbg-ovec`/`--prt-raw`/`--dbg-het-cnt`/`--ex-list`/
 `--b-cov`/`--h-cov`/`--m-rate`/`--telo-*` 等，均与 C++ 二进制逐字节一致。
 
-### `--ul`（超长读整合）——已完成 U1–U5 + U6 基础件
+### `--ul`（超长读整合）——U1–U6 完成，U7 门禁收尾中
 
 | 阶段 | 内容 | 状态 | 门禁 |
 | --- | --- | --- | --- |
@@ -3300,57 +3301,74 @@ renew_ng/gen_raw_ug_seq 九大块已移植并提交（ee59902..a5edf0f 十一个
 | U3 | scall 流水线 + `ul_load` 编排 + `.uidx.bin` 缓存 | 完成 | `ul_load_golden`：日志锚点全中、uidx 语义比对零差异、`UL_INF` 逐字段一致 |
 | U4 | `gen_init_sg` UL 分支 + contained 共识簇 + `ul_refine_alignment` gchain 簇 | 完成 | 152/122/47、refine 74/74、前后 dump 逐读逐块一致 |
 | U5 | `ul_clean_gfa` 的 is_ou 分支（`flex_asg_t`/`asg_arc_cut_contain`） | 完成 | `ul_clean_gfa_smoke` 与 C++ `PROBE_FULL=1` 日志逐行一致（81/81、1/1、0/0、0/0） |
-| U6 | renewal 链 | **进行中**（基础件已移植，主体待做） | 见下 |
-| U7 | 移除 `--ul` parse 期拒绝 + 全量 e2e 逐字节 | 待做 | 依赖 U6 |
+| U6 | renewal 链（rescall/gl_chain/`ul_realignment(_gfa)`/integer 簇/`gen_ul2ul`/`renew_ng`/`gradually_renew_g`）+ `deep_graph_clean`/`hic_clean_adv` | **完成** | 见「续十五」：SGCHK 3078 弧同哈希、POLUG 49 unitig 一致、rescall 739/739 全通、`shrink_uls` 条目级对齐 |
+| U7 | 移除 `--ul` parse 期拒绝 + 全量 e2e 逐字节 | **进行中** | 解锁已提交；e2e 剩余 2 处分歧（见下） |
 
-U6 已移植并提交（`src/assembly/ul_renew.rs`，commit `9a1558e`）：
-`gen_polished_ug`（Overlaps.cpp 10429）、`ugl_cover_check`（19600）、
-`filter_ul_ug`（19634/19764）、`update_ug_arch_ul`/`_mul`（19613/19645）、
-`clear_all_ul_t`（22004）。另修正 `G_CHAIN_INDEL` 为 128（`73aa0ab`）。
+U6 已全部完成（提交序列从 `9a1558e` 到 `543b528`，详见「续十二」–
+「续十五」）：rescall 链（`gen_UL_reovlps`/`gen_ul_idx`/`graph_ovlp_binning`/
+`rescall_ul_pipeline`）、`gl_chain` 簇、`ul_realignment(_gfa)`、
+integer/shrink 簇（`ul_re_correct`/`shrink_uls`/`init_ul_str_idx_t`）、
+`gen_ul2ul`/`renew_ng`/`realloc_rdb_adv`/`update_paf`/`renew_R_to_U`/
+`post_rescue`，以及 `deep_graph_clean`/`hic_clean_adv`（`ug_clean.rs`，
+含 `ug_clean_t`/`cal_bub_best(_by_len)` 簇）与 `gradually_renew_g`/
+`renew_g` 的 pipeline 接线。
 
-U6 仍缺（按依赖顺序，均为 `--ul` 最终 GFA 逐字节一致的必要条件）：
+### U7 门禁剩余待办（下一步工作清单）
 
-1. **rescall 链**：`gen_UL_reovlps`（inter.cpp 21537）、`gen_ul_idx`
-   （21261）、`graph_ovlp_binning`（22789）+ `ug_bin_t`/`idx_emask_t`/
-   `mask_ul_ov_t` 引擎与 `.ul.msk.bin` 读写、`ul_v_recall`/`rescall_ul_pipeline`
-   （20583/20018）、`worker_ul_rescall_pipeline`（13031）、
-   `worker_for_ul_rescall_alignment`（9299）。
-2. **`gl_chain` 簇**（6605）：`gen_gl_aln`（5223）、`gl_chain_lin`（5431）、
-   `ff_chain`（4004）、`l2g_res_chain_sc`（4580）、`gen_gg_aln`（5246）、
-   `gl_chain_graph_adv`（6086）、`update_ul_vec_t_ug`（4974）、
-   `gl_chain_flter`（7054）、`filter_topN`（7223）、`update_sketch_trace`
-   （Correct.cpp 22372），及其叶子 `aln_sc`、`get_ecov_el`（5341）、
-   `get_overlap_region_sub_err`（5295）、`check_trans_rate`（3981）、
-   `fill_unaligned_alignments`、`update_ava_het_site`（2412）、
-   `rescue_trans_ul_chains`（2936）、`pop_sc`/`push_sc_pre`。
-3. **`ul_realignment`**（22871：`gen_polished_ug` → 缓存 → `gen_UL_reovlps`
-   → `filter_ul_ug` → `gen_ul_vec_rid_t` → `update_ug_arch_ul_mul`）。
-4. **`ul_realignment_gfa`**（gfa_ut 17598）+ `filter_sg_by_ug`、
-   `gen_bubble_chain`、`init_ul_resolve_t`/`init_integer_ml_t`/
-   `init_ul_str_idx_t`、`init_ulg_opt_t`（16906）。
-5. **`ul_re_correct`**（7892）+ integer 簇（`worker_integer_correction`/
-   `clean_ul_re_correct_buf`/`worker_integer_update`/`rebuid_idx`/`shrink_uls`；
-   `--integer-correct` 默认 0 轮）。
-6. **`gen_ul2ul`**（16827）全簇 + `renew_ng`（15107）+
-   `realloc_rdb_adv`（14663）/`update_paf`（17164）/`convert_usg_t`/
-   `fill_scaffolds`/`renew_R_to_U`/`post_rescue` 接线。
-7. **`gradually_renew_g`（39297）/`renew_g`（39271）** 接入
-   `pipeline.rs::clean_graph` 的 UL 尾部（C++ 39444）。
+U7 解锁已提交（`1085527`）。端到端门禁已推进到以下状态，剩余两项：
 
-U6 门禁计划（资产已就绪）：`re.uidx.bin` 语义比对（`gen_polished_ug`+
-`gen_ul_idx`）、`re.ul.msk.bin` 逐字节（`graph_ovlp_binning`）、
-`.re.ul.ovlp.bin` 字段比对（rescall 结果）、最终 8 个 GFA/BED 逐字节
-（`renew_ng` 全链）。
+1. **第二遍 `ul_lalign` 的 base 对齐回退路径**（阻塞项）：
+   rid=5/y_id=26 的 239 次主路径 `cal_exz_infi_adv` 输入（ts/qs/目标与查询
+   序列哈希）与输出（err/thre/ps/pe/ts/te）与参考逐次一致，但 Rust 多出
+   5 次回退对齐，合并窗口参考 `x=[0,14328) y=[45945,60300)`、Rust
+   `x=[0,14549) y=[45945,60525)`。须收紧
+   `ovlp_base_aln_all`/`rechain_alignment_ul` 的触发条件（对照
+   `Correct.cpp` 16652–16704 与 `ovlp_base_aln` 16704–16750 的
+   `(eoff-soff<=1) && ((q1-q0)>>1) < MAX_CNS_E` 分支）。
+   已确认：595 个链命中的 offset/self_offset/cnt 完全一致，仅 41 个条目的
+   `readID` 标签不同（`is_pri_aln` 分类零翻转）。
+2. **`dis_check_integer_aln_t` 负数索引**：目标读 `str.cn==0` 时参考为
+   `(uint32)-1` 越界读（glibc 下等价于 a[0]），Rust 为 usize 下溢 panic。
+   参考实测 `cn0=0`（无空 str 的读），Rust `filter_ul_ug` 后 `tot=959`、
+   参考 1061，说明 pchain 判定仍有一处分歧需先修。
+3. 上述两项修复后：跑 `scripts/compare_outputs.sh /tmp/ulref /tmp/ulrsm`
+   对拍 8 个 GFA/BED + `re.ul.msk.bin`，并对 `re.uidx.bin`/
+   `re.ul.ovlp.bin` 做字段级比对；随后做全量回归（默认 9-profile、trio、
+   `-5`、`--dual-scaf`、yak、ONT、`--fast`）。
+
+复现方法：C++ 探针见 `/tmp/{OverlapsP,InterP,CorrectP,GfaP}.cpp`（替换对应
+目标文件重链）；两侧须**串行**运行（并发会互相加载 `.ul.ovlp.bin` 缓存而
+跳过 rescall）。当前 `cargo test --release` 345 passed。
 
 ### 仍未迁移的分支
 
-- `--ul` 的 U6 主体与 U7 解锁（parse 期显式拒绝；缺口清单见上）。
-- Hi-C（`--h1`/`--h2`/`--enzyme`，parse 期显式拒绝，完全未开始）。缺口是
+- **U7 端到端门禁**（`--ul` 已解锁、机制全部移植；仅剩上述 2 处分歧的
+  收尾与逐字节对拍）。
+- Hi-C（`--h1`/`--h2`/`--enzyme`，parse 期仍显式拒绝，完全未开始）。缺口是
   `hic.cpp` 的短读比对索引（`hc_pt`）、`hic_short_align`/`hic_analysis`、
   `output_hic_graph`/`output_hic_graph_mmhap` 与 horder.cpp misjoin/scaffolding
   链路；需要 H0 合成 Hi-C 语料建立门禁。
 - `--dbg-gfa`（`.pt_flt`/图 checkpoint 与 verbose GFA，parse 期显式拒绝；
   原因见上：参考实现的 checkpoint 非确定性）。
+
+### 待办索引（TODO）
+
+| # | 任务 | 依赖 | 状态 |
+| --- | --- | --- | --- |
+| T1 | 修复第二遍 base 对齐回退路径（`ovlp_base_aln_all`/`rechain_alignment_ul` 触发条件） | — | 进行中 |
+| T2 | 修复 `dis_check_integer_aln_t` 的空 str 上游分歧（`filter_ul_ug` pchain：959 vs 1061） | T1 或独立 | 待做 |
+| T3 | U7 门禁：8 个 GFA/BED + `.re.ul.msk.bin` 逐字节、`.re.*` 缓存字段级、日志锚点 | T1/T2 | 待做 |
+| T4 | U7 全量回归（默认 9-profile、trio、`-5`、`--trio-dual`、`--dual-scaf`、yak、ONT、`--fast`、`--sec-in` 豁免） | T3 | 待做 |
+| T5 | H0：`scripts/gen_hic_reads.py` 合成 Hi-C 语料 + C++ 参考（`reference/hic.*`） | — | 待做（未开始） |
+| T6 | H1：`hic_clean_adv`（Overlaps.cpp 14403）/`deep_graph_clean` 与 hic.cpp 泡泡机制的完整对齐（当前为已移植的 `ug_clean.rs`，但 `deep_graph_clean` 内 `cal_bub_best_by_len` 的 hic 泡泡分支仍需 H2 后验证） | H0 | 部分完成 |
+| T7 | H2：`hc_pt` 单位图 k-mer 索引（hic.cpp 349–917，`.hic.tlb.bin`） | H0 | 待做 |
+| T8 | H3：短读投票映射器（hic.cpp 936–2204，`.hic.lk.bin`） | H2 | 待做 |
+| T9 | H4：距离模型（hic.cpp 3710–5170 活跃部） | H3 | 待做 |
+| T10 | H5：tangle/权重/驱动（hic.cpp 13510–17162 活跃部） | H4 | 待做 |
+| T11 | H6：输出接线 `output_hic_graph`/`output_hic_graph_mmhap`/`benchmark_hic_graph` + horder.cpp misjoin/scaffolding | H5 | 待做 |
+| T12 | H7：解锁 `--h1`/`--h2` + 全量回归 + 文档收尾 | T11 | 待做 |
+| T13 | 维持 `--dbg-gfa` 显式拒绝（已论证不可移植） | — | 终态 |
+| T14 | 单细胞纠错分支与部分纠错轮次（`ec_driver.rs` 的 Err 桩） | 可选 | 待做 |
 
 ### 门禁资产与复现命令
 
