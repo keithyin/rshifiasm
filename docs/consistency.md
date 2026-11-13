@@ -3,10 +3,14 @@
 本文件记录与 C++ 版 hifiasm 的逐字节比对基线、各阶段门禁状态与已知差异。
 每次阶段推进都需要更新本文件。
 
-> **最新状态（2026-11-13）**：默认 HiFi、trio 全分支、ONT、`--sec-in` 已完成
-> 并门禁通过；`--ul` 的 U1–U6 已全部移植并接线，U7 已解锁（parse 期拒绝已
-> 移除），U7 端到端门禁正在收尾（rescall 739/739 全通、renewal 链推进到
-> `gen_ul2ul`，剩余 2 处分歧见「续十五」）；Hi-C（`--h1`/`--h2`）尚未开始。
+> **最新状态（2026-11-13 续十六）**：默认 HiFi、trio 全分支、ONT、`--sec-in` 已完成
+> 并门禁通过；`--ul` 的 U1–U6 已全部移植并接线，U7 已解锁。U7 调试取得决定性
+> 进展：第二遍 `ul_lalign` 的 base 对齐回退分歧（原 T1）已定位并修复——根因是
+> `check_connect_rg` 的 rw 端点方向 bug 与 ul_glchain 局部 `g_adjacent_dis` 的
+> 弧值语义 bug（详见「续十六」），y=26 第二遍区域已与参考逐字节一致；剩余分歧
+> 收敛为 scall `gl_chain` 链内容差 152 处（[STRH] site-2 tot 969 vs 1061，原 T2）。
+> 工作区尚有 2 个未提交修复与一批临时探针（提交前须剥离，见「续十六」清单）。
+> Hi-C（`--h1`/`--h2`）尚未开始。
 > 详见文末「迁移状态总览」。
 > 本文件其余章节为按时间顺序的迁移记录，其中的「尚未实现 / 待移植」表述
 > 反映**当时**的状态，可能已被后续提交实现。
@@ -104,7 +108,7 @@
 | P5 组装图 | `p_utg.gfa`、`p_ctg.gfa` 逐字节一致 | ✅ 完成（r_utg/p_utg 全链路一致；p_ctg 探针级 + e2e 一致，见下文实测） |
 | P6 单倍型 | `hap1/hap2.p_ctg.gfa`、`a_ctg.gfa` 一致 | ✅ 完成（`hap1/hap2.p_ctg.*` 探针级 + e2e 逐字节一致，见下文实测；`--dual-scaf` 的完整路径见下文 `trans_base_infer` 一节） |
 | P7 Hi-C/trio | trio 全部分支逐字节；Hi-C 需额外测试数据 | ✅ trio（名单模式/`--trio-dual`/`-5`/`--dual-scaf`）；⏳ Hi-C |
-| P8 ONT/UL | 需额外测试数据 | ✅ ONT（全部 GFA/BED/ovlp 逐字节一致；`--fast` 亦一致）；🔨 UL（U1–U6 完成、U7 解锁，e2e 门禁剩 2 处分歧，见「续十五」与「待办索引」T1–T4） |
+| P8 ONT/UL | 需额外测试数据 | ✅ ONT（全部 GFA/BED/ovlp 逐字节一致；`--fast` 亦一致）；🔨 UL（U1–U6 完成、U7 解锁，第二遍对齐分歧已修复，剩 scall 链内容分歧，见「续十六」与「待办索引」T1–T4） |
 
 ## 已验证的翻译细节
 
@@ -3302,7 +3306,7 @@ renew_ng/gen_raw_ug_seq 九大块已移植并提交（ee59902..a5edf0f 十一个
 | U4 | `gen_init_sg` UL 分支 + contained 共识簇 + `ul_refine_alignment` gchain 簇 | 完成 | 152/122/47、refine 74/74、前后 dump 逐读逐块一致 |
 | U5 | `ul_clean_gfa` 的 is_ou 分支（`flex_asg_t`/`asg_arc_cut_contain`） | 完成 | `ul_clean_gfa_smoke` 与 C++ `PROBE_FULL=1` 日志逐行一致（81/81、1/1、0/0、0/0） |
 | U6 | renewal 链（rescall/gl_chain/`ul_realignment(_gfa)`/integer 簇/`gen_ul2ul`/`renew_ng`/`gradually_renew_g`）+ `deep_graph_clean`/`hic_clean_adv` | **完成** | 见「续十五」：SGCHK 3078 弧同哈希、POLUG 49 unitig 一致、rescall 739/739 全通、`shrink_uls` 条目级对齐 |
-| U7 | 移除 `--ul` parse 期拒绝 + 全量 e2e 逐字节 | **进行中** | 解锁已提交；e2e 剩余 2 处分歧（见下） |
+| U7 | 移除 `--ul` parse 期拒绝 + 全量 e2e 逐字节 | **进行中** | 解锁已提交；第二遍对齐分歧已修复（见「续十六」修复 1），剩余 scall 链内容分歧（见下） |
 
 U6 已全部完成（提交序列从 `9a1558e` 到 `543b528`，详见「续十二」–
 「续十五」）：rescall 链（`gen_UL_reovlps`/`gen_ul_idx`/`graph_ovlp_binning`/
@@ -3315,35 +3319,42 @@ integer/shrink 簇（`ul_re_correct`/`shrink_uls`/`init_ul_str_idx_t`）、
 
 ### U7 门禁剩余待办（下一步工作清单）
 
-U7 解锁已提交（`1085527`）。端到端门禁已推进到以下状态，剩余两项：
+U7 解锁已提交（`1085527`）。原「2 处分歧」的根因均已定位（见「续十六」）：
 
-1. **第二遍 `ul_lalign` 的 base 对齐回退路径**（阻塞项）：
-   rid=5/y_id=26 的 239 次主路径 `cal_exz_infi_adv` 输入（ts/qs/目标与查询
-   序列哈希）与输出（err/thre/ps/pe/ts/te）与参考逐次一致，但 Rust 多出
-   5 次回退对齐，合并窗口参考 `x=[0,14328) y=[45945,60300)`、Rust
-   `x=[0,14549) y=[45945,60525)`。须收紧
-   `ovlp_base_aln_all`/`rechain_alignment_ul` 的触发条件（对照
-   `Correct.cpp` 16652–16704 与 `ovlp_base_aln` 16704–16750 的
-   `(eoff-soff<=1) && ((q1-q0)>>1) < MAX_CNS_E` 分支）。
-   已确认：595 个链命中的 offset/self_offset/cnt 完全一致，仅 41 个条目的
-   `readID` 标签不同（`is_pri_aln` 分类零翻转）。
-2. **`dis_check_integer_aln_t` 负数索引**：目标读 `str.cn==0` 时参考为
-   `(uint32)-1` 越界读（glibc 下等价于 a[0]），Rust 为 usize 下溢 panic。
-   参考实测 `cn0=0`（无空 str 的读），Rust `filter_ul_ug` 后 `tot=959`、
-   参考 1061，说明 pchain 判定仍有一处分歧需先修。
-3. 上述两项修复后：跑 `scripts/compare_outputs.sh /tmp/ulref /tmp/ulrsm`
+1. ~~**第二遍 `ul_lalign` 的 base 对齐回退路径**~~ **已修复**：根因是
+   `check_connect_rg` 的 rw 端点方向 bug（修复 1）。修复后 rid=5/y_id=26 的
+   第二遍区域（[GCP]/[CNH]/[CB]/[OBA]×581/[EXZ]×239/[AUX]）与参考逐字节
+   一致：融合括号 `qe=14329/te=60301`，最终窗口 `x=[0,14328) y=[45945,60300)
+   err=727 clen=1368`。
+2. **scall `gl_chain` 链内容分歧**（当前阻塞项，对应原 T2 的上游）：
+   `dis_check_integer_aln_t` panic 的上游是 bb/pchain 链差 152 处
+   （[STRH] site-1 tot=972、site-2 tot=969，参考两处同值 1061）。已确认：
+   - C++ site-1 与 site-2 的逐读 cn 完全一致（`shrink_uls`+`rebuid_idx`
+     不改计数）→ 分歧在 shrink 之前，即 scall 的 `gl_chain`（inter.cpp
+     9409，bb 链唯一写入点）；
+   - [BB] site-1 全量 dump：块坐标一致、pdis 一致（修复 2 后）、但 152 处
+     链结构不同（如 read5：参考 3 块 utg25rev+utg23+utg22，Rust 仅 utg23；
+     read24：cn=3 vs 1）；
+   - [UGA]：rescall 入口单位图弧两侧完全一致（n_seq=49、n_arc=140、哈希
+     相同）→ 图无分歧，分歧在链 DP（`gl_chain_lin` 的链窗口或
+     `l2g_res_chain_sc` 的输入窗口）。
+   - 下一步：对 ulid=5 探 `gen_gl_aln` 输出与 `ll_tk` 链窗口（[GGL]/[L2G]
+     探针两侧各一），判定是 overlap 列表还是 DP 选择分歧。
+3. 修复 2 后跑 `scripts/compare_outputs.sh /tmp/ulref /tmp/ulrsm`
    对拍 8 个 GFA/BED + `re.ul.msk.bin`，并对 `re.uidx.bin`/
    `re.ul.ovlp.bin` 做字段级比对；随后做全量回归（默认 9-profile、trio、
    `-5`、`--dual-scaf`、yak、ONT、`--fast`）。
 
 复现方法：C++ 探针见 `/tmp/{OverlapsP,InterP,CorrectP,GfaP}.cpp`（替换对应
 目标文件重链）；两侧须**串行**运行（并发会互相加载 `.ul.ovlp.bin` 缓存而
-跳过 rescall）。当前 `cargo test --release` 345 passed。
+跳过 rescall）；**同前缀重跑 Rust 前必须删除 `<prefix>.re.*` 缓存**，否则
+rescall 被缓存跳过（续十六的 rsm9 教训）。当前 `cargo test --release`
+345 passed（探针代码不计入）。
 
 ### 仍未迁移的分支
 
-- **U7 端到端门禁**（`--ul` 已解锁、机制全部移植；仅剩上述 2 处分歧的
-  收尾与逐字节对拍）。
+- **U7 端到端门禁**（`--ul` 已解锁、机制全部移植；第二遍对齐分歧已修复，
+  剩 scall 链内容分歧的收尾与逐字节对拍）。
 - Hi-C（`--h1`/`--h2`/`--enzyme`，parse 期仍显式拒绝，完全未开始）。缺口是
   `hic.cpp` 的短读比对索引（`hc_pt`）、`hic_short_align`/`hic_analysis`、
   `output_hic_graph`/`output_hic_graph_mmhap` 与 horder.cpp misjoin/scaffolding
@@ -3355,8 +3366,8 @@ U7 解锁已提交（`1085527`）。端到端门禁已推进到以下状态，�
 
 | # | 任务 | 依赖 | 状态 |
 | --- | --- | --- | --- |
-| T1 | 修复第二遍 base 对齐回退路径（`ovlp_base_aln_all`/`rechain_alignment_ul` 触发条件） | — | 进行中 |
-| T2 | 修复 `dis_check_integer_aln_t` 的空 str 上游分歧（`filter_ul_ug` pchain：959 vs 1061） | T1 或独立 | 待做 |
+| T1 | 修复第二遍 base 对齐回退路径 | — | **完成**（根因=`check_connect_rg` rw 端点方向，见「续十六」修复 1；y=26 区域逐字节一致） |
+| T2 | 修复 scall `gl_chain` 链内容分歧（[STRH] site-2 tot 969 vs 1061；`dis_check_integer_aln_t` panic 的上游） | — | 进行中（修复 2 已入，剩余见「续十六」下一步） |
 | T3 | U7 门禁：8 个 GFA/BED + `.re.ul.msk.bin` 逐字节、`.re.*` 缓存字段级、日志锚点 | T1/T2 | 待做 |
 | T4 | U7 全量回归（默认 9-profile、trio、`-5`、`--trio-dual`、`--dual-scaf`、yak、ONT、`--fast`、`--sec-in` 豁免） | T3 | 待做 |
 | T5 | H0：`scripts/gen_hic_reads.py` 合成 Hi-C 语料 + C++ 参考（`reference/hic.*`） | — | 待做（未开始） |
@@ -3628,3 +3639,99 @@ rescall 完成后 `shrink_uls`/`init_ul_str_idx` 与 `gen_ul2ul` 的 str 索引
 - 对比时务必**串行**运行两侧（并发会互相加载 `.ul.ovlp.bin` 缓存导致
   rescall 被跳过）。
 - 当前 `cargo test --release` 345 passed。
+
+## 续十六（2026-11-14，U7 两处移植 bug 定位与修复：第二遍对齐区域全对齐）
+
+本轮将「续十五」遗留的两处分歧全部定位到根因并修复。方法：双侧镜像探针
+（[OBA]/[CNH]/[CB]/[AUX]/[RCA]/[EXZ]/[SEQ]/[GVL]/[TRC]/[GCP]/[STRH]/[STRR]/
+[BB]/[UGA]/[UPV]/[GLC]/[DDL]，C++ 侧以 /tmp/CorrectP2、InterP4–6、GfaP2–3
+重链；Rust 侧临时 eprintln），逐层 bisect。
+
+### 修复 1（已验证）：`check_connect_rg` 的 rw 端点方向
+
+`ul_rescall.rs` 的 `check_connect_rg`（`Correct.cpp` 19190）用同一个闭包计
+算 rv/rw，而参考的两次端点读取是**镜像**的：
+
+- `rv = path[uv].a[(uv&1)?0:n-1] >> 32 ^ (uv&1)`（出边端：反向取 a[0]、
+  正向取 a[n-1]）
+- `rw = path[uw].a[(uw&1)?n-1:0] >> 32 ^ (uw&1)`（入边端：反向取 a[n-1]、
+  正向取 a[0]）
+
+Rust 把 rv 的约定错用在 rw 上。多读 unitig 时 rw 查错读 → read-graph 弧查
+找失败 → `govlp_check` 返回 0 → `gen_shared_trace` 不跳过含 y24/y23 的
+pair（C++ 的 [GVL] 实测这三对 ug=0 rg=1 ret=1）→ y=26 的共享区间条目被从
+[0,14319) 错误扩展到 [0,14551) → 融合括号右端落到链尾（qe=59457/te=-1，
+参考 qe=14329/te=60301）→ 第二遍块通道多跑 15 块、5 次额外小对齐，最终窗
+口 x=[0,14549) vs 参考 x=[0,14328)。
+
+修复后 rid=5/y_id=26 的整个第二遍区域（[GCP] qn=1 ch_n=595 rcn=6124、
+[CNH] 595 命中、[CB] 括号、[OBA] 581 块、[EXZ]/[SEQ] 239 次、[AUX] 最终窗
+口 err=727 clen=1368）与参考逐字节一致。全库审计确认同惯例镜像只此一处错
+（`get_bridges`/`ul2ul.rs`/`trans_cov.rs` 均正确）。
+
+### 修复 2（已入，效果部分验证）：ul_glchain 局部 `g_adjacent_dis` 的弧值语义
+
+`ul_glchain.rs:1277` 的局部 `g_adjacent_dis` 返回 `arc.overlap`（ol 字段），
+参考（inter.cpp 4490）返回 `(uint32_t)av[i].ul`——即 ul 低 32 位。scall 的
+单位图弧已被 `gen_polished_ug`（Overlaps.cpp 10452–10458）改写为
+node_length（= seq.len − ol），两者不同：utg5→utg6 弧 ol=15853、
+node_length=31890。gl_chain 线性路径的 `dist_pre`（→bb 的 `pdis`）因此全
+面偏小（read3：15853/14308 vs 参考 31890/19420）。改为 `arc.node_length()`
+后 [UPV] 与参考一致，[STRH] site-2 tot 956→969（参考 1061）。
+
+注意 ul.rs 的同名函数（返回 `node_length()`）本就正确；`ul_consensus.rs`
+的 `g_adjacent_dis_mul`（src 分支返回 ma_hit2arc 新弧的 ul 低位=ol）也正
+确——只有 ul_glchain 的局部副本错。
+
+### 关键事实（探针证据链）
+
+1. **单位图无分歧**：[UGA] 在 gen_ul_reovlps 入口 dump 全图弧（n_seq=49、
+   n_arc=140、FNV 哈希相同；v=10/26 逐弧一致）。
+2. **`shrink_uls`+`rebuid_idx` 不改逐读 cn**：C++ [STRR1] 与 [STRR2] 完全
+   一致 → [STRH] 分歧全部来自上游 scall `gl_chain`（inter.cpp 9409 是 bb
+   链唯一写入点；rescall 不经 gl_chain）。
+3. **块坐标一致、链结构差 152 处**：[BB1] 全量 dump 对比——如 read5 参考
+   3 块（utg25rev pc=1 + utg23 pc=1 + utg22 pc=0），Rust 仅 utg23 1 块；
+   read24 cn=3 vs 1。pdis 在修复 2 后逐块一致。
+4. **`is_pri_aln` 零翻转**：41 处 readID（=gen_weight_khits 的 iidx 深度）
+   2 vs 3 差异不影响第二遍块通道（cnt≥readID 两侧同真），但仍是 iidx 上游
+   差异的信号，留待门禁阶段核查。
+5. **panic 未消**：`dis_check_integer_aln_t`（ul_integer.rs:268）仍在
+   `t.cn − lk.tk − 1` 下溢 panic（len=2 的 bb 被以 usize::MAX 索引）——
+   这是第 3 条链结构分歧的下游症状；参考在同输入下是 (uint32)-1 越界读
+   （参考实测 cn0=0，本不应触达）。
+
+### 工作区状态（未提交）
+
+两个修复与一批临时探针混在工作区，提交前须剥离探针：
+
+- 保留（真修复）：`ul_rescall.rs` check_connect_rg 端点；`ul_glchain.rs`
+  g_adjacent_dis 返回值。
+- 剥离（临时探针）：ul_rescall.rs [GCP]/[CNH]/[CB]/[AUXM]/[AUX]/[OBA 参
+  数]/[GVL]；ul_align.rs [OBA]+probe_rid 参数；ug_lalign.rs [RCA]+probe_rid
+  实参；cal_exz.rs [EXZ]/[SEQ]；ul_integer.rs [STRH]/[STRR]/[BB]/[DCHK0]+
+  STR_SITE；ul_renew_driver.rs / ul_renew_ng.rs STR_SITE 存取；ul_recall.rs
+  [TRCa]/[TRCb]/[UGA]+UL_PROBE_ID 存取；ul_gchain.rs [DDL]/[DDA]+
+  UL_PROBE_ID；ul_glchain.rs [GLC]/[UPV]。
+- C++ 侧探针均为 /tmp 临时文件，hifiasm 源树已还原（git status 仅余未跟踪
+  的 hifiasm 二进制）。
+
+### 缓存陷阱（本轮教训）
+
+Rust 侧 `ul_realignment` 会加载 `<prefix>.re.ul.ovlp.bin` 缓存（
+`load_all_ul_t`）而**跳过整个 rescall**（gen_ul_reovlps 不执行、探针不打印、
+后续阶段直接用缓存 store）。同前缀重跑前必须 `rm <prefix>.re.*.bin`。
+这也是「两侧须串行」的另一原因：并发 + 各自前缀时 C++ 侧曾两次被 OOM 杀
+（exit 137，峰值 RSS ~16.9GB/32GB），建议仍串行执行。
+
+### 下一步（T2 收尾）
+
+1. 对 ulid=5（与 24）加 [GGL]/[L2G] 探针（gen_gl_aln 输出的 overlap 列表、
+   gl_chain_lin 的 ll_tk 链窗口、l2g_res_chain_sc 输入），判定剩余 152 处
+   链结构分歧在 overlap 列表还是 DP 选择。
+2. 若在 DP：对照 `gl_chain_lin`（inter.cpp 5431）与 Rust `gl_chain_lin`
+   （ul_glchain.rs 985）的打分/带宽/`max_ovlp`（ol 语义）与
+   `get_overlap_region_sub_err` 的 trans_sc/sec_err。
+3. [STRH] 对齐后：跑 T3 对拍（`scripts/compare_outputs.sh /tmp/ulref
+   /tmp/ulrsm`，8 GFA/BED + re 缓存字段级），随后 T4 全量回归。
+4. 提交：剥离探针后按「修复 1」「修复 2 + T2 收尾」分两个 commit。
