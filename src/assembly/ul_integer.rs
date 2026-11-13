@@ -967,24 +967,31 @@ pub fn init_ul_str_idx(store: &[UlReadVec], unitig_count: usize) -> UlStrIdx {
             let start = str_idx.idx[vertex] as usize;
             let end = str_idx.idx[vertex + 1] as usize;
             if end > start {
+                // The reference indexes `a` relative to the vertex's slice
+                // (`a = occ + idx[vertex]`), so every slot is `start + m`.
+                let a_n = end - start;
                 let m;
-                if str_idx.occ[end - 1] == (end - start - 1) as u64 {
-                    m = end - start - 1;
-                    str_idx.occ[end - 1] = ((k as u64) << 32) | i as u64;
+                if str_idx.occ[end - 1] == (a_n - 1) as u64 {
+                    m = a_n - 1;
+                    str_idx.occ[start + m] = ((k as u64) << 32) | i as u64;
                 } else {
-                    m = str_idx.occ[end - 1] as usize;
-                    let next = str_idx.occ[m] as usize;
-                    str_idx.occ[next] = ((k as u64) << 32) | i as u64;
-                    str_idx.occ[m] = next as u64 + 1;
+                    // `a[a[a_n-1]++] = (k<<32)|i`: the last slot of the run
+                    // holds the next write position, so write there first and
+                    // bump the counter afterwards.
+                    let next = str_idx.occ[end - 1] as usize;
+                    str_idx.occ[start + next] = ((k as u64) << 32) | i as u64;
+                    str_idx.occ[end - 1] = next as u64 + 1;
+                    m = next;
                 }
-                let v0 = (z.a[(str_idx.occ[m]) as u32 as usize] as u32) as u32;
+                let v0 = (z.a[(str_idx.occ[start + m]) as u32 as usize] as u32) as u32;
                 let mut m = m as i64;
                 while m > 0 && !z.is_cir {
                     m -= 1;
-                    if (str_idx.occ[m as usize] >> 32) != k as u64 {
+                    if (str_idx.occ[start + m as usize] >> 32) != k as u64 {
                         break;
                     }
-                    let v1 = (z.a[(str_idx.occ[m as usize]) as u32 as usize] as u32) as u32;
+                    let v1 =
+                        (z.a[(str_idx.occ[start + m as usize]) as u32 as usize] as u32) as u32;
                     if v0 == v1 {
                         z.is_cir = true;
                     }

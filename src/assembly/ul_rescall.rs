@@ -854,14 +854,7 @@ fn push_adp_k_hits(
         push_kmer_hit_at_length(cl, pushed);
     }
     if cln == 6008 {
-        eprintln!(
-            "[PSH] ci_in={} k_out={} len={} m={}",
-            ci,
-            k,
-            cl.length,
-            previous
-        );
-    }
+}
     if qs == u64::MAX || qe == u64::MAX {
         return k;
     }
@@ -975,30 +968,14 @@ pub fn gen_cns_chain(
         let call = CALL.fetch_add(1, Ordering::Relaxed);
         if call == 0 {
             let region = &regions[region_index];
-            eprintln!(
-                "[GCE] y_id={} wn={} rcn={} seed={}",
-                region.y_identifier,
-                window_count,
-                cl.length,
-                region.shared_seed
-            );
-            for (k, m) in region
+for (k, m) in region
                 .window_cigar
                 .windows
                 .iter()
                 .enumerate()
                 .take(300)
             {
-                eprintln!(
-                    "[GCEW] w={} x=[{},{}] y=[{},{}] anchor={}",
-                    k,
-                    m.x_start,
-                    m.x_end,
-                    m.y_start,
-                    m.y_end,
-                    (m.extra_end < 0 && m.y_end != -1) as i32
-                );
-            }
+}
         }
     }
     let target_identifier = regions[region_index].y_identifier as i64;
@@ -1381,13 +1358,7 @@ pub fn refine_khits(
         small_gap_rate,
         minimum_gap,
     );
-    eprintln!(
-        "[RK] seed={} cmi={} kept={}",
-        region.shared_seed,
-        copy_index,
-        copy_index - region.shared_seed as i64
-    );
-    for k in copy_index..cursor {
+for k in copy_index..cursor {
         candidates.list[k as usize].read_identifier = ALNW_SENTINEL;
     }
 }
@@ -1430,18 +1401,7 @@ pub fn count_k_hits_adv(
                 }
                 let first = &candidates.list[region.shared_seed as usize];
                 let last = &candidates.list[(cursor - 1) as usize];
-                eprintln!(
-                    "[SLC] k={} seed={} pid={} n={} first=[{},{}] last=[{},{}]",
-                    k,
-                    region.shared_seed,
-                    pid,
-                    count,
-                    first.self_offset,
-                    first.offset,
-                    last.self_offset,
-                    last.offset
-                );
-            }
+}
         }
     }
 
@@ -1678,23 +1638,9 @@ pub fn ul_gap_filling_adv(
                 false,
             );
             if query_length == 73261 {
-                eprintln!(
-                    "[CNS] qn={} ch_n={} rcn={} len={}",
-                    qn,
-                    chain_count,
-                    candidates.length - chain_count,
-                    candidates.length
-                );
-                for c in (candidates.length - chain_count)..candidates.length {
+for c in (candidates.length - chain_count)..candidates.length {
                     let hit = &candidates.list[c as usize];
-                    eprintln!(
-                        "[CNSC] c={} readID={} self_off={} off={}",
-                        c,
-                        hit.read_identifier,
-                        hit.self_offset,
-                        hit.offset
-                    );
-                }
+}
             }
             if chain_count != 0 {
                 let chain_index = candidates.length;

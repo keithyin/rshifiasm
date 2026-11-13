@@ -1468,13 +1468,14 @@ pub fn shrink_ul0(
         str_.cn = 0;
         return;
     }
-    let copy_group = |uls: &mut AllUl,
+    let copy_group = |src: &[crate::assembly::ul::UcBlock],
+                      str_a: &[u64],
                       slots: &[u64],
                       out: &mut crate::assembly::ul_store::UlReadVec,
                       base_nid: usize| {
         let mut m = 0usize;
         for (j, &kk) in slots.iter().enumerate() {
-            let blk = uls.reads[id].bb[(str_.a[kk as usize] >> 32) as usize];
+            let blk = src[(str_a[kk as usize] >> 32) as usize];
             let pidx = blk.pidx;
             let aidx = blk.aidx;
             let pdis = blk.pdis;
@@ -1529,7 +1530,10 @@ pub fn shrink_ul0(
             let mut x = crate::assembly::ul_store::UlReadVec::default();
             x.bb = vec![crate::assembly::ul::UcBlock::default(); e - s];
             let slots: Vec<u64> = (s..e).map(|kk| kk as u64).collect();
-            copy_group(uls, &slots, &mut x, uls.nid.len());
+            // The source blocks are read from the untouched read; the new
+            // group is written into `x`.
+            let src = uls.reads[id].bb.clone();
+            copy_group(&src, &str_.a, &slots, &mut x, uls.nid.len());
             uls.reads.push(x);
         }
     }
@@ -1539,8 +1543,11 @@ pub fn shrink_ul0(
     let e = s + (buf[i] & 0xffff_ffff) as usize;
     let slots: Vec<u64> = (s..e).map(|kk| kk as u64).collect();
     let mut x = std::mem::take(&mut uls.reads[id]);
+    // The reference copies block `m` from `x->bb.a[z]` in place; `m <= z`
+    // always holds, so a cloned source reproduces it safely here.
+    let src = x.bb.clone();
     x.bb.resize(e - s, crate::assembly::ul::UcBlock::default());
-    copy_group(uls, &slots, &mut x, uls.nid.len());
+    copy_group(&src, &str_.a, &slots, &mut x, uls.nid.len());
     uls.reads[id] = x;
 }
 

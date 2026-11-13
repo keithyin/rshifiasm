@@ -2210,18 +2210,7 @@ pub fn gl_chain_flter(
     introsort_overlaps_by_xe(&mut olist[..*ol_len]);
     regen_ul_ov_t_lst(&context.unitig_graph.unitigs, &olist[..*ol_len], idx);
     for (z, region) in olist[..*ol_len].iter().enumerate() {
-        eprintln!(
-            "[RGN] z={} y_id={} x=[{},{}] q=[{},{}] t=[{},{}]",
-            z,
-            region.y_identifier,
-            region.x_position_start,
-            region.x_position_end,
-            idx[z].qs,
-            idx[z].qe,
-            idx[z].ts,
-            idx[z].te
-        );
-    }
+}
     if idx.is_empty() {
         return 0;
     }

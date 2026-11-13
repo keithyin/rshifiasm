@@ -388,37 +388,9 @@ fn extract_sub_cigar_err_impl(
         ck = 0;
     }
     if tot != 0 {
-        eprintln!(
-            "[ETOT] tot={} s={} e={} y_id={} x=[{},{}] p=[ts={},te={},sec={},rev={}] minw={} maxw={} curwid={}",
-            tot,
-            s,
-            e,
-            region.y_identifier,
-            region.x_position_start,
-            region.x_position_end,
-            p.ts,
-            p.te,
-            p.sec,
-            p.rev as u32,
-            min_w,
-            max_w,
-            wk
-        );
-        for w in min_w..=max_w.min(windows.len() as i64 - 1) {
+for w in min_w..=max_w.min(windows.len() as i64 - 1) {
             let m = &windows[w as usize];
-            eprintln!(
-                "[ETOTW] w={} x=[{},{}] y=[{},{}] err={} clen={} ualn={} est={}",
-                w,
-                m.x_start,
-                m.x_end,
-                m.y_start,
-                m.y_end,
-                m.error,
-                m.cigar_length,
-                is_ualn_win(m) as i32,
-                is_est_aln(m) as i32
-            );
-        }
+}
     }
     assert_eq!(tot, 0);
     p.qn = wk as u32;
@@ -1498,7 +1470,10 @@ fn extract_xcoordates(region: &OverlapRegion, a: &[u64], b: &mut Vec<u64>) -> us
                 let is = t[0];
                 let ie = t[1] + 1;
                 a_z = a_i as i64;
-                while a_z >= 0 {
+                // The reference scans `a[a_i]` with `a_i == a_n` after a forward
+                // run reached the end; the out-of-bounds slot stops the scan
+                // immediately, so clamp it here.
+                while a_z >= 0 && (a_z as usize) < a.len() {
                     let ae = a[a_z as usize] as u32 as i64;
                     if ae <= is {
                         break;
@@ -1548,7 +1523,10 @@ fn extract_xcoordates(region: &OverlapRegion, a: &[u64], b: &mut Vec<u64>) -> us
         let is = t[0];
         let ie = t[1] + 1;
         a_z = a_i as i64;
-        while a_z >= 0 {
+        // The reference scans `a[a_i]` with `a_i == a_n` after a forward
+        // run reached the end; the out-of-bounds slot stops the scan
+        // immediately, so clamp it here.
+        while a_z >= 0 && (a_z as usize) < a.len() {
             let ae = a[a_z as usize] as u32 as i64;
             if ae <= is {
                 break;
@@ -1617,7 +1595,10 @@ fn cal_xerr(region: &OverlapRegion, a: &[u64]) -> i64 {
                 let is = q[0];
                 let ie = q[1] + 1;
                 a_z = a_i as i64;
-                while a_z >= 0 {
+                // The reference scans `a[a_i]` with `a_i == a_n` after a forward
+                // run reached the end; the out-of-bounds slot stops the scan
+                // immediately, so clamp it here.
+                while a_z >= 0 && (a_z as usize) < a.len() {
                     let ae = a[a_z as usize] as u32 as i64;
                     if ae <= is {
                         break;
@@ -1665,7 +1646,10 @@ fn cal_xerr(region: &OverlapRegion, a: &[u64]) -> i64 {
         let is = q[0];
         let ie = q[1] + 1;
         a_z = a_i as i64;
-        while a_z >= 0 {
+        // The reference scans `a[a_i]` with `a_i == a_n` after a forward
+        // run reached the end; the out-of-bounds slot stops the scan
+        // immediately, so clamp it here.
+        while a_z >= 0 && (a_z as usize) < a.len() {
             let ae = a[a_z as usize] as u32 as i64;
             if ae <= is {
                 break;
@@ -2567,39 +2551,22 @@ pub fn rphase_hl(
 ) {
     let on0 = regions.len();
     let mut active = 0usize;
+    // The reference resets `align_length = 0` for every region here, which
+    // discards the secondary windows left by the previous call. The Rust port
+    // keeps them in the parallel `slots` array, so clear every slot before the
+    // compaction moves the regions (a stale slot of an inactive region would
+    // otherwise be written back by the tail loop).
+    for slot in slots.iter_mut() {
+        slot.clear();
+    }
     {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CALL: AtomicU32 = AtomicU32::new(0);
         let call = CALL.fetch_add(1, Ordering::Relaxed);
         if call == 0 {
             for (k, region) in regions.iter().enumerate() {
-                eprintln!(
-                    "[RHL] k={} y_id={} x=[{},{}] y=[{},{}] n={}",
-                    k,
-                    region.y_identifier,
-                    region.x_position_start,
-                    region.x_position_end,
-                    region.y_position_start,
-                    region.y_position_end,
-                    region.window_cigar.windows.len()
-                );
-                for (w, m) in region.window_cigar.windows.iter().enumerate() {
-                    eprintln!(
-                        "[RHLW] k={} w={} x=[{},{}] y=[{},{}] err={} clen={} ualn={} est={} eb={} ee={}",
-                        k,
-                        w,
-                        m.x_start,
-                        m.x_end,
-                        m.y_start,
-                        m.y_end,
-                        m.error,
-                        m.cigar_length,
-                        is_ualn_win(m) as i32,
-                        is_est_aln(m) as i32,
-                        m.extra_begin,
-                        m.extra_end
-                    );
-                }
+for (w, m) in region.window_cigar.windows.iter().enumerate() {
+}
             }
         }
     }
@@ -2743,16 +2710,7 @@ pub fn rphase_hl(
         }
         windows.truncate(slots[k].len());
         z.x_strand = 0;
-        eprintln!(
-            "[RPH] k={} y_id={} ol={} zwn={} al={} n={}",
-            k,
-            z.y_identifier,
-            z.overlap_length,
-            zwn,
-            slots[k].len(),
-            windows.len()
-        );
-        assert!(zwn <= u64::from(z.overlap_length));
+assert!(zwn <= u64::from(z.overlap_length));
         z.alignment_length = z.overlap_length - zwn as u32;
     }
 }
@@ -2981,7 +2939,7 @@ fn gen_commen_sketch(
             if we > qe {
                 we = qe;
             }
-            let first = aln[id_a[buf[0] as u32 as usize] as usize].qn as usize;
+            let first = aln[buf[0] as u32 as usize].qn as usize;
             let (wid, _) = window_id_by_start(
                 regions[first].x_position_start as i32,
                 regions[first].x_position_end as i32,
@@ -3014,7 +2972,7 @@ fn gen_commen_sketch(
             }
             let mut i = 1usize;
             while i < buf_n {
-                let other = aln[id_a[buf[i] as u32 as usize] as usize].qn as usize;
+                let other = aln[buf[i] as u32 as usize].qn as usize;
                 let (wid2, _) = window_id_by_start(
                     regions[other].x_position_start as i32,
                     regions[other].x_position_end as i32,
@@ -3071,7 +3029,7 @@ fn gen_commen_sketch(
             }
             if co != 0 {
                 for i in 0..buf_n {
-                    let other = aln[id_a[buf[i] as u32 as usize] as usize].qn as usize;
+                    let other = aln[buf[i] as u32 as usize].qn as usize;
                     let (wid3, _) = window_id_by_start(
                         regions[other].x_position_start as i32,
                         regions[other].x_position_end as i32,
